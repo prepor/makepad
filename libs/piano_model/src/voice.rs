@@ -323,7 +323,12 @@ impl Voice {
         // against a lower wave impedance: the string yields more and the
         // contact lengthens — part of the una-corda mellowing.
         let z_scale: f64 = if soft_pedal && key.n_osc == 3 { 2.0 / 3.0 } else { 1.0 };
+        // The raw velocity curve, then the key's treble speed-range
+        // compression about the mezzo-forte pivot (see keys.rs speed_q):
+        // the top octaves' dynamic span is the narrowest on a real
+        // instrument, not the widest.
         let speed = velocity_to_speed(vel);
+        let speed = key.speed_pivot * (speed / key.speed_pivot).powf(key.speed_q);
         // Per-STRIKE variation (deterministic: seeded by key and strike
         // count, so renders stay bit-identical for identical event
         // streams). The per-KEY voicing scatter makes the 88 keys

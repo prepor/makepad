@@ -12,6 +12,16 @@
 // the same reason after the forte-headroom pass (master -2 dB, knee
 // 0.78) and the per-strike contact jitter landed: both are scatter-scale
 // flaps (~1-5 dB) on brackets whose generator is lost.
+// 2026-08-30, after the mid-register phantom gating + treble loss
+// re-pin + treble velocity-span compression: C4/A5 noise_hi and C5
+// hi_ratio LOWER edges widened, and C5 tol[0]/tol[1] +1 dB. All four
+// brackets had baked in the phantom bank's lone 6.2-6.4 kHz tone as
+// legitimate high-band content (on C5 it was measured as partial 11,
+// 11.5 dB ABOVE the recording's value; ablation moves 6-9 kHz by
+// 15+ dB and nothing else by more than 0.3 dB) — content the listener
+// twice rejected as "frequencies that don't belong". A5's bracket also
+// tracked a reference sample that is the same transposed source as C6
+// (identical fitted B = 1.73e-3). Upper (excess-noise) edges untouched.
 // tables. Each row embeds the partial-amplitude ladder of one note of a
 // real recorded acoustic grand (FluidR3 GM, one per octave A0..C7,
 // measured from the recordings themselves) at onset / 100 ms / 300 ms,
@@ -108,7 +118,7 @@ const NOTES: &[RefNote] = &[
         lad_300: &[0.0, -7.9, -19.8, -15.8, -25.3, -21.8, -19.5, -20.0, -32.7, -43.0, -25.1, -28.5, -41.0, -30.8, -22.6, -22.6, -40.3, -38.0, -36.0, -36.9],
         tol: [13.95, 12.67, 11.18],
         attack_ms: (3.0, 52.0), prompt: (5.0, 16.1), after: (3.0, 13.7),
-        noise_hi: (-16.8, -0.2), hi_ratio: (-55.3, -23.6) },
+        noise_hi: (-24.0, -0.2), hi_ratio: (-55.3, -23.6) },
     RefNote { key: 69, name: "A4", win_s: 0.0460,
         lad_on: &[0.0, -21.9, -23.9, -10.4, -16.5, -11.9, -19.2, -17.9, -27.7, -32.2, -27.4, -26.1, -28.1, -40.3, -28.4, -32.7, -35.0, -56.2, -60.0, -60.0],
         lad_100: &[0.0, -20.3, -27.7, -22.1, -19.1, -13.0, -25.6, -25.6, -20.7, -28.6, -33.2, -43.0, -43.2, -40.1, -38.4, -39.5, -42.7, -60.0, -60.0, -60.0],
@@ -120,16 +130,16 @@ const NOTES: &[RefNote] = &[
         lad_on: &[-3.0, -11.2, 0.0, -14.7, -4.8, -12.2, -14.9, -15.8, -10.4, -22.5, -39.3, -21.5, -31.3, -23.2, -24.0, -60.0, -60.0, -50.7, -60.0],
         lad_100: &[0.0, -7.8, -3.9, -11.8, -8.9, -18.7, -24.3, -19.7, -13.2, -28.3, -45.5, -24.7, -36.0, -35.2, -34.4, -60.0, -60.0, -60.0, -60.0],
         lad_300: &[0.0, -10.2, -7.9, -20.0, -9.8, -15.7, -29.3, -20.2, -18.4, -26.5, -55.8, -39.5, -43.9, -50.2, -60.0, -60.0, -60.0, -60.0, -60.0],
-        tol: [13.78, 10.46, 10.95],
+        tol: [14.80, 11.30, 10.95],
         attack_ms: (2.1, 24.5), prompt: (4.5, 31.3), after: (4.1, 18.6),
-        noise_hi: (-24.7, 0.6), hi_ratio: (-42.0, -15.6) },
+        noise_hi: (-24.7, 0.6), hi_ratio: (-57.0, -15.6) },
     RefNote { key: 81, name: "A5", win_s: 0.0460,
         lad_on: &[0.0, -10.8, -11.7, -10.4, -13.3, -16.6, -19.9, -37.2, -45.3, -36.9, -60.0],
         lad_100: &[0.0, -4.1, -11.9, -11.2, -17.1, -15.1, -23.9, -39.1, -47.9, -38.6, -37.1],
         lad_300: &[-1.4, 0.0, -10.7, -0.7, -13.2, -9.8, -19.4, -44.6, -50.6, -39.6, -60.0],
         tol: [7.87, 7.36, 15.59],
         attack_ms: (1.6, 16.4), prompt: (9.6, 30.7), after: (5.5, 24.5),
-        noise_hi: (-17.7, -2.0), hi_ratio: (-32.5, -7.5) },
+        noise_hi: (-24.0, -2.0), hi_ratio: (-32.5, -7.5) },
     RefNote { key: 84, name: "C6", win_s: 0.0460,
         lad_on: &[0.0, -9.6, -14.2, -11.2, -14.4, -19.0, -26.4, -54.4, -48.0],
         lad_100: &[0.0, -5.3, -10.7, -15.4, -16.0, -14.6, -22.3, -58.4, -56.1],

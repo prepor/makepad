@@ -113,7 +113,11 @@ fn partials_follow_dispersion_law() {
     assert!(mag > 1e-7, "C2 partial 16 carries no energy");
     let cents_sharp = 1200.0 * (pred / harmonic).log2();
     println!("C2 partial 16 (from fitted B): {cents_sharp:.1} cents sharp of harmonic");
-    assert!(cents_sharp > 25.0, "bass partials are not audibly inharmonic ({cents_sharp:.1} cents)");
+    // 12+ cents at C2's 16th partial: audible stretch. (The gate sat at
+    // 25 when the B law ran ~0.42 decades above the reference recordings'
+    // tracker-fitted inharmonicity; the reference itself measures ~15.5
+    // cents here, so 25 would demand MORE stretch than the real thing.)
+    assert!(cents_sharp > 12.0, "bass partials are not audibly inharmonic ({cents_sharp:.1} cents)");
 }
 
 // ---------------------------------------------------------------------------

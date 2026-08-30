@@ -130,7 +130,13 @@ const MASTER_GAIN: f32 = 0.25;
 
 /// A voice whose 64-sample bridge-force energy stays below this for ~16 ms
 /// is put to sleep (and its state zeroed, keeping wake-ups deterministic).
-const VOICE_SILENCE_POWER: f32 = 1e-5;
+/// The acc domain is post-trim bridge force, but radiativity is applied
+/// AFTER it: keys whose partials ride the radiation bumps (the bass keys
+/// on the first-resonance step) are radiated up to ~9 dB louder than the
+/// same acc power elsewhere, so the gate must sit well under the old
+/// -64 dBFS-ish point — at 1e-5 the first-resonance lift made a
+/// pianissimo A0 audibly vanish at ~200 ms.
+const VOICE_SILENCE_POWER: f32 = 1e-7;
 /// Minimum ringing energy for a damper landing to make contact noise.
 const DAMPER_NOISE_POWER: f32 = 0.1;
 const DAMPER_NOISE_AMP: f32 = 0.25;
@@ -661,6 +667,7 @@ impl Piano {
         let k = &self.keys[(key - FIRST_KEY) as usize];
         let mut h = crate::hammer::Hammer::new();
         let speed = keys::velocity_to_speed(velocity);
+        let speed = k.speed_pivot * (speed / k.speed_pivot).powf(k.speed_q);
         h.strike(
             speed,
             k.hammer_mass,

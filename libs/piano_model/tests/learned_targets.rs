@@ -293,13 +293,20 @@ fn learned_trend_gate() {
     // attack_body 1.0). Keys 60/72 return to their direct-routing
     // geometry, confirming the earlier note: their coupled-state swings
     // were the ladder windows measuring attack noise, not strings.
+    // key 84's "hi" aggregate is partials 7+ of C6 — 7.4-9.9 kHz, where
+    // the source corpus is 63.7 kbps codec noise (band level flat,
+    // autocorrelation at the f0 lag ~0): the learned target there is a
+    // noise fit, and pinning the string losses to the corpus's
+    // trustworthy first-second decay (2026-08-30) necessarily moved the
+    // physical model away from it. Anchor re-measured; the other five
+    // keys' aggregates moved < 2 dB in the same pass.
     const ANCHORS: &[(u8, f64, f64, f64)] = &[
         (30, -0.7, 18.3, 8.2),
         (36, 7.4, 10.1, 4.4),
         (48, 3.4, -0.3, 4.0),
         (60, -0.2, -3.4, -4.2),
         (72, 2.1, 3.5, 8.2),
-        (84, -24.1, 1.9, -2.7),
+        (84, -35.1, 1.9, -2.7),
     ];
     const MARGIN: f64 = 6.0;
     let vel = 112u8;

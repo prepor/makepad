@@ -51,6 +51,20 @@ design_params! {
     rad_vel_hz = 153.24610995333614,
     rad_body = 2.2,
     rad_body_hz = 150.0,
+    /// first-board-resonance radiation step (see soundboard::radiativity):
+    /// amplitude gain rad_res on a steep (4th-order) band between
+    /// rad_res_lo and rad_res_hi. A concert grand's first board modes sit
+    /// at ~50-90 Hz and radiate the A1-C2 fundamentals strongly; the body
+    /// shelf above alone left those fundamentals 10-20 dB under the
+    /// reference recordings' balance and the bottom octaves read as a
+    /// plucked wire ("guitar"): all partial cluster, no weight under it.
+    /// Steep on BOTH sides: below rad_res_lo the board stops radiating
+    /// (C1's fundamental stays -35 dB in the reference), above rad_res_hi
+    /// the ordinary body shelf takes over — a broad bump here would lift
+    /// C2's second partial as much as its first and change nothing.
+    rad_res = 3.2,
+    rad_res_lo = 50.0,
+    rad_res_hi = 88.0,
     // --- string losses (keys.rs) ---------------------------------------
     /// fundamental T60 at A0 (s): t60 = t60_base*(1-t)^t60_pow + t60_min
     t60_base = 26.333895237530335,
@@ -61,27 +75,36 @@ design_params! {
     /// of successive search passes
     t60_min = 0.9,
     /// quadratic-in-frequency loss (1/s per kHz^2): a2 = a2_lo + a2_slope*t.
-    /// Near-flat across the compass: the old 0.44 slope gave a C6 partial at
-    /// 5.5 kHz sigma ~13/s (dead in 150 ms) where the reference recordings
-    /// hold their treble partials 3..6 nearly flat through the first 300 ms;
-    /// plain treble wire has LESS internal loss than wound bass, not 8x more.
-    a2_lo = 0.04,
-    a2_slope = 0.009960792746298096,
+    /// Between the extremes of two earlier passes: 0.44 slope killed a C6
+    /// 5.5 kHz partial in 150 ms (dead treble), but the 0.04/0.010 floor
+    /// that replaced it was calibrated against the reference samples'
+    /// LOOPED sustain (their late decay is a crossfade artifact) and let
+    /// the model's 4.5-6.5 kHz aftersound ring at sigma ~3.8/s (T60 1.8 s)
+    /// — measured DOUBLE the recordings' whole-note treble decay over the
+    /// trustworthy first second (C5 ref 38 dB/s vs model 18; C6 33 vs 19):
+    /// the lingering metallic haze under "bell ring". These values put
+    /// C5/C6 whole-note slopes at the reference's own prompt rates while
+    /// costing ~2 dB in the first 90 ms.
+    a2_lo = 0.09,
+    a2_slope = 0.04,
     /// wound-string winding-friction loss (1/s per kHz), scaled (1-t)^3 so
     /// it lives on the copper-wound bass and vanishes by the plain-wire
     /// mids. Coulomb-type inter-winding friction costs a roughly constant
     /// energy fraction per cycle — a loss LINEAR in frequency, distinct
-    /// from the f^2 air/viscous term. Without it the model's C2 partials
-    /// 7-12 rang at sigma ~0.8/s where the reference recording measures
-    /// ~15/s over the first 100 ms — the bass read as an endless bright
-    /// wire and both reference sources flagged it. 16 (not the full 15/s
-    /// at C2's p8) because the recording's fast onset drop is partly the
-    /// Weinreich PROMPT stage, which the unison split already provides:
-    /// the winding term supplies the rest, and the slow unison member
-    /// keeps the partial alive just under a second, which is what the ear
-    /// wants (the reference samples' own 1 s+ bass sustain is a
-    /// loop-crossfade artifact per the learned lane's source notes).
-    a1_wound = 16.0,
+    /// from the f^2 air/viscous term. The old 16.0 was calibrated to the
+    /// reference bass's PROMPT decay (sigma ~15/s at C2's p8 over the
+    /// first 100 ms) but applied as one constant sigma for all time —
+    /// the prompt stage of a double decay pressed onto the aftersound
+    /// too. Measured result: the model's bass upper-partial bed sat
+    /// 20-27 dB under the recordings over 0-300 ms (A0 2-8 kHz vs
+    /// low-band: ref -14.8 dB, model -42) and the whole-note bass
+    /// envelope fell at 18 dB/s where the recordings fall at 3-5 — bright
+    /// for one instant, then a dead thud: the plucked-guitar signature
+    /// the listener flagged. At 4.0 the fast unison member still takes
+    /// the prompt drop and the slow member holds the growl for the
+    /// aftersound. The proper structure (winding loss split per unison
+    /// member) is noted in keys.rs.
+    a1_wound = 4.0,
     /// quartic-in-frequency loss (1/s per kHz^4): real string losses grow
     /// FASTER than f^2 at the top of the band (air drag leaves the viscous
     /// regime, felt/termination micro-losses); with only the f^2 term one
@@ -124,8 +147,38 @@ design_params! {
     /// felt power p: feltp_lo + feltp_span*t
     feltp_lo = 2.332016978017561,
     feltp_span = 1.4310157297332198,
+    /// extra resting hardness of the last half-octave's hammers, as an
+    /// additional exponent of 10 on felt_k ramped over t = 0.75..1.0
+    /// (zero at and below C6). The top hammers of a concert grand are
+    /// hard-pressed and lacquered: contact stays sub-millisecond even at
+    /// piano. The soft-felt integration alone gave C7 a 2.9 ms pianissimo
+    /// contact (3-6x the measured instrument) — with the treble speed-range
+    /// compression bounding fortissimo, mezzo C7 pulses lost their second
+    /// partial entirely (-28 dB; the dull-treble gate sits at -22).
+    /// Hardening the resting felt lifts mezzo/piano treble brightness the
+    /// way the real instrument gets it: from the hammer, not from the blow.
+    feltk_top = 2.0,
     /// mezzo-forte hammer speed (m/s) used for voicing estimates
     v_mf = 2.461108502067713,
+    /// Hammer-speed range compression toward the treble, pivoted at v_mf:
+    /// speed' = v_mf * (speed/v_mf)^q with
+    /// q = 1 - vel_q_depth * clamp((t - vel_q_start)/vel_q_ramp, 0, 1).
+    /// The rendered level span from velocity 30 to 127 measured ~23-26 dB
+    /// across A0..C4 but 39-48 dB at C5..C7: with the key's own partials
+    /// far above the force-pulse corner, every octave the corner moves
+    /// with contact time multiplies the level swing, and the top octaves
+    /// got twice the dynamic slope of the rest of the compass — forte
+    /// trebles leapt out of the texture like struck bells ("bell ring")
+    /// while the same keys vanished at piano. A real action cannot do
+    /// this either: measured top-octave dynamic ranges are the NARROWEST
+    /// on the instrument (light hammers on short key travel bound both
+    /// ends of the speed range). The compression is exact in the level
+    /// domain (a log-log chain rule): span scales by q, pivoting at the
+    /// mezzo-forte point the compass-evenness calibration was done at,
+    /// so velocity ~66 renders exactly as before on every key.
+    vel_q_depth = 0.42,
+    vel_q_start = 0.42,
+    vel_q_ramp = 0.30,
     /// lock-up onset as a fraction of mf compression
     lock_frac = 0.95,
     /// lock-up weight across compass: lockw_lo + (lockw_hi-lockw_lo)*t
@@ -164,9 +217,21 @@ design_params! {
     tens_base = 700.0,
     tens_span = 800.0,
     // --- inharmonicity ---------------------------------------------------
-    /// B = 10^(b_lo + b_span*t)
-    b_lo = -4.35,
-    b_span = 2.7,
+    /// B = 10^(b_lo + b_span*t).
+    /// Fitted to the reference recordings with a sequential partial
+    /// tracker: log10 B = -4.771 + 2.891 t (C2 7.1e-5, C4 3.2e-4,
+    /// C6 1.9e-3). The old (-4.35, 2.7) law sat ~0.42 decades above that
+    /// across the whole compass — C5's 12th partial +190 cents vs the
+    /// recording's +104 — and also above the model's OWN string geometry
+    /// (B = pi^3 E d^4 / 64 T L^2 from the scaling tables runs 1.4-2.5x
+    /// LOWER than the law was claiming). Doubled stretch is inaudible at
+    /// piano (partials 8-20 are 30-50 dB down) and lands exactly at forte,
+    /// where those partials sit within 15 dB of the peak: a bell, not a
+    /// string. The ladder tests are structurally blind to B (they look for
+    /// peaks where the model's law predicts them), so this is pinned to
+    /// the tracker fit, shaded toward the geometry.
+    b_lo = -4.63,
+    b_span = 2.78,
     // --- voicing normalisation ------------------------------------------
     trim_ref = 0.0000014,
     top_taper = 1.8,

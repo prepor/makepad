@@ -70,7 +70,21 @@ pub fn radiativity(f: f64, p: &DesignParams) -> f64 {
     let b = f / p.rad_body_hz;
     let b4 = b * b * b * b;
     let body = 1.0 + p.rad_body * (1.0 / (1.0 + b4)) * (f * f / (f * f + 85.0 * 85.0));
-    hp1 * hp2 * lp * body
+    // First-board-resonance step (see params::rad_res): the ~50-90 Hz
+    // region where a concert grand's first board modes radiate the
+    // A1-C2 fundamentals. Fourth-order on both skirts: steep below so the
+    // bottom octave's near-inaudible fundamentals stay put (C1's is
+    // -35 dB in the reference), steep above so C2's SECOND partial
+    // (130 Hz) does not ride the same lift — a broad bump here moves the
+    // fundamental-to-partial balance by nothing. Without this term the
+    // bottom octaves measured 10-20 dB light on their fundamentals
+    // against the reference recordings and read as a plucked wire.
+    let rl = f / p.rad_res_lo;
+    let rl4 = rl * rl * rl * rl;
+    let rh = f / p.rad_res_hi;
+    let rh4 = rh * rh * rh * rh;
+    let res = 1.0 + p.rad_res * (rl4 / (1.0 + rl4)) * (1.0 / (1.0 + rh4));
+    hp1 * hp2 * lp * body * res
 }
 
 pub struct Soundboard {

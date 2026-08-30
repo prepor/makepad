@@ -72,6 +72,12 @@ pub struct KeyDesign {
     pub felt_lambda: f64,
     pub z_total: f64,                // wave impedance seen by the hammer (n_strings * Z)
     pub t1_seconds: f64,             // agraffe reflection round trip 2 x0 / c
+    /// Hammer-speed compression exponent for this key (see params::vel_q_*):
+    /// speed' = speed_pivot * (speed/speed_pivot)^speed_q at note-on.
+    pub speed_q: f64,
+    /// The mezzo-forte pivot the compression turns about (= DesignParams
+    /// v_mf, the point the compass-evenness calibration was done at).
+    pub speed_pivot: f64,
     pub undamped: bool,
     pub pan: f32,                    // player perspective: bass left
     pub rough_depth: f32,            // contact roughness scale
@@ -128,8 +134,13 @@ pub struct KeyDesign {
 /// the audio band.
 fn mode_cap(idx: usize) -> usize {
     match idx {
-        0..=11 => 128,
-        12..=23 => 104,
+        // The bottom octaves' growl lives in partials far above the old
+        // caps: at 128 modes A0's top partial sat at ~4.5 kHz, so the
+        // whole 4.5-9 kHz band of the bottom octave — clearly tonal in
+        // the reference recordings — simply did not exist. 240 reaches
+        // ~9.9 kHz at A0 with the reference-fitted B.
+        0..=11 => 240,
+        12..=23 => 128,
         24..=39 => 88,
         40..=55 => 72,
         _ => 64,
@@ -196,7 +207,9 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
     // Felt stiffness scaled so mf contact times land on the measured 4 ms
     // (bass) .. <1 ms (treble); voicing scatter moves individual hammers
     // the way real felt varies needle-to-needle.
-    let felt_k = 10f64.powf(p.feltk_lo + p.feltk_span * t) * (2f64).powf(0.5 * sc * kj(idx, 1));
+    let felt_k = 10f64.powf(
+        p.feltk_lo + p.feltk_span * t + p.feltk_top * ((t - 0.75) / 0.25).clamp(0.0, 1.0),
+    ) * (2f64).powf(0.5 * sc * kj(idx, 1));
     let felt_p = p.feltp_lo + p.feltp_span * t;
     let felt_lambda = 1.0;
     // Mezzo-forte felt compression estimate; lock-up starts just below it,
@@ -221,6 +234,18 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
     let core_k = p.core_mul * 1.0e7 * core_w * core_w;
     let u_core = p.core_frac * u_mf;
     let felt_lock_w = p.lockw_lo + (p.lockw_hi - p.lockw_lo) * t;
+    // Treble hammer-speed range compression (see params::vel_q_*): the
+    // measured level span from velocity 30 to 127 was ~23-26 dB across
+    // A0..C4 but 39-48 dB at C5..C7 — twice the dynamic slope, pivoting
+    // at the calibrated mezzo point, so forte trebles rang out like
+    // struck bells while piano trebles vanished. q < 1 narrows the
+    // SPEED range about that same pivot, which scales the level span by
+    // exactly q without moving the mezzo-forte sound of any key.
+    let speed_q = if p.vel_q_ramp > 1e-9 {
+        1.0 - p.vel_q_depth * ((t - p.vel_q_start) / p.vel_q_ramp).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     let strike_pos =
         (p.spos_lo - (p.spos_lo - p.spos_hi) * t.powf(p.spos_pow)) * (1.0 + 0.04 * sc * kj(idx, 2));
     let t1_seconds = 2.0 * strike_pos * length / c_wave;
@@ -301,6 +326,12 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
             }
             let fk = fn_hz / 1000.0;
             let f0k = f0 / 1000.0;
+            // KNOWN STRUCTURAL GAP: the winding-friction term is one
+            // constant sigma, but the recordings show a double decay up
+            // here (prompt ~15/s at C2's p8, aftersound a few /s). The
+            // Weinreich member split only spreads it ~2.7x; a proper fix
+            // makes the wound loss itself member-dependent (heavy in the
+            // fast in-phase mode, light in the aftersound modes).
             let wound = p.a1_wound * (1.0 - t).powi(3);
             let sigma = ((sigma_fund
                 + wound * (fk - f0k)
@@ -363,6 +394,16 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
     for g in gout.iter_mut() {
         *g *= trim;
     }
+
+    // Phantom audibility is a WOUND-string phenomenon; on plain wire the
+    // longitudinal series is a faint colour, not a voice. The smooth
+    // ph_taper alone still left the mid-register bank's strongest mode as
+    // the loudest single component of a forte C4/C5 in 4-10 kHz (one
+    // isolated inharmonic tone at ~6.3 kHz, right at peak ear
+    // sensitivity, on every mid forte note — "bell"). Gate the bank down
+    // hard past the wound/plain transition (idx 24, t~0.28): full on the
+    // wound bass, -12 dB by C4, -20 dB by C5.
+    let ph_wound = 1.0 / (1.0 + (((t - 0.28) / 0.10).max(0.0)).powi(2));
 
     // --- longitudinal / phantom bank ------------------------------------
     // Longitudinal wave speed: plain wire is bulk steel (~5100 m/s); on
@@ -468,6 +509,8 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         felt_lambda,
         z_total,
         t1_seconds,
+        speed_q,
+        speed_pivot: p.v_mf,
         undamped,
         pan: (-0.55 + 1.1 * t) as f32,
         rough_depth: p.rough_depth as f32,
@@ -506,7 +549,10 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         // partials, heavier strings). Normalising to the key's typical mf
         // bridge amplitude keeps the quadratic LAW per key while placing
         // the ff phantom level comparably across the compass.
-        ph_gain: (p.ph_gain * (0.29 + 0.67 * (1.0 - t).powf(2.4)) * ((1.0 - t) + 0.05).powf(p.ph_taper)) as f32,
+        ph_gain: (p.ph_gain
+            * ph_wound
+            * (0.29 + 0.67 * (1.0 - t).powf(2.4))
+            * ((1.0 - t) + 0.05).powf(p.ph_taper)) as f32,
         ph_direct: p.ph_direct as f32,
         ph_hp_c: (1.0 - (-core::f64::consts::TAU * p.ph_hp / sample_rate).exp()) as f32,
         ph_pre_c: (1.0 - (-core::f64::consts::TAU * 5200.0 / sample_rate).exp()) as f32,

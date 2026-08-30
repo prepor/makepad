@@ -156,6 +156,52 @@ fn qwen_prefers_a_lane_advertising_chat_home() {
     }
 }
 
+/// A home whose every lane is mid-generation queues the turn behind
+/// whatever those lanes are doing; one with a free slot serves now.
+#[test]
+fn qwen_prefers_a_home_with_a_free_lane_over_a_full_one() {
+    let mut t = ScriptedFleet::default();
+    let mut full = health(&["chat"]);
+    if let Value::Obj(pairs) = &mut full {
+        pairs.push((
+            "lanes".into(),
+            json::obj(vec![
+                ("model", json::s("qwen3.8-27b")),
+                ("slots_total", Value::Int(1)),
+                ("lanes_active", Value::Int(1)),
+            ]),
+        ));
+    }
+    t.on_get("http://busy:8765/health", Ok(full));
+    t.on_get(
+        "http://busy:8765/models",
+        Ok(models(vec![model_row("qwen3.8-27b", "chat", true, "")])),
+    );
+    let mut free = health(&["chat"]);
+    if let Value::Obj(pairs) = &mut free {
+        pairs.push((
+            "lanes".into(),
+            json::obj(vec![
+                ("model", json::s("qwen3.8-27b")),
+                ("slots_total", Value::Int(4)),
+                ("lanes_active", Value::Int(1)),
+            ]),
+        ));
+    }
+    t.on_get("http://calm:8765/health", Ok(free));
+    t.on_get(
+        "http://calm:8765/models",
+        Ok(models(vec![model_row("qwen3.8-27b", "chat", true, "")])),
+    );
+    let mut p = FleetQwenChatProvider::new(t, vec!["http://busy:8765".into(), "http://calm:8765".into()]);
+    match p.availability() {
+        ProviderAvailability::Available { detail, .. } => {
+            assert!(detail.contains("calm:8765"), "the free lane must win: {detail}");
+        }
+        other => panic!("expected available: {other:?}"),
+    }
+}
+
 #[test]
 fn qwen_prefers_qwen38_and_reports_the_model() {
     let mut t = ScriptedFleet::default();

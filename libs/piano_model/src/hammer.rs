@@ -80,11 +80,16 @@ pub struct Hammer {
     k_felt: f64,
     p_felt: f64,
     inv_ulock: f64,
+    core_k: f64,
+    u_core: f64,
+    f_pk: f64,
+    snap: f64,
     lock_w: f64,
     lock_cap: f64,
     lambda: f64,
     rough: f32,      // contact roughness depth (0..~0.5), scales with speed
     rough_lp: f32,
+    rough_lp2: f32,
     rough_rng: u32,
     inv_m: f64,
     dt: f64,             // substep dt
@@ -111,11 +116,16 @@ impl Hammer {
             k_felt: 0.0,
             p_felt: 2.5,
             inv_ulock: 0.0,
+            core_k: 0.0,
+            u_core: 0.0,
+            f_pk: 0.0,
+            snap: 1.0,
             lock_w: 1.0,
             lock_cap: 14.0,
             lambda: 0.0,
             rough: 0.0,
             rough_lp: 0.0,
+            rough_lp2: 0.0,
             rough_rng: 1,
             inv_m: 0.0,
             dt: 0.0,
@@ -147,6 +157,8 @@ impl Hammer {
         img_fc_mul: f64,
         img_g_base: f64,
         img_g_slope: f64,
+        core_k: f64,
+        u_core: f64,
     ) {
         self.active = true;
         self.started = false;
@@ -162,11 +174,16 @@ impl Hammer {
         self.k_felt = k_felt * k_scale;
         self.p_felt = p_felt;
         self.inv_ulock = 1.0 / u_lock.max(1e-6);
+        self.core_k = core_k;
+        self.u_core = u_core;
+        self.f_pk = 0.0;
+        self.snap = 1.0;
         self.lock_w = lock_w;
         self.lock_cap = 2.2 * lock_w;
         self.lambda = lambda;
         self.rough = rough;
         self.rough_lp = 0.0;
+        self.rough_lp2 = 0.0;
         self.rough_rng = rough_seed | 1;
         self.inv_m = 1.0 / mass;
         self.steps = 0;
@@ -218,10 +235,59 @@ impl Hammer {
                     let lockf = 1.0 + x * self.lock_cap / (x + self.lock_cap);
                     // The loading/unloading (hysteresis) modulation is a
                     // linearisation valid for moderate felt strain rates;
-                    // clamp it so agraffe-image chatter in the treble (du of
-                    // tens of m/s) cannot run it into the F_MAX safety net.
-                    let hyst = (1.0 + self.lambda * du).clamp(0.15, 2.6);
+                    // saturate it SMOOTHLY toward the same bounds the old
+                    // hard clamp enforced (0.15 / 2.6). At treble ff the
+                    // agraffe-image chatter swings du by tens of m/s per
+                    // substep and the hard clamp slammed the force between
+                    // its two rails — a square-wave modulation that read as
+                    // high-frequency rasp. Both branches have slope 1 at
+                    // du = 0, so moderate strain rates are unchanged.
+                    let x = self.lambda * du;
+                    let hyst = if x >= 0.0 {
+                        1.0 + 1.6 * x / (1.6 + x)
+                    } else {
+                        1.0 + 0.85 * x / (0.85 - x)
+                    };
                     f = self.k_felt * u.powf(self.p_felt) * lockf * hyst;
+                    // Wood-core stage: the thin treble felt bottoms out at
+                    // forte and the string meets the hammer CORE through
+                    // it — a hard Hertzian contact that puts a
+                    // sub-0.2 ms spike on top of each contact hump. This
+                    // is the treble "ping": the smooth felt pulse tops
+                    // out ~-40 dB at 8 kHz where real C6 recordings hold
+                    // partials at -22..-38, and no smooth-stage
+                    // stiffening can bridge that (measured: lock-up moves
+                    // it 2-4 dB). Zero everywhere the felt is thick
+                    // (core_k = 0 below the top octaves).
+                    if self.core_k > 0.0 && u > self.u_core {
+                        f += self.core_k * (u - self.u_core).powf(1.5);
+                    }
+                    // Release snap (top octaves only, same gate as the
+                    // core): once the final unloading passes 75% of the
+                    // way down, the last fibres let go FAST (~35 us)
+                    // instead of following the smooth felt curve — the
+                    // one place a force discontinuity is physical, and
+                    // the only broadband source the string-impedance
+                    // relaxation cannot low-pass away. Coherent, one
+                    // event per contact: a ping, not spray.
+                    if self.core_k > 0.0 {
+                        if f > self.f_pk {
+                            self.f_pk = f;
+                            self.snap = 1.0;
+                        } else if du < 0.0 && f < 0.25 * self.f_pk {
+                            // snap hardness scales with the blow: a soft
+                            // touch peels off gently, fortissimo lets go
+                            // in ~35 us
+                            let hard = (self.f_pk / 40.0).min(1.0)
+                                * (self.core_k / 5.0e6).min(1.0);
+                            self.snap *= 1.0 - 0.14 * hard;
+                        }
+                        f *= self.snap;
+                        if f > self.f_pk * 0.5 {
+                            // re-contact hump: re-arm
+                            self.snap = 1.0;
+                        }
+                    }
                     if f < 0.0 {
                         f = 0.0;
                     } else if f > F_MAX {
@@ -251,8 +317,15 @@ impl Hammer {
                 x ^= x << 5;
                 self.rough_rng = x;
                 let white = (x >> 8) as f32 * (1.0 / 8_388_608.0) - 1.0;
-                self.rough_lp += 0.62 * (white - self.rough_lp);
-                fmean *= 1.0 + self.rough * self.rough_lp;
+                // Two poles near 2.7 kHz instead of one at 7.4 kHz: contact
+                // chatter is kHz-scale (felt fibre slips, returning agraffe
+                // ripple), not a white spray to Nyquist — the single bright
+                // pole put per-sample force steps on every ff strike. The
+                // 2.1 factor restores the modulation RMS the depth
+                // calibration was done at.
+                self.rough_lp += 0.30 * (white - self.rough_lp);
+                self.rough_lp2 += 0.30 * (self.rough_lp - self.rough_lp2);
+                fmean *= 1.0 + self.rough * (2.1 * self.rough_lp2);
             }
             *slot = fmean;
         }

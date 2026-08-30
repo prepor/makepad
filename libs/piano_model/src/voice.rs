@@ -83,6 +83,7 @@ pub struct BodyTap {
     lp3: f32,
     lp4: f32,
     c_hi: f32,
+    c_tilt: f32,
     ratio: f32, // per-burst c decay: c(t) = c_hi * ratio^(pos/len) precomputed as per-sample factor
     c_cur: f32,
     amp: f32,
@@ -100,13 +101,14 @@ impl BodyTap {
             lp3: 0.0,
             lp4: 0.0,
             c_hi: 0.1,
+            c_tilt: 0.1,
             ratio: 1.0,
             c_cur: 0.0,
             amp: 0.0,
         }
     }
 
-    pub fn start(&mut self, len: u32, att: u32, amp: f32, c_hi: f32, c_lo: f32, seed: u32) {
+    pub fn start(&mut self, len: u32, att: u32, amp: f32, c_hi: f32, c_lo: f32, c_tilt: f32, seed: u32) {
         self.pos = 0;
         self.len = len.max(1);
         self.att = att.clamp(1, self.len);
@@ -116,6 +118,7 @@ impl BodyTap {
         self.lp3 = 0.0;
         self.lp4 = 0.0;
         self.c_hi = c_hi;
+        self.c_tilt = c_tilt;
         self.c_cur = c_hi;
         // per-sample multiplicative contraction from c_hi to c_lo over len
         self.ratio = (c_lo.max(1e-6) / c_hi.max(1e-6)).powf(1.0 / self.len as f32);
@@ -139,14 +142,15 @@ impl BodyTap {
             x ^= x << 5;
             self.rng = x;
             let white = (x >> 8) as f32 * (1.0 / 8_388_608.0) - 1.0;
-            // Four cascaded poles at the contracting corner: the spray above
-            // the corner falls -24 dB/oct. With one or two poles the residue
-            // above ~5 kHz survives the direct radiation path's
-            // differentiator nearly flat to Nyquist, and a room full of
-            // per-note bursts of that reads as broadband crackle (measured:
-            // sample steps 25x the programme median, thousands per minute
-            // in dense music). Passband below the corner is unchanged.
-            self.lp += self.c_cur * (white - self.lp);
+            // One FIXED pole at the tilt corner (~1.2 kHz) plus three
+            // cascaded poles at the contracting corner. The fixed pole
+            // gives the burst the falling spectrum of a real board tap
+            // (-6 dB/oct above ~1 kHz); the three contracting poles put a
+            // -18 dB/oct lid above cs_hi. Flat noise out to 5 kHz on every
+            // strike — the earlier shape — measured as sample steps 25x the
+            // programme median in dense music and was heard as radio
+            // static/rasp twice. Passband below the tilt corner unchanged.
+            self.lp += self.c_tilt * (white - self.lp);
             self.lp2 += self.c_cur * (self.lp - self.lp2);
             self.lp3 += self.c_cur * (self.lp2 - self.lp3);
             self.lp4 += self.c_cur * (self.lp3 - self.lp4);
@@ -186,6 +190,13 @@ pub struct Voice {
     pub eff_ci: Vec<f32>,
     pub acc: [f32; MAX_CHUNK],
     pub noise_buf: [f32; MAX_CHUNK],
+    /// Structure-borne case noise (key-bottom thump, action click, damper
+    /// felt): radiated by the CASE, not driven through the bridge into the
+    /// soundboard resonators. When these went into the board bus, the
+    /// restored (livelier) low-mid board rang a 10 ms key thump for 300 ms
+    /// — "hammer noise way over represented". The knock stays bridge-borne
+    /// (it IS the string's compression precursor into the bridge).
+    pub case_buf: [f32; MAX_CHUNK],
     force: [f32; MAX_CHUNK],
     pub power: f32,
     pub quiet_ticks: u32,
@@ -240,6 +251,7 @@ impl Voice {
             eff_ci: vec![0.0; n],
             acc: [0.0; MAX_CHUNK],
             noise_buf: [0.0; MAX_CHUNK],
+            case_buf: [0.0; MAX_CHUNK],
             force: [0.0; MAX_CHUNK],
             power: 0.0,
             quiet_ticks: 0,
@@ -312,6 +324,32 @@ impl Voice {
         // contact lengthens — part of the una-corda mellowing.
         let z_scale: f64 = if soft_pedal && key.n_osc == 3 { 2.0 / 3.0 } else { 1.0 };
         let speed = velocity_to_speed(vel);
+        // Per-STRIKE variation (deterministic: seeded by key and strike
+        // count, so renders stay bit-identical for identical event
+        // streams). The per-KEY voicing scatter makes the 88 keys
+        // individuals, but every strike of one key was the same strike:
+        // on flat-velocity material (an engraving export with every note
+        // at velocity 90) repeated notes came back near-identical and
+        // read as looped samples. A real action never repeats itself —
+        // felt condition, strike point and seating vary a little every
+        // blow. A few percent on the contact parameters varies timbre,
+        // not loudness.
+        let sj = {
+            let mut x = (self.key_idx as u32)
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(self.strike_count.wrapping_mul(0x85eb_ca6b))
+                ^ 0x2545_f491;
+            let mut f = move || {
+                x ^= x >> 16;
+                x = x.wrapping_mul(0x7feb_352d);
+                x ^= x >> 15;
+                x = x.wrapping_mul(0x846c_a68b);
+                x ^= x >> 16;
+                (x >> 8) as f64 * (2.0 / 16_777_216.0) - 1.0
+            };
+            [f(), f(), f(), f()]
+        };
+        let speed = speed * (1.0 + 0.025 * sj[0]);
         // Contact roughness depth grows with hammer speed (ff pulses are
         // chopped by returning ripples; pp pulses are clean and dark). The
         // una-corda shift onto soft unworn felt smooths the contact too.
@@ -334,9 +372,9 @@ impl Voice {
         self.hammer.strike(
             speed,
             key.hammer_mass,
-            key.felt_k,
+            key.felt_k * (1.0 + 0.08 * sj[1]),
             key.felt_p,
-            u_lock,
+            u_lock * (1.0 + 0.03 * sj[2]),
             // Fresh un-compacted felt barely locks up: most of the una-corda
             // darkening at forte comes from losing that stiffening.
             key.felt_lock_w * if soft_pedal { 0.2 } else { 1.0 },
@@ -351,6 +389,8 @@ impl Voice {
             key.img_fc_mul,
             key.img_g_base,
             key.img_g_slope,
+            key.core_k * (1.0 + 0.25 * sj[3]) * if soft_pedal { 0.4 } else { 1.0 },
+            key.u_core,
         );
         // The measured attack noise of a piano is not one broadband click:
         // it is (a) a sub-100 Hz thump the key-bottom impact pumps into the
@@ -370,7 +410,7 @@ impl Voice {
             let tseed = (self.key_idx as u32).wrapping_mul(0x2545_f491)
                 ^ self.strike_count.wrapping_mul(0x9e37_79b9) ^ 0x0b0d_15ea;
             let att = (0.0015 * sample_rate) as u32;
-            self.body_tap.start(key.cs_len, att, tamp, key.cs_c_hi, key.cs_c_lo, tseed);
+            self.body_tap.start(key.cs_len, att, tamp, key.cs_c_hi, key.cs_c_lo, key.cs_c_tilt, tseed);
         }
         let camp = vc.attack_noise * if soft_pedal { 0.5 } else { 1.0 } * key.click_amp * self.vel_norm.powf(key.click_vpow);
         let cseed = seed ^ 0x00c0_ffee;
@@ -385,6 +425,7 @@ impl Voice {
         for k in 0..n {
             self.acc[k] = 0.0;
             self.noise_buf[k] = 0.0;
+            self.case_buf[k] = 0.0;
         }
         let has_force = if self.hammer.active {
             self.hammer.render_force(&mut self.force, n)
@@ -459,9 +500,9 @@ impl Voice {
                 }
             }
         }
-        self.thump.render_add(&mut self.noise_buf, n);
-        self.click.render_add(&mut self.noise_buf, n);
-        self.damper_noise.render_add(&mut self.noise_buf, n);
+        self.thump.render_add(&mut self.case_buf, n);
+        self.click.render_add(&mut self.case_buf, n);
+        self.damper_noise.render_add(&mut self.case_buf, n);
     }
 
     pub fn silence(&mut self) {

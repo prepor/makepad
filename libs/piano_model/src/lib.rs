@@ -49,12 +49,13 @@ mod sympathetic;
 mod soundboard;
 pub mod fx;
 mod mt;
+pub mod learned;
 
 use fx::{soft_clip, DcBlock, EarlyReflections, Eq, Perspective, Reverb, ReverbParams, ReverbPreset, Tone};
 use keys::{build_key, KeyDesign, FIRST_KEY, LAST_KEY, NUM_KEYS};
-pub use params::{DesignParams, PianoPreset, Voicing, VoicingPreset, PIANO_PRESETS};
+pub use params::{DesignParams, PianoPreset, Voicing, PIANO_PRESETS};
 use modal::{detect_path, run_modes, KernelPath, MAX_CHUNK};
-use soundboard::Soundboard;
+use soundboard::{Soundboard, BOARD_REGIONS};
 use sympathetic::SymBank;
 use voice::Voice;
 
@@ -125,7 +126,7 @@ pub trait Instrument {
 /// just into the soft saturator (which then acts as the mastering limiter
 /// every commercial piano recording goes through), and a pp note stays
 /// ~20 dB under a ff one.
-const MASTER_GAIN: f32 = 0.102;
+const MASTER_GAIN: f32 = 0.25;
 /// A voice whose 64-sample bridge-force energy stays below this for ~16 ms
 /// is put to sleep (and its state zeroed, keeping wake-ups deterministic).
 const VOICE_SILENCE_POWER: f32 = 1e-5;
@@ -134,6 +135,12 @@ const DAMPER_NOISE_POWER: f32 = 0.1;
 const DAMPER_NOISE_AMP: f32 = 0.25;
 /// Sustain pedal value at/above which dampers are fully lifted.
 const PEDAL_FULL_LIFT: f32 = 0.75;
+/// Gain and colour corner of the DIRECT case-radiation path used for the
+/// (1 - attack_body) share of the mechanical attack: band-limited like a
+/// massive wooden case (~700 Hz, -12 dB/oct above), calibrated so the two
+/// ends of the attack_body axis sit at comparable loudness.
+const CASE_GAIN: f32 = 6.0;
+const CASE_LP_HZ: f64 = 700.0;
 
 /// Radiation filter for the panned direct-string path: differentiate
 /// (pressure couples to velocity), flatten at the bottom of the radiativity
@@ -151,14 +158,14 @@ struct RadTilt {
 }
 
 impl RadTilt {
-    fn new(sample_rate: f64, lp_hz: f64) -> Self {
+    fn new(sample_rate: f64, lp_hz: f64, vel_hz: f64) -> Self {
         Self {
             dx1: 0.0,
             dlp: 0.0,
             dlp2: 0.0,
-            c: (1.0 - (-core::f64::consts::TAU * 150.0 / sample_rate).exp()) as f32,
+            c: (1.0 - (-core::f64::consts::TAU * vel_hz / sample_rate).exp()) as f32,
             c2: (1.0 - (-core::f64::consts::TAU * lp_hz / sample_rate).exp()) as f32,
-            scale: (sample_rate / (core::f64::consts::TAU * 150.0)) as f32,
+            scale: (sample_rate / (core::f64::consts::TAU * vel_hz)) as f32,
         }
     }
 
@@ -175,6 +182,21 @@ impl RadTilt {
         self.dx1 = 0.0;
         self.dlp = 0.0;
         self.dlp2 = 0.0;
+    }
+}
+
+/// Bridge region for a key index: the bass bridge carries the wound
+/// strings (single and double unisons), then the long bridge in thirds.
+#[inline(always)]
+fn key_region(idx: usize) -> usize {
+    if idx < 20 {
+        0
+    } else if idx < 44 {
+        1
+    } else if idx < 66 {
+        2
+    } else {
+        3
     }
 }
 
@@ -208,9 +230,14 @@ pub(crate) struct EngineCore {
     sym_gate: f32,
     /// bus power accumulated since the last control tick (64-grid)
     bus_pow_acc: f32,
-    /// damped-bank gate decided ON the control grid (never mid-chunk, so
-    /// the decision cannot depend on host-buffer chunk splits)
-    damped_on: bool,
+    /// damped-bank drive, SMOOTHED on the control grid (never mid-chunk,
+    /// so the value cannot depend on host-buffer chunk splits). This was a
+    /// boolean gate: with the bus power hovering near the threshold it
+    /// flipped the whole damped-string bed on and off chunk to chunk — a
+    /// per-64-sample switched mechanism, exactly the class of hard edge
+    /// the listener kept flagging. The threshold still decides the TARGET;
+    /// the applied gain glides.
+    damped_gain: f32,
     couple_loss: f32,
     // quantised bath-loading extra radius currently applied to voices
     bath_r: f32,
@@ -239,13 +266,19 @@ pub(crate) struct EngineCore {
     dbg_direct: f32,
     // chunk scratch
     bus: [f32; MAX_CHUNK],
-    noise: [f32; MAX_CHUNK],
     sym_out: [f32; MAX_CHUNK],
-    board_in: [f32; MAX_CHUNK],
+    /// per-bridge-region board drive (voice bridge force + its mechanical
+    /// noise land in the voice's own region; see soundboard.rs)
+    board_in: [[f32; MAX_CHUNK]; BOARD_REGIONS],
     board_l: [f32; MAX_CHUNK],
     board_r: [f32; MAX_CHUNK],
     dir_l: [f32; MAX_CHUNK],
     dir_r: [f32; MAX_CHUNK],
+    case_l: [f32; MAX_CHUNK],
+    case_r: [f32; MAX_CHUNK],
+    case_lp: [f32; 4],
+    case_lp_c: f32,
+
     dir_tilt_l: RadTilt,
     dir_tilt_r: RadTilt,
 }
@@ -264,19 +297,16 @@ impl Piano {
     }
 
     /// Builds one of the shipped instrument presets (see
-    /// params::PIANO_PRESETS): design + voicing + room in one call.
-    /// Selecting a preset whose `needs_rebuild()` is true means calling
-    /// this again (construction, not the audio path); a voicing-only
-    /// preset can instead be applied live with `apply_preset_live`.
+    /// params::PIANO_PRESETS): the reference design, plus the preset's
+    /// voicing and room.
     pub fn new_with_preset(sample_rate: f32, preset: &PianoPreset) -> Self {
-        let mut p = Self::new_with_params(sample_rate, &preset.design_params());
+        let mut p = Self::new(sample_rate);
         p.apply_preset_live(preset);
         p
     }
 
-    /// Applies the runtime part of a preset (voicing + room) to this
-    /// instrument. If `preset.needs_rebuild()` the construction-time design
-    /// is NOT applied — build with `new_with_preset` for the full change.
+    /// Applies a preset (voicing + room) to this instrument. A preset is
+    /// entirely runtime state, so this never rebuilds anything.
     pub fn apply_preset_live(&mut self, preset: &PianoPreset) {
         self.set_voicing(preset.voicing);
         self.set_reverb_preset(preset.room);
@@ -344,7 +374,7 @@ impl Piano {
             sym_damped_gain: dp.sym_damped as f32,
             sym_gate: dp.sym_gate as f32,
             bus_pow_acc: 0.0,
-            damped_on: false,
+            damped_gain: 0.0,
             couple_loss: dp.couple_loss as f32,
             bath_r: 1.0,
             dup_zr: dup.0,
@@ -369,15 +399,19 @@ impl Piano {
             dbg_board_modal: 1.0,
             dbg_direct: 1.0,
             bus: [0.0; MAX_CHUNK],
-            noise: [0.0; MAX_CHUNK],
             sym_out: [0.0; MAX_CHUNK],
-            board_in: [0.0; MAX_CHUNK],
+            board_in: [[0.0; MAX_CHUNK]; BOARD_REGIONS],
             board_l: [0.0; MAX_CHUNK],
             board_r: [0.0; MAX_CHUNK],
             dir_l: [0.0; MAX_CHUNK],
             dir_r: [0.0; MAX_CHUNK],
-            dir_tilt_l: RadTilt::new(sample_rate as f64, dp.rad_lp),
-            dir_tilt_r: RadTilt::new(sample_rate as f64, dp.rad_lp),
+            case_l: [0.0; MAX_CHUNK],
+            case_r: [0.0; MAX_CHUNK],
+            case_lp: [0.0; 4],
+            case_lp_c: (1.0 - (-core::f64::consts::TAU * CASE_LP_HZ / sample_rate as f64).exp()) as f32,
+
+            dir_tilt_l: RadTilt::new(sample_rate as f64, dp.rad_lp, dp.rad_vel_hz),
+            dir_tilt_r: RadTilt::new(sample_rate as f64, dp.rad_lp, dp.rad_vel_hz),
         };
         Self { keys, core, voices }
     }
@@ -491,10 +525,6 @@ impl Piano {
 
     pub fn voicing(&self) -> Voicing {
         self.core.voicing
-    }
-
-    pub fn set_voicing_preset(&mut self, p: VoicingPreset) {
-        self.set_voicing(p.voicing());
     }
 
     // ------------------------------------------------------------------
@@ -645,6 +675,8 @@ impl Piano {
             k.img_fc_mul,
             k.img_g_base,
             k.img_g_slope,
+            k.core_k,
+            k.u_core,
         );
         let mut pos = 0;
         while pos + MAX_CHUNK <= out.len() {
@@ -690,6 +722,51 @@ impl Piano {
         (peak, (e / n.max(1) as f64).sqrt())
     }
 
+    /// EXPERIMENTAL — learned-hybrid prototyping (see learned.rs and
+    /// tests/learned_targets.rs): reshapes one key's string partials.
+    /// `gain[m]` multiplies partial m+1's output weight on every unison
+    /// string; `sigma_scale[m]` raises that partial's pole radius to the
+    /// given power (r -> r^s, so s > 1 decays faster and s < 1 sustains
+    /// longer; values are clamped to 0.25..=4.0). Control path only —
+    /// call between process() calls, never from inside; allocates nothing.
+    /// The shipped instrument never calls this: it exists so offline
+    /// experiments can impose learned per-partial targets on the physical
+    /// excitation/coupling and be listened to.
+    #[doc(hidden)]
+    pub fn debug_shape_partials(&mut self, key: u8, gain: &[f32], sigma_scale: &[f32]) {
+        if !(FIRST_KEY..=LAST_KEY).contains(&key) {
+            return;
+        }
+        let i = (key - FIRST_KEY) as usize;
+        let k = &mut self.keys[i];
+        let mp = k.modes_padded;
+        for osc in 0..k.n_osc {
+            for m in 0..k.modes_per_osc {
+                let idx = osc * mp + m;
+                if let Some(&g) = gain.get(m) {
+                    if g.is_finite() && g >= 0.0 {
+                        k.gout[idx] *= g;
+                    }
+                }
+                if let Some(&s) = sigma_scale.get(m) {
+                    if s.is_finite() {
+                        let s = s.clamp(0.25, 4.0) as f64;
+                        let (cr, ci) = (k.cr_sus[idx] as f64, k.ci_sus[idx] as f64);
+                        let r = (cr * cr + ci * ci).sqrt();
+                        if r > 1e-12 && r < 1.0 {
+                            let scale = r.powf(s - 1.0);
+                            k.cr_sus[idx] = (cr * scale) as f32;
+                            k.ci_sus[idx] = (ci * scale) as f32;
+                        }
+                    }
+                }
+            }
+        }
+        let v = &mut self.voices[i];
+        let eng = v.eng;
+        v.rebuild(k, eng);
+    }
+
     /// Full state reset (voices, pedals, resonance, effects, clock).
     pub fn reset(&mut self) {
         for v in &mut self.voices {
@@ -713,7 +790,7 @@ impl Piano {
         self.core.dup_zi.fill(0.0);
         self.core.bath_r = 1.0;
         self.core.bus_pow_acc = 0.0;
-        self.core.damped_on = false;
+        self.core.damped_gain = 0.0;
         self.core.er.reset();
         self.core.reverb.reset();
         self.core.tone.reset();
@@ -722,6 +799,7 @@ impl Piano {
         self.core.dc_r.reset();
         self.core.dir_tilt_l.reset();
         self.core.dir_tilt_r.reset();
+        self.core.case_lp = [0.0; 4];
         self.core.sustain = 0.0;
         self.core.soft = false;
         self.core.global_sample = 0;
@@ -800,7 +878,11 @@ impl EngineCore {
         // Dampers lift over the top of the pedal travel and the felt only
         // grips near full engagement: a strongly nonlinear curve is what
         // makes half-pedalling usable.
-        self.damped_on = self.sym_damped_gain > 0.0 && self.bus_pow_acc > self.sym_gate;
+        let damped_target = if self.sym_damped_gain > 0.0 && self.bus_pow_acc > self.sym_gate { 1.0 } else { 0.0 };
+        self.damped_gain += 0.35 * (damped_target - self.damped_gain);
+        if self.damped_gain < 1e-3 {
+            self.damped_gain = 0.0;
+        }
         self.bus_pow_acc = 0.0;
         let lift_target = ((PEDAL_FULL_LIFT - self.sustain).max(0.0) / PEDAL_FULL_LIFT).min(1.0).powf(2.5);
         // Bath-loading: how much open string is there for a sounding string
@@ -895,13 +977,24 @@ impl EngineCore {
     ) {
         for k in 0..n {
             self.bus[k] = 0.0;
-            self.noise[k] = 0.0;
             self.sym_out[k] = 0.0;
             self.dir_l[k] = 0.0;
             self.dir_r[k] = 0.0;
+            self.case_l[k] = 0.0;
+            self.case_r[k] = 0.0;
             self.board_l[k] = 0.0;
             self.board_r[k] = 0.0;
         }
+        for reg in 0..BOARD_REGIONS {
+            for k in 0..n {
+                self.board_in[reg][k] = 0.0;
+            }
+        }
+        // attack_body: the share of the mechanical attack that couples
+        // through the board (the woody attack the listener chose) vs the
+        // tight case-coloured direct path; see params::Voicing.
+        let ab = self.voicing.attack_body;
+        let ab_dir = (1.0 - ab) * CASE_GAIN;
         for v in voices.iter_mut() {
             if !v.active {
                 continue;
@@ -909,13 +1002,34 @@ impl EngineCore {
             let pan = keys[v.key_idx].pan * self.pan_sign;
             let ang = (pan + 1.0) * core::f32::consts::FRAC_PI_4;
             let (pl, pr) = (ang.cos(), ang.sin());
+            // which stretch of bridge this key's strings terminate on:
+            // the bass bridge, then thirds of the long bridge (mirrored
+            // with the pan sign so Audience view flips the board too)
+            let reg = {
+                let r = key_region(v.key_idx);
+                if self.pan_sign >= 0.0 { r } else { BOARD_REGIONS - 1 - r }
+            };
             let mut p = v.power;
             for k in 0..n {
                 let a = v.acc[k];
                 self.bus[k] += a;
                 self.dir_l[k] += pl * a;
                 self.dir_r[k] += pr * a;
-                self.noise[k] += v.noise_buf[k];
+                // The attack complex (thump, click, damper felt) couples
+                // INTO the board with the bridge force. A round of this
+                // work rerouted it to a direct, unresonant path because the
+                // coupled version measured a +19 dB low-mid tail at 300 ms
+                // — and the listener rejected the result twice ("weird",
+                // "way too loud") while calling the coupled build "the
+                // beginning of an actual piano". The tail IS the
+                // instrument's body answering the blow; the character is
+                // the coupling, and the proportion is set by the noise
+                // generators' levels (already well below the original
+                // build's at forte). The ear outranks the energy metric
+                // here, same as the quadrature lesson.
+                self.board_in[reg][k] += a + v.noise_buf[k] + ab * v.case_buf[k];
+                self.case_l[k] += ab_dir * pl * v.case_buf[k];
+                self.case_r[k] += ab_dir * pr * v.case_buf[k];
                 p += a * a;
             }
             v.power = p;
@@ -925,16 +1039,22 @@ impl EngineCore {
             bus_pow += self.bus[k] * self.bus[k];
         }
         self.bus_pow_acc += bus_pow;
-        let damped_on = self.damped_on && self.voicing.sympathetic > 0.0;
+        let damped_drive = if self.voicing.sympathetic > 0.0 { self.damped_gain } else { 0.0 };
         let sym_send = self.sym_out_gain * self.voicing.sympathetic;
         for i in 0..NUM_KEYS {
             let s = &mut self.sym[i];
             if s.active {
                 s.render(&keys[i], self.path, &self.bus[..n], self.sym_in, &mut self.sym_out[..n]);
-            } else if damped_on {
+            } else if damped_drive > 0.0 {
                 // felt-damped strings still couple: heavily damped rotations,
-                // small drive, rendered only while the bridge is energetic
-                s.render(&keys[i], self.path, &self.bus[..n], self.sym_in * self.sym_damped_gain, &mut self.sym_out[..n]);
+                // small drive, faded in and out on the control grid
+                s.render(
+                    &keys[i],
+                    self.path,
+                    &self.bus[..n],
+                    self.sym_in * self.sym_damped_gain * damped_drive,
+                    &mut self.sym_out[..n],
+                );
             }
         }
         if self.dup_gain > 0.0 && self.voicing.sympathetic > 0.0 {
@@ -951,15 +1071,30 @@ impl EngineCore {
                 &mut self.sym_out[..n],
             );
         }
-        for k in 0..n {
-            self.board_in[k] = self.bus[k] + sym_send * self.sym_out[k] + self.noise[k];
+        // the sympathetic bed and duplex ring couple through the whole
+        // bridge: spread them evenly over the regions
+        let sym_spread = sym_send * (1.0 / BOARD_REGIONS as f32);
+        for reg in 0..BOARD_REGIONS {
+            for k in 0..n {
+                self.board_in[reg][k] += sym_spread * self.sym_out[k];
+            }
         }
-        self.board.render(self.path, &self.board_in[..n], &mut self.board_l[..n], &mut self.board_r[..n]);
+        self.board.render(self.path, &self.board_in, n, &mut self.board_l[..n], &mut self.board_r[..n]);
         for k in 0..n {
             let dsl = self.dir_tilt_l.process(self.dir_l[k]);
             let dsr = self.dir_tilt_r.process(self.dir_r[k]);
-            let pl = self.master * (self.dbg_board_modal * self.board_l[k] + self.dbg_direct * self.direct_string * dsl);
-            let pr = self.master * (self.dbg_board_modal * self.board_r[k] + self.dbg_direct * self.direct_string * dsr);
+            // case colour for the direct share (see CASE_LP_HZ)
+            let cc = self.case_lp_c;
+            self.case_lp[0] += cc * (self.case_l[k] - self.case_lp[0]);
+            self.case_lp[1] += cc * (self.case_lp[0] - self.case_lp[1]);
+            self.case_lp[2] += cc * (self.case_r[k] - self.case_lp[2]);
+            self.case_lp[3] += cc * (self.case_lp[2] - self.case_lp[3]);
+            let pl = self.master
+                * (self.dbg_board_modal * self.board_l[k]
+                    + self.dbg_direct * (self.direct_string * dsl + self.case_lp[1]));
+            let pr = self.master
+                * (self.dbg_board_modal * self.board_r[k]
+                    + self.dbg_direct * (self.direct_string * dsr + self.case_lp[3]));
             // channel EQ ahead of the room: the reflections and tail hear
             // the EQ'd source, the way a desk insert feeds the sends
             let (pl, pr) = self.eq.process(pl, pr);

@@ -221,11 +221,21 @@ unsafe fn run_modes_avx2(
     }
 }
 
-/// Stereo-tap variant used by the soundboard: the left tap reads Im(z), the
-/// right tap reads Re(z) (a free 90-degree per-mode phase offset that
-/// decorrelates the channels the way a listener's two ears see a large
-/// radiating plate at different phases).
+/// Stereo-tap variant used by the soundboard. The left tap reads Im(z);
+/// the right tap reads a per-mode MIX of both quadratures,
+///     R_m = gri_m * Im(z) + grr_m * Re(z),
+/// which realises an arbitrary interchannel phase per mode: with
+/// gri = g cos(phi), grr = g sin(phi) the right channel hears the mode
+/// phase-shifted by phi relative to the left. The soundboard derives phi
+/// from a physically sized interaural/microphone time difference for the
+/// mode's radiation position (phi = 2 pi f tau), so LOW modes stay nearly
+/// coherent between the channels and only the high ones scatter — the
+/// interchannel-coherence-vs-frequency envelope of a real instrument at a
+/// listening position. (The previous scheme read Im left / Re right with
+/// random signs: a blanket 90-degree offset that pinned the midrange
+/// interchannel correlation near zero — a phasey wash, not a soundstage.)
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn run_modes_stereo(
     path: KernelPath,
     zr: &mut [f32],
@@ -234,7 +244,8 @@ pub fn run_modes_stereo(
     ci: &[f32],
     gin: &[f32],
     gout_l: &[f32],
-    gout_r: &[f32],
+    gout_ri: &[f32],
+    gout_rr: &[f32],
     input: &[f32],
     in_gain: f32,
     acc_l: &mut [f32],
@@ -245,21 +256,22 @@ pub fn run_modes_stereo(
         KernelPath::Scalar => {
             let n = input.len();
             for m in 0..zr.len() {
-                let (crm, cim, ginm, glm, grm) = (cr[m], ci[m], gin[m], gout_l[m], gout_r[m]);
+                let (crm, cim, ginm) = (cr[m], ci[m], gin[m]);
+                let (glm, grim, grrm) = (gout_l[m], gout_ri[m], gout_rr[m]);
                 let (mut r, mut i) = (zr[m], zi[m]);
                 for k in 0..n {
                     let t = crm * r - cim * i;
                     i = cim * r + crm * i + ginm * (in_gain * input[k]);
                     r = t;
                     acc_l[k] += glm * i;
-                    acc_r[k] += grm * r;
+                    acc_r[k] += grim * i + grrm * r;
                 }
                 zr[m] = r;
                 zi[m] = i;
             }
         }
         _ => {
-            // 4-wide is plenty for the (shared, small) soundboard bank; the
+            // 4-wide is plenty for the (shared) soundboard banks; the
             // AVX2 machine also takes this path here.
             let n = input.len();
             let mut vacc_l = [zero_v4(); MAX_CHUNK];
@@ -272,14 +284,15 @@ pub fn run_modes_stereo(
                 let civ = load_v4(&ci[m..]);
                 let ginv = load_v4(&gin[m..]);
                 let glv = load_v4(&gout_l[m..]);
-                let grv = load_v4(&gout_r[m..]);
+                let griv = load_v4(&gout_ri[m..]);
+                let grrv = load_v4(&gout_rr[m..]);
                 for k in 0..n {
                     let f = splat_v4(in_gain * input[k]);
                     let t = sub_v4(mul_v4(crv, zrv), mul_v4(civ, ziv));
                     ziv = fma_v4(ginv, f, fma_v4(civ, zrv, mul_v4(crv, ziv)));
                     zrv = t;
                     vacc_l[k] = fma_v4(glv, ziv, vacc_l[k]);
-                    vacc_r[k] = fma_v4(grv, zrv, vacc_r[k]);
+                    vacc_r[k] = fma_v4(griv, ziv, fma_v4(grrv, zrv, vacc_r[k]));
                 }
                 store_v4(&mut zr[m..], zrv);
                 store_v4(&mut zi[m..], ziv);

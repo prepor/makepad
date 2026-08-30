@@ -67,6 +67,8 @@ pub struct KeyDesign {
     pub felt_p: f64,
     pub felt_u_lock: f64,
     pub felt_lock_w: f64,
+    pub core_k: f64,
+    pub u_core: f64,
     pub felt_lambda: f64,
     pub z_total: f64,                // wave impedance seen by the hammer (n_strings * Z)
     pub t1_seconds: f64,             // agraffe reflection round trip 2 x0 / c
@@ -90,6 +92,7 @@ pub struct KeyDesign {
     pub cs_len: u32,
     pub cs_c_hi: f32,
     pub cs_c_lo: f32,
+    pub cs_c_tilt: f32,
     pub cs_vpow: f32,
     // Direct hammer-blow shock into the bridge:
     pub knock_amp: f32,
@@ -203,6 +206,20 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
     let e_mf = 0.5 * hammer_mass * v_mf * v_mf;
     let u_mf = (e_mf * (felt_p + 1.0) / felt_k).powf(1.0 / (felt_p + 1.0));
     let felt_u_lock = p.lock_frac * u_mf;
+    // wood core: only the top octaves' thin felt reaches it. Absolute
+    // Hertzian scale (N per m^1.5): at ~0.25 mm of over-compression the
+    // stage contributes some tens of newtons — a sharp feature on top of
+    // the ~75 N felt pulse, not a wall (scaling it off felt_k mixed the
+    // two force laws' exponents and produced a 1300 N delta spike).
+    // ramps in above ~F4, full through the C6 octave, then backs off
+    // toward C8: the reference ladders of the top two octaves fall
+    // steeply after their first partials (tiny hammers, sub-half-ms
+    // dwell), and the full snap there overshot them by 3-6 dB.
+    let core_up = ((t - 0.55) / 0.17).clamp(0.0, 1.0);
+    let core_dn = 1.0 - 0.97 * ((t - 0.75) / 0.09).clamp(0.0, 1.0);
+    let core_w = core_up * core_dn;
+    let core_k = p.core_mul * 1.0e7 * core_w * core_w;
+    let u_core = p.core_frac * u_mf;
     let felt_lock_w = p.lockw_lo + (p.lockw_hi - p.lockw_lo) * t;
     let strike_pos =
         (p.spos_lo - (p.spos_lo - p.spos_hi) * t.powf(p.spos_pow)) * (1.0 + 0.04 * sc * kj(idx, 2));
@@ -282,7 +299,16 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
             if fn_hz >= 0.499 * sample_rate {
                 continue; // stays a zero (dead) mode
             }
-            let sigma = ((sigma_fund + a2 * ((fn_hz / 1000.0).powi(2) - (f0 / 1000.0).powi(2))).max(0.15) * smult).min(400.0);
+            let fk = fn_hz / 1000.0;
+            let f0k = f0 / 1000.0;
+            let wound = p.a1_wound * (1.0 - t).powi(3);
+            let sigma = ((sigma_fund
+                + wound * (fk - f0k)
+                + a2 * (fk * fk - f0k * f0k)
+                + p.a4 * (fk.powi(4) - f0k.powi(4)))
+            .max(0.15)
+                * smult)
+                .min(400.0);
             let r = (-sigma * dt).exp();
             let theta = core::f64::consts::TAU * fn_hz * dt;
             cr_sus[m] = (r * theta.cos()) as f32;
@@ -403,7 +429,16 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         if fn_hz >= 0.499 * sample_rate {
             continue;
         }
-        let sigma = ((sigma_fund + a2 * ((fn_hz / 1000.0).powi(2) - (f0 / 1000.0).powi(2))).max(0.15) * 1.2).min(400.0);
+        let fk = fn_hz / 1000.0;
+        let f0k = f0 / 1000.0;
+        let wound = p.a1_wound * (1.0 - t).powi(3);
+        let sigma = ((sigma_fund
+            + wound * (fk - f0k)
+            + a2 * (fk * fk - f0k * f0k)
+            + p.a4 * (fk.powi(4) - f0k.powi(4)))
+        .max(0.15)
+            * 1.2)
+            .min(400.0);
         let r = (-sigma * dt).exp();
         let theta = core::f64::consts::TAU * fn_hz * dt;
         sym_cr[m] = (r * theta.cos()) as f32;
@@ -428,6 +463,8 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         felt_p,
         felt_u_lock,
         felt_lock_w,
+        core_k,
+        u_core,
         felt_lambda,
         z_total,
         t1_seconds,
@@ -452,6 +489,7 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         cs_len: (p.cs_ms * 0.001 * sample_rate * ((1.0 - t) + 0.12).powf(p.cs_taper)).max(16.0) as u32,
         cs_c_hi: (1.0 - (-core::f64::consts::TAU * p.cs_hi / sample_rate).exp()) as f32,
         cs_c_lo: (1.0 - (-core::f64::consts::TAU * p.cs_lo / sample_rate).exp()) as f32,
+        cs_c_tilt: (1.0 - (-core::f64::consts::TAU * p.cs_tilt / sample_rate).exp()) as f32,
         cs_vpow: p.cs_vpow as f32,
         cr_sus,
         ci_sus,
@@ -468,7 +506,7 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         // partials, heavier strings). Normalising to the key's typical mf
         // bridge amplitude keeps the quadratic LAW per key while placing
         // the ff phantom level comparably across the compass.
-        ph_gain: (p.ph_gain * (0.29 + 0.67 * (1.0 - t).powf(2.4))) as f32,
+        ph_gain: (p.ph_gain * (0.29 + 0.67 * (1.0 - t).powf(2.4)) * ((1.0 - t) + 0.05).powf(p.ph_taper)) as f32,
         ph_direct: p.ph_direct as f32,
         ph_hp_c: (1.0 - (-core::f64::consts::TAU * p.ph_hp / sample_rate).exp()) as f32,
         ph_pre_c: (1.0 - (-core::f64::consts::TAU * 5200.0 / sample_rate).exp()) as f32,

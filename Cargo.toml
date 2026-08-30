@@ -3,6 +3,7 @@ workspace.members = [
     "apps/mpbrowser",
     "apps/mpterm",
     "apps/mpwm",
+    "apps/finance",
     "apps/mpsheets",
     "libs/mp_theme",
     "libs/mp_wm_api",

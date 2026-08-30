@@ -429,6 +429,21 @@ impl PlaybackBridge {
         &self.plan
     }
 
+    /// How long the piece is, in quarters. The scrub bar's range: a fixed one
+    /// puts the marker at a fraction of the wrong whole, which is a playhead
+    /// that disagrees with the page.
+    pub fn end_quarter(&self) -> f64 {
+        let end = self
+            .plan
+            .tempo_map()
+            .sample_to_quarter(self.plan.end_sample());
+        if end.is_finite() && end > 1.0 {
+            end
+        } else {
+            1.0
+        }
+    }
+
     pub fn clock_snapshot(&self) -> AudioClockSnapshot {
         self.clock.read()
     }
@@ -996,7 +1011,13 @@ fn compile_plan(score: &Score, bpm: f64, count_in: bool) -> PerformancePlan {
                     part,
                     note_id: note.id.counter(),
                     key: crate::document::pitch_to_midi(pitch),
-                    dynamic: 0.68,
+                    // A note that was PLAYED knows how hard. Only a note that
+                    // was written has to be given a dynamic.
+                    dynamic: note
+                        .performance
+                        .map_or(ENGRAVED_DYNAMIC, |played| {
+                            f32::from(played.velocity) / 127.0
+                        }),
                     articulation: articulation_for_event(&event.kind),
                     swing_eligible: true,
                 });
@@ -1019,8 +1040,28 @@ fn compile_plan(score: &Score, bpm: f64, count_in: bool) -> PerformancePlan {
         .map(|note| note.at_quarter + note.duration_quarters)
         .fold(0.0_f64, f64::max);
     input.end_quarter = measures_end_quarter.max(notes_end_quarter);
-    let tempo = TempoMap::constant(PLAN_RATE, bpm.clamp(20.0, 400.0))
-        .unwrap_or_else(|_| TempoMap::constant(PLAN_RATE, 120.0).expect("fallback tempo is valid"));
+    // The damper pedal, as performed. Without it the dampers never lift and
+    // every note stops the moment its written value runs out.
+    for change in &score.maps.pedal {
+        input.pedals.push(makepad_score_play::PedalInput {
+            at_quarter: rational_f64(change.at.0) * 4.0,
+            part: 0,
+            // The controller's 0..127 in the scheduler's 0..65535.
+            value: (u32::from(change.value.value) * 65_535 / 127) as u16,
+        });
+    }
+    input
+        .pedals
+        .retain(|pedal| pedal.at_quarter <= input.end_quarter);
+    // The score's OWN tempo map, when it has one. A performance is mostly
+    // rubato — a recording of this prelude carries three hundred tempo changes
+    // — and flattening it to one number is what makes a performance sound
+    // typed. `bpm` stays the fallback and the transport's tempo control still
+    // scales the whole map through `set_tempo`.
+    let tempo = score_tempo_map(score).unwrap_or_else(|| {
+        TempoMap::constant(PLAN_RATE, bpm.clamp(20.0, 400.0))
+            .unwrap_or_else(|_| TempoMap::constant(PLAN_RATE, 120.0).expect("fallback tempo is valid"))
+    });
     let count_in = count_in.then(|| CountInSpec {
         meter: Meter::new(4, 4, &[4]).expect("4/4 is valid"),
         bars: 1,
@@ -1047,8 +1088,58 @@ fn compile_plan(score: &Score, bpm: f64, count_in: bool) -> PerformancePlan {
     })
 }
 
+/// What a note with no recorded velocity is played at: an ordinary mezzo.
+const ENGRAVED_DYNAMIC: f32 = 0.68;
+
+/// Notes sound their full written value.
+///
+/// `Articulation::Normal` shortens a note to 90% of its value, which is a
+/// sensible default for a notation program deciding how to READ an engraving.
+/// It is wrong here: a performance already says exactly how long each note was
+/// held, and clipping every one of them by a tenth puts a silence between
+/// every pair of adjacent notes — 549 of them in a prelude of running
+/// sixteenths, which is precisely the sound of a machine playing.
 fn articulation_for_event(_kind: &EventKind) -> PlayArticulation {
-    PlayArticulation::Normal
+    PlayArticulation::Custom { gate: 1.0, attack: 1.0 }
+}
+
+/// The score's tempo map as the scheduler wants it. `None` when the score has
+/// no tempo of its own, or when the points do not make a usable map.
+fn score_tempo_map(score: &Score) -> Option<TempoMap> {
+    let mut points: Vec<makepad_score_play::TempoPoint> = Vec::new();
+    for change in &score.maps.tempo {
+        let quarter = rational_f64(change.at.0) * 4.0;
+        if !quarter.is_finite() || quarter < 0.0 {
+            continue;
+        }
+        let (bpm, ramp) = match change.value {
+            makepad_score::model::Tempo::Instant { quarters_per_minute } => {
+                (rational_f64(quarters_per_minute), false)
+            }
+            makepad_score::model::Tempo::Ramp { from_quarters_per_minute, .. } => {
+                (rational_f64(from_quarters_per_minute), true)
+            }
+        };
+        if !(20.0..=400.0).contains(&bpm) {
+            continue;
+        }
+        points.push(makepad_score_play::TempoPoint {
+            quarter,
+            bpm,
+            ramp_to_next: ramp,
+        });
+    }
+    if points.is_empty() {
+        return None;
+    }
+    points.sort_by(|a, b| a.quarter.total_cmp(&b.quarter));
+    points.dedup_by(|a, b| a.quarter == b.quarter);
+    // The map must start at zero or the scheduler has no tempo for the pickup.
+    if points[0].quarter > 0.0 {
+        let first = points[0];
+        points.insert(0, makepad_score_play::TempoPoint { quarter: 0.0, ..first });
+    }
+    TempoMap::new(PLAN_RATE, points).ok()
 }
 
 fn rational_f64(value: Rational) -> f64 {
@@ -1372,4 +1463,5 @@ mod tests {
         // The modelled piano actually sounded the notes those blocks dispatched.
         assert!(peak > 1.0e-4, "rendered audio is silent (peak {peak})");
     }
+
 }

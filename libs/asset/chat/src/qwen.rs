@@ -280,18 +280,35 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
                 order.insert(0, good);
             }
         }
+        // One scan. A designated chat HOME — a box whose /health advertises
+        // decode lanes — ends it outright: lanes mean a resident model,
+        // per-conversation KV and clamped budgets. A usable box WITHOUT
+        // lanes is only the fallback, taken when no home answers anywhere:
+        // that box reloads and re-prefills the whole context on every
+        // visit, and the old stop-at-first-usable rule kept chat exactly
+        // there ("it just keeps running prefill").
+        let mut fallback: Option<(String, String, bool)> = None;
         for base in order {
             if self.picks.is_dead(&base) {
                 reasons.push(format!("{base}: skipped (recently unreachable)"));
                 continue;
             }
             match self.probe_one(&base, &mut reasons) {
-                Some((model, text_fallback)) => {
+                Some((model, text_fallback, true)) => {
                     self.picks.remember(base.clone(), model.clone(), text_fallback);
                     return Ok((base, model, text_fallback));
                 }
+                Some((model, text_fallback, false)) => {
+                    if fallback.is_none() {
+                        fallback = Some((base, model, text_fallback));
+                    }
+                }
                 None => {}
             }
+        }
+        if let Some((base, model, text_fallback)) = fallback {
+            self.picks.remember(base.clone(), model.clone(), text_fallback);
+            return Ok((base, model, text_fallback));
         }
         // STALE-OK: the LAN to a busy GPU box drops the odd connect, and a
         // probe window can catch two drops in a row. A node that served
@@ -321,7 +338,9 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
         }
     }
 
-    fn probe_one(&mut self, base: &str, reasons: &mut Vec<String>) -> Option<(String, bool)> {
+    /// The third element of a hit says whether this box is a lane-advertising
+    /// chat home (see `probe`).
+    fn probe_one(&mut self, base: &str, reasons: &mut Vec<String>) -> Option<(String, bool, bool)> {
         let health = match self.get_json_retry(&format!("{base}/health")) {
             Ok(v) => v,
             Err(e) => {
@@ -338,7 +357,9 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
         // Lane contention rides along with the probe we already pay for —
         // never its own request. Absence is meaningful (one lane), so it is
         // recorded as absence.
-        self.picks.remember_lanes(base, parse_lanes(&health));
+        let lanes = parse_lanes(&health);
+        let has_lanes = lanes.is_some();
+        self.picks.remember_lanes(base, lanes);
         let models = match self.get_json_retry(&format!("{base}/models")) {
             Ok(v) => v,
             Err(e) => {
@@ -380,10 +401,10 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             }
         }
         if let Some(model) = chat_id {
-            return Some((model, false));
+            return Some((model, false, has_lanes));
         }
         if let Some(model) = text_id {
-            return Some((model, true));
+            return Some((model, true, has_lanes));
         }
         None
     }

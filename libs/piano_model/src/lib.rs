@@ -51,7 +51,7 @@ pub mod fx;
 mod mt;
 pub mod learned;
 
-use fx::{soft_clip, DcBlock, EarlyReflections, Eq, Perspective, Reverb, ReverbParams, ReverbPreset, Tone};
+use fx::{soft_clip, DcBlock, EarlyReflections, Eq, Limiter, Perspective, Reverb, ReverbParams, ReverbPreset, Tone};
 use keys::{build_key, KeyDesign, FIRST_KEY, LAST_KEY, NUM_KEYS};
 pub use params::{DesignParams, PianoPreset, Voicing, PIANO_PRESETS};
 use modal::{detect_path, run_modes, KernelPath, MAX_CHUNK};
@@ -127,6 +127,7 @@ pub trait Instrument {
 /// every commercial piano recording goes through), and a pp note stays
 /// ~20 dB under a ff one.
 const MASTER_GAIN: f32 = 0.25;
+
 /// A voice whose 64-sample bridge-force energy stays below this for ~16 ms
 /// is put to sleep (and its state zeroed, keeping wake-ups deterministic).
 const VOICE_SILENCE_POWER: f32 = 1e-5;
@@ -214,6 +215,7 @@ pub(crate) struct EngineCore {
     er: EarlyReflections,
     reverb: Reverb,
     tone: Tone,
+    limiter: Limiter,
     eq: Eq,
     voicing: Voicing,
     /// sym-bank openness derived from voicing.sympathetic > 1 (dampers
@@ -361,6 +363,7 @@ impl Piano {
             er: EarlyReflections::new(sample_rate),
             reverb: Reverb::new(sample_rate),
             tone: Tone::new(sample_rate),
+            limiter: Limiter::new(sample_rate),
             eq: Eq::new(fs),
             voicing: Voicing::default(),
             openness: 0.0,
@@ -1105,9 +1108,11 @@ impl EngineCore {
             let (tl, tr) = self.tone.process(l, r);
             let mut l = self.dc_l.process(tl);
             let mut r = self.dc_r.process(tr);
+            // Ride the gain first; the knee is only the last line.
             if self.soft_clip_on {
-                l = soft_clip(l);
-                r = soft_clip(r);
+                let (limited_l, limited_r) = self.limiter.process(l, r);
+                l = soft_clip(limited_l);
+                r = soft_clip(limited_r);
             }
             out_l[k] = l;
             out_r[k] = r;

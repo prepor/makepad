@@ -868,3 +868,83 @@ fn stereo_image_is_coherent_but_not_mono() {
     }
     assert!(msgs.is_empty(), "stereo image outside the physical envelope:\n{}", msgs.join("\n"));
 }
+
+/// The limiter exists to keep the safety knee out of the audio. These are the
+/// two properties that makes true: it must be exactly transparent when the
+/// music is not loud, and it must actually hold a loud one down.
+mod limiter {
+    use makepad_piano_model::fx::Limiter;
+
+    const RATE: f32 = 48_000.0;
+
+    /// Anything under the ceiling must come out bit-identical. A limiter that
+    /// touches ordinary playing is a tone control nobody asked for.
+    #[test]
+    fn quiet_material_passes_through_untouched() {
+        let mut limiter = Limiter::new(RATE);
+        for index in 0..RATE as usize {
+            let phase = index as f32 / RATE * core::f32::consts::TAU * 220.0;
+            let sample = 0.5 * phase.sin();
+            let (left, right) = limiter.process(sample, -sample);
+            assert_eq!(left, sample);
+            assert_eq!(right, -sample);
+        }
+        assert_eq!(limiter.reduction_db(), 0.0);
+    }
+
+    /// A sustained signal well over the ceiling has to end up at the ceiling,
+    /// and get there without the gain still moving.
+    #[test]
+    fn a_loud_passage_settles_at_the_ceiling() {
+        let mut limiter = Limiter::new(RATE);
+        let mut peak: f32 = 0.0;
+        for index in 0..RATE as usize {
+            let phase = index as f32 / RATE * core::f32::consts::TAU * 220.0;
+            let sample = 2.0 * phase.sin();
+            let (left, _) = limiter.process(sample, sample);
+            // Ignore the attack window: the knee behind it covers that.
+            if index > (RATE * 0.05) as usize {
+                peak = peak.max(left.abs());
+            }
+        }
+        assert!(peak <= 0.75, "settled peak {peak} is above the ceiling");
+        assert!(peak > 0.60, "settled peak {peak} means it over-corrected");
+        assert!(limiter.reduction_db() > 6.0);
+    }
+
+    /// Block size must not be audible: the whole engine is a per-sample state
+    /// machine, and the limiter is the newest piece of that promise.
+    #[test]
+    fn the_gain_is_independent_of_how_the_audio_is_chopped_up() {
+        let signal: Vec<f32> = (0..4096)
+            .map(|index| {
+                let phase = index as f32 / RATE * core::f32::consts::TAU * 110.0;
+                1.6 * phase.sin()
+            })
+            .collect();
+        let one_block: Vec<f32> = {
+            let mut limiter = Limiter::new(RATE);
+            signal.iter().map(|s| limiter.process(*s, *s).0).collect()
+        };
+        let many_blocks: Vec<f32> = {
+            let mut limiter = Limiter::new(RATE);
+            let mut out = Vec::with_capacity(signal.len());
+            for chunk in signal.chunks(37) {
+                out.extend(chunk.iter().map(|s| limiter.process(*s, *s).0));
+            }
+            out
+        };
+        assert_eq!(one_block, many_blocks);
+    }
+
+    /// Both channels ride the same gain, or the stereo image moves whenever
+    /// one hand is louder than the other.
+    #[test]
+    fn one_gain_serves_both_channels() {
+        let mut limiter = Limiter::new(RATE);
+        for _ in 0..1000 {
+            let (left, right) = limiter.process(2.0, 0.5);
+            assert!((left / 2.0 - right / 0.5).abs() < 1.0e-6);
+        }
+    }
+}

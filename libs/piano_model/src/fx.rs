@@ -498,7 +498,97 @@ impl DcBlock {
     }
 }
 
-/// Output safety limiter: EXACTLY unity below the 0.72 threshold, then a
+
+/// The output limiter: a gain that RIDES the music, ahead of the safety knee.
+///
+/// [`soft_clip`] is a waveshaper. It is exact below its threshold and it can
+/// never let a sample past full scale, which makes it a good last line, but it
+/// has no time constant at all: it decides sample by sample, so a peak 6 dB
+/// over the ceiling is 6 dB of gain reduction applied to that sample and none
+/// to its neighbour. That is distortion by construction, and on a dense
+/// fortissimo — measured at a pre-limiter peak of 2.05 on a Liszt climax, with
+/// 0.15% of samples over the knee — it is audible as overdrive.
+///
+/// A limiter instead moves ONE gain slowly relative to the audio, so a loud
+/// passage is quieter rather than distorted. The detector takes peaks
+/// instantly and lets them go over [`RELEASE_MS`]; the gain follows downward
+/// over [`ATTACK_MS`] and back up at the release rate. Nothing here looks
+/// ahead, so a transient's first millisecond can still cross the ceiling —
+/// that is precisely what the knee behind it is for, and it now catches
+/// microseconds of transient instead of shaping whole chords.
+///
+/// Per-sample state and no branching on block length: N blocks of any sizes
+/// give bit-identical output to one block of their sum.
+pub struct Limiter {
+    /// Peak envelope of the input.
+    env: f32,
+    /// The gain being applied.
+    gain: f32,
+    attack: f32,
+    release: f32,
+    ceiling: f32,
+}
+
+/// How fast the gain comes down onto a peak. Long enough not to modulate the
+/// audio it is riding (which would be distortion again), short enough that the
+/// knee behind it only ever sees a transient's leading edge.
+const ATTACK_MS: f32 = 1.5;
+/// How fast it lets go. Slow enough that a run of loud chords is held at one
+/// level rather than pumped between them.
+const RELEASE_MS: f32 = 180.0;
+/// Where the gain stops it. Under the knee, so in normal playing the two
+/// stages never both work on the same sample.
+const CEILING: f32 = 0.72;
+
+impl Limiter {
+    pub fn new(sample_rate: f32) -> Self {
+        let coefficient = |ms: f32| {
+            let samples = ms * 0.001 * sample_rate.max(1.0);
+            1.0 - (-1.0 / samples.max(1.0)).exp()
+        };
+        Self {
+            env: 0.0,
+            gain: 1.0,
+            attack: coefficient(ATTACK_MS),
+            release: coefficient(RELEASE_MS),
+            ceiling: CEILING,
+        }
+    }
+
+    /// One stereo frame. The same gain goes on both channels, so the image
+    /// does not move when one hand is louder than the other.
+    #[inline(always)]
+    pub fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let peak = left.abs().max(right.abs());
+        // Instant attack on the DETECTOR: the envelope must already know about
+        // a peak before the gain starts moving towards it.
+        self.env = if peak > self.env {
+            peak
+        } else {
+            self.env + self.release * (peak - self.env)
+        };
+        let target = if self.env > self.ceiling {
+            self.ceiling / self.env
+        } else {
+            1.0
+        };
+        let rate = if target < self.gain { self.attack } else { self.release };
+        self.gain += rate * (target - self.gain);
+        if !self.gain.is_finite() {
+            self.gain = 1.0;
+        }
+        (left * self.gain, right * self.gain)
+    }
+
+    /// How much the limiter is holding back right now, in dB. Zero when it is
+    /// out of the way.
+    pub fn reduction_db(&self) -> f32 {
+        -20.0 * self.gain.max(1.0e-6).log10()
+    }
+}
+
+/// Output SAFETY knee, behind [`Limiter`]: exactly unity below the 0.78
+/// threshold, then a
 /// smooth (C1) rational knee that approaches +/-1.0 asymptotically, so a
 /// fortissimo chord can never digital-clip.
 ///

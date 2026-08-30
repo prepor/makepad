@@ -221,6 +221,86 @@ unsafe fn run_modes_avx2(
     }
 }
 
+/// Complex-residue variant for the string banks: each mode's output is
+///     y_m = gout_im * Im(z) + gout_re * Re(z),
+/// i.e. a COMPLEX residue per pole instead of the sine-only Im tap. This
+/// is the published normal-mode reduction (Bank et al., EUSIPCO 2000:
+/// two poles with independent frequency, amplitude, PHASE and decay per
+/// partial): when string unison/polarisation modes are coupled through a
+/// bridge admittance, the eigen-derived residues are complex, and their
+/// phases are what make the prompt/aftersound mixture vary from partial
+/// to partial. The residues come from the construction-time
+/// eigendecomposition in keys.rs; the sum of a partial's mode responses
+/// still starts at zero for a force input (the cancellation is computed
+/// by the eigen algebra, not assumed per mode — see the quadrature
+/// lesson at the top of this file).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn run_modes_c(
+    path: KernelPath,
+    zr: &mut [f32],
+    zi: &mut [f32],
+    cr: &[f32],
+    ci: &[f32],
+    gin: &[f32],
+    gout_im: &[f32],
+    gout_re: &[f32],
+    input: &[f32],
+    in_gain: f32,
+    acc: &mut [f32],
+) {
+    debug_assert!(input.len() <= MAX_CHUNK && acc.len() >= input.len());
+    debug_assert!(zr.len() % 8 == 0);
+    match path {
+        KernelPath::Scalar => {
+            let n = input.len();
+            for m in 0..zr.len() {
+                let (crm, cim, ginm) = (cr[m], ci[m], gin[m]);
+                let (gim, grm) = (gout_im[m], gout_re[m]);
+                let (mut r, mut i) = (zr[m], zi[m]);
+                for k in 0..n {
+                    let t = crm * r - cim * i + ginm * (in_gain * input[k]);
+                    i = cim * r + crm * i;
+                    r = t;
+                    acc[k] += gim * i + grm * r;
+                }
+                zr[m] = r;
+                zi[m] = i;
+            }
+        }
+        // 4-wide path (also taken by AVX2 hosts: this kernel runs only a
+        // few banks per voice and the 4-wide code is verified on every
+        // architecture, while an 8-wide twin would be untestable here).
+        _ => {
+            let n = input.len();
+            let mut vacc = [zero_v4(); MAX_CHUNK];
+            let mut m = 0;
+            while m < zr.len() {
+                let mut zrv = load_v4(&zr[m..]);
+                let mut ziv = load_v4(&zi[m..]);
+                let crv = load_v4(&cr[m..]);
+                let civ = load_v4(&ci[m..]);
+                let ginv = load_v4(&gin[m..]);
+                let gimv = load_v4(&gout_im[m..]);
+                let grev = load_v4(&gout_re[m..]);
+                for k in 0..n {
+                    let f = splat_v4(in_gain * input[k]);
+                    let t = fma_v4(ginv, f, sub_v4(mul_v4(crv, zrv), mul_v4(civ, ziv)));
+                    ziv = fma_v4(civ, zrv, mul_v4(crv, ziv));
+                    zrv = t;
+                    vacc[k] = fma_v4(grev, zrv, fma_v4(gimv, ziv, vacc[k]));
+                }
+                store_v4(&mut zr[m..], zrv);
+                store_v4(&mut zi[m..], ziv);
+                m += 4;
+            }
+            for k in 0..n {
+                acc[k] += hsum_v4(vacc[k]);
+            }
+        }
+    }
+}
+
 /// Stereo-tap variant used by the soundboard. The left tap reads Im(z);
 /// the right tap reads a per-mode MIX of both quadratures,
 ///     R_m = gri_m * Im(z) + grr_m * Re(z),

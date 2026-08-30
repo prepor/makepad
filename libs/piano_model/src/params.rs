@@ -100,11 +100,13 @@ design_params! {
     /// low-band: ref -14.8 dB, model -42) and the whole-note bass
     /// envelope fell at 18 dB/s where the recordings fall at 3-5 — bright
     /// for one instant, then a dead thud: the plucked-guitar signature
-    /// the listener flagged. At 4.0 the fast unison member still takes
-    /// the prompt drop and the slow member holds the growl for the
-    /// aftersound. The proper structure (winding loss split per unison
-    /// member) is noted in keys.rs.
-    a1_wound = 4.0,
+    /// the listener flagged. Since the per-partial normal-mode reduction
+    /// landed (keys.rs), the PROMPT loss is carried by the bridge
+    /// coupling and this term is only the intrinsic winding loss the
+    /// aftersound decays at: at 2.0 the horizontal/anti modes of the
+    /// wound keys sit at sigma ~0.5-0.9 across the audible partials,
+    /// against measured real slow stages of 0.02-1.2.
+    a1_wound = 2.0,
     /// quartic-in-frequency loss (1/s per kHz^4): real string losses grow
     /// FASTER than f^2 at the top of the band (air drag leaves the viscous
     /// regime, felt/termination micro-losses); with only the f^2 term one
@@ -114,60 +116,70 @@ design_params! {
     /// is ~1/s at 5.5 kHz and ~5/s at 8 kHz at the default.
     a4 = 0.0010380816636116807,
     // --- unison / coupling ---------------------------------------------
-    /// unison detune (cents): det_lo + det_slope*t
-    det_lo = 0.12171375578897867,
-    det_slope = 0.13118272122621927,
-    /// scale on the Weinreich decay-rate split between unison members
-    wein = 1.5944907145331448,
-    /// how much the split collapses toward the treble (spread = 1 - wt*t)
-    wein_treble = 0.5098924202619071,
-    /// split CONTRAST exponent toward the top octave: the measured treble
-    /// prompt/aftersound ratio (e.g. ~6:1 at A6) exceeds what the mid-range
-    /// split table reaches; multipliers are raised to this power over the
-    /// top ~2 octaves (1.0 = off)
-    wein_top = 0.5058585298767448,
-    /// Bridge-coupling prompt loss (1/s): the extra decay of the unison
-    /// normal modes that actually PUMP the bridge, scaled per partial by
-    /// the bridge-admittance proxy (soundboard::bridge_admittance_proxy)
-    /// and per member by how bridge-coupled that member is (in-phase /
-    /// vertical: full; anti-phase / horizontal: bridge_couple_leak).
-    /// This is the structural piece the fixed Weinreich multipliers could
-    /// not express: two-exponential fits of the reference bass show a
-    /// prompt stage at sigma 8..50/s varying irregularly from partial to
-    /// partial over an aftersound at 0.3..0.9/s, where the model rendered
-    /// a smooth single decay at 0.6..1.9/s on nearly every bass partial —
-    /// the plucked-harp signature. Tapered (1-t)^bridge_couple_taper so
-    /// the approved mid/treble balance keeps riding the existing split.
-    /// Scale = the prompt sigma (1/s) a median-admittance bass partial's
-    /// coupled member gets; keys.rs squares and caps the proxy so
-    /// admittance peaks reach ~5x this (the Salamander fits show prompt
-    /// 6..34/s on the strongly coupled partials) while valleys drop to
-    /// the floor (many real bass partials show almost no prompt stage).
-    bridge_couple = 16.0,
+    /// unison detune (cents): det_lo + det_slope*t. Sets the ANTI
+    /// (mistuned anti-phase) mode's offset, i.e. the unison beat rate.
+    /// Raised from the searched 0.12: with the old fixed-split structure
+    /// beats were microscopic by design; real unisons sit ~1-2 cents
+    /// apart and the measured reference beat depths are +-0.3..5 dB.
+    det_lo = 0.9,
+    det_slope = 0.25,
+    /// Bridge-coupling prompt loss (1/s): the vertical-polarisation
+    /// coupling scale for the per-partial normal-mode reduction (see
+    /// keys.rs). Per partial it is shaped by the squared-and-capped
+    /// admittance proxy, so admittance peaks reach ~5x this while
+    /// valleys drop to the floor — the measured reference bass shows
+    /// prompt sigma 6..34/s on strongly coupled partials and almost none
+    /// on others, over an aftersound at 0.02..1.2/s. This irregular
+    /// per-partial double decay is what the old fixed Weinreich
+    /// multipliers (sigma ratio 4.3 on every partial of every key)
+    /// provably could not express — the plucked-harp signature.
+    bridge_couple = 9.0,
     /// admittance floor: even off-resonance partials couple somewhat
-    bridge_couple_floor = 0.06,
-    /// compass taper exponent on (1-t)
+    bridge_couple_floor = 0.03,
+    /// compass taper exponent on (1-t). NOTE the honest discrepancy: the
+    /// weak-coupling literature (Woodhouse 2021) puts the coupling scale
+    /// at ~2 f0 Z ReY, GROWING toward the treble, while this taper (and
+    /// the singles factor in keys.rs) is calibrated the other way from
+    /// the Salamander staircases (its bass bridge presents the lowest
+    /// admittance to the lowest strings — that is why bass notes last).
+    /// Reconciling needs per-position bridge admittance data we do not
+    /// have; the calibrated curve reproduces the measured per-note
+    /// knees, so it stands.
     bridge_couple_taper = 1.5,
-    /// share of the coupling loss reaching the weakly coupled members
-    bridge_couple_leak = 0.015,
-    /// Energy migration into the weakly coupled members, as drive share:
-    /// in the real two-way coupled system the in-phase mode's energy
-    /// leaks into the aftersound modes during the prompt stage
-    /// (Weinreich); one-directional modal banks cannot transfer it, so
-    /// the drive that WOULD have migrated is handed to the slow members
-    /// at note-on. Share = min(0.55, bridge_mig * coupling sigma): the
-    /// harder a partial drains, the more of it survives as aftersound —
-    /// the Salamander fits show exactly that (the strongly draining
-    /// partials' amplitude is mostly in the slow stage, Af/As deeply
-    /// negative, while the model without this had Af/As positive
-    /// everywhere).
-    bridge_mig = 0.02,
-    /// input-weight bias between unison normal modes: the hammer strikes
-    /// the strings IN PHASE, so the fast in-phase normal mode receives
-    /// nearly all the drive and the slow anti-phase modes only the
-    /// mistuning residue (Weinreich). in_w ~ sigma_mult^wein_inw,
-    /// mean-normalised (0 = equal drive, the old behaviour).
-    wein_inw = 0.4972161544571432,
+    // --- per-partial normal-mode reduction (keys.rs mode tables) --------
+    /// Horizontal-polarisation drive share: the hammer imparts mostly
+    /// vertical motion; termination asymmetry leaks this fraction
+    /// (amplitude) into the horizontal polarisation, which decays nearly
+    /// intrinsically and becomes the aftersound.
+    pol_drive = 0.3,
+    /// Horizontal radiation share through the bridge relative to
+    /// vertical (the bridge's second admittance direction; a real bridge
+    /// wants the full 2x2 admittance matrix — this is its second
+    /// diagonal, reduced to a share).
+    pol_rad = 0.55,
+    /// Horizontal bridge-coupling loss as a fraction of the vertical:
+    /// the aftersound decays NEARLY intrinsically (measured slow stages
+    /// 0.02..1.2 1/s where the old build's slow members ran 0.46..1.68 —
+    /// "the pedal is not pressed").
+    pol_couple = 0.02,
+    /// Bridge-rocking cross coupling between the polarisations, as a
+    /// fraction of sqrt(Gv*Gh): mixes the eigenvectors and makes the
+    /// residues complex.
+    pol_cross = 0.25,
+    /// Polarisation detune (cents): the slow false-beat of a held note.
+    pol_det = 1.2,
+    /// Horizontal intrinsic-loss factor: the t60 law above was fitted as
+    /// a SINGLE-decay law, i.e. to the blend of prompt and aftersound;
+    /// the aftersound stage itself decays slower (the real C4 holds
+    /// ~1.4 dB/s from 1.5 to 4 s — sigma ~0.16 — where the single-decay
+    /// law gives 0.71). The horizontal mode's base loss is scaled by
+    /// this before the coupling terms are added.
+    pol_sig = 0.5,
+    /// Anti-phase (mistuned unison) mode: bridge output share (its
+    /// radiation is the mistuning residue) and its small share of the
+    /// vertical coupling loss (imperfect bridge cancellation).
+    anti_gain = 0.18,
+    anti_couple = 0.015,
     // --- strike comb -----------------------------------------------------
     /// floor under |sin(n pi x0/L)|: finite hammer width, moving contact
     /// point and non-rigid termination keep real comb nulls shallow

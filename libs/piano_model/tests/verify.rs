@@ -61,7 +61,7 @@ fn partials_follow_dispersion_law() {
                 break;
             }
             let (fm, mag) = peak_near(x, pred, (0.3 * f0).min(60.0).max(4.0));
-            if mag < ref_mag * 3e-3 {
+            if mag < ref_mag * 1e-3 {
                 // Strike-comb-dip partials (the dips have a physical floor
                 // now, ~-22 dB of gin) sit far enough down that spectral
                 // leakage from their strong neighbours dominates the search
@@ -138,7 +138,13 @@ fn decay_times_and_double_decay() {
     println!("C3 fundamental: sigma late {sig_late:.2}/s (T60 late {:.1} s)", 6.91 / sig_late.max(1e-9));
     assert!(sig_late > 0.0, "fundamental must decay");
     let t60_late = 6.91 / sig_late;
-    assert!((2.0..60.0).contains(&t60_late), "C3 aftersound T60 {t60_late:.1}s out of range");
+    // Upper bound 100, not 60: since the polarisation aftersound landed,
+    // the 2.5-5.5 s window rides the slow false-beat (period ~11 s at
+    // C3's fundamental) and a fit through the beat's flat phase reads
+    // sigma ~0.1 where the DESIGN aftersound sigma is 0.25/s (T60 28 s,
+    // at -16 dB re onset — the real C4 measures ~1.4 dB/s there, slower
+    // still). The bound still catches a genuinely undamped mode.
+    assert!((2.0..100.0).contains(&t60_late), "C3 aftersound T60 {t60_late:.1}s out of range");
 
     // Double decay: the broadband envelope falls fast while the prompt
     // sound (fast unison mode + high partials) dies, then settles onto the

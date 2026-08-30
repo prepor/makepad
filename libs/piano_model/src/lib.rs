@@ -134,7 +134,10 @@ pub trait Instrument {
 /// keep it, and the faster note drain means flat-forte material engages
 /// the limiter/knee LESS at equal master than the old sustained decay
 /// did.
-const MASTER_GAIN: f32 = 0.32;
+/// 0.37 after the per-partial normal-mode reduction: the aftersound now
+/// sits at its measured level (~-16 dB re the prompt) instead of the old
+/// half-drive slow members, which lowered sustained RMS ~1.3 dB further.
+const MASTER_GAIN: f32 = 0.37;
 
 /// A voice whose 64-sample bridge-force energy stays below this for ~16 ms
 /// is put to sleep (and its state zeroed, keeping wake-ups deterministic).
@@ -764,6 +767,7 @@ impl Piano {
                 if let Some(&g) = gain.get(m) {
                     if g.is_finite() && g >= 0.0 {
                         k.gout[idx] *= g;
+                        k.gout_re[idx] *= g;
                     }
                 }
                 if let Some(&s) = sigma_scale.get(m) {

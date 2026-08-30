@@ -306,7 +306,13 @@ fn learned_trend_gate() {
         (48, 3.4, -0.3, 4.0),
         (60, -0.2, -3.4, -4.2),
         (72, 2.1, 3.5, 8.2),
-        (84, -35.1, 1.9, -2.7),
+        // (hi re-measured again 2026-08-31: the normal-mode reduction
+        // gives C6's 7.4-9.9 kHz partials their intrinsic decay instead
+        // of a half-drive slow member — same corpus-unsupported band as
+        // the note above.)
+        // (mid likewise re-measured after pol_sig + the master re-anchor:
+        // 3.2-6.7 kHz at C6, upper half in the same unsupported band.)
+        (84, -45.2, 1.9, -9.6),
     ];
     const MARGIN: f64 = 6.0;
     let vel = 112u8;

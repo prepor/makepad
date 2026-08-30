@@ -7,7 +7,7 @@
 
 use crate::hammer::Hammer;
 use crate::keys::{velocity_to_speed, KeyDesign, PH_MODES};
-use crate::modal::{run_modes, KernelPath, MAX_CHUNK};
+use crate::modal::{run_modes, run_modes_c, KernelPath, MAX_CHUNK};
 use crate::params::Voicing;
 
 /// Deterministic per-voice noise burst (hammer-action thump, damper felt
@@ -462,7 +462,7 @@ impl Voice {
         for osc in 0..key.n_osc {
             let a = osc * mp;
             let b = a + mp;
-            run_modes(
+            run_modes_c(
                 path,
                 &mut self.zr[a..b],
                 &mut self.zi[a..b],
@@ -470,6 +470,7 @@ impl Voice {
                 &self.eff_ci[a..b],
                 &key.gin[a..b],
                 &key.gout[a..b],
+                &key.gout_re[a..b],
                 &self.force[..n],
                 self.osc_gain[osc],
                 &mut self.acc[..n],

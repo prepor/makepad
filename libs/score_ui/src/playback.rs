@@ -1,7 +1,7 @@
 //! Audio-clock-master playback bridge. UI gestures are converted to
 //! `score_play` messages; the audio callback owns the realtime engine and a
-//! physically modelled piano. The SoundFont sampler is kept only for the
-//! metronome click, which is a short transient rather than an instrument.
+//! physically modelled piano. The SoundFont sampler serves the metronome
+//! click.
 
 use crate::sound::SoundSettings;
 use makepad_score::model::{EventKind, Rational, Score};
@@ -12,9 +12,12 @@ use makepad_score_play::{
     ScheduleOptions, Scheduler, ScrubConfig, ScrubController, ScrubHit, ScrubOutcome, SpscRing,
     SynthBackend, SynthEvent, SynthEventKind, SynthEventTiming, TempoMap, TransportLoop,
 };
+use crate::sound::ScoreEngine;
 use makepad_piano_model::{
     fx::{Perspective, ReverbPreset},
-    Piano, PianoEvent, PianoPreset, TimedEvent as PianoTimedEvent, Voicing,
+    learned::PianoEngine,
+    Piano,
+    PianoEvent, PianoPreset, TimedEvent as PianoTimedEvent, Voicing,
 };
 use makepad_soundfont::{metronome_click, NoSamples, Sampler, SamplerEvent, TimedEvent};
 use makepad_widgets::*;
@@ -118,6 +121,7 @@ struct SharedSound {
     roughness: AtomicU32,
     phantoms: AtomicU32,
     attack_noise: AtomicU32,
+    attack_body: AtomicU32,
     sympathetic: AtomicU32,
     // Output EQ and trim.
     shelf_db: AtomicU32,
@@ -145,6 +149,7 @@ impl SharedSound {
         store(&self.roughness, sound.voicing.roughness);
         store(&self.phantoms, sound.voicing.phantoms);
         store(&self.attack_noise, sound.voicing.attack_noise);
+        store(&self.attack_body, sound.voicing.attack_body);
         store(&self.sympathetic, sound.voicing.sympathetic);
         store(&self.shelf_db, sound.eq_shelf_db);
         store(&self.shelf_hz, sound.eq_shelf_hz);
@@ -161,15 +166,17 @@ impl SharedSound {
     fn read(&self) -> SoundSettings {
         let load = |cell: &AtomicU32| f32::from_bits(cell.load(Ordering::Relaxed));
         SoundSettings {
+            engine: ScoreEngine::Physical,
             // The preset index is a UI label; the audio side only ever needs
             // the values it produced, which are all published above.
-            preset: crate::sound::default_preset_index(),
+            preset: crate::sound::default_preset_index(ScoreEngine::Physical),
             voicing: Voicing {
                 body_tap: load(&self.body_tap),
                 knock: load(&self.knock),
                 roughness: load(&self.roughness),
                 phantoms: load(&self.phantoms),
                 attack_noise: load(&self.attack_noise),
+                attack_body: load(&self.attack_body),
                 sympathetic: load(&self.sympathetic),
             },
             eq_shelf_db: load(&self.shelf_db),
@@ -194,13 +201,34 @@ impl SharedSound {
     }
 }
 
+/// Build the instrument the application asked for.
+///
+/// Hybrid is the one that is not simply a `PianoEngine::new`: it is the
+/// physical instrument with [`crate::hybrid`]'s baked per-partial targets
+/// applied across all 88 keys before it ever renders a block. That costs
+/// 3.6 ms, which is why it belongs here on the UI thread alongside the
+/// design rebuilds rather than anywhere near the callback.
+fn build_engine(engine: ScoreEngine, rate: f32, preset: &PianoPreset) -> PianoEngine {
+    match engine {
+        ScoreEngine::Hybrid => {
+            let mut piano = Piano::new_with_preset(rate, preset);
+            crate::hybrid::apply_targets(&mut piano);
+            PianoEngine::Physical(Box::new(piano))
+        }
+        other => PianoEngine::new(other.kind(), rate, preset),
+    }
+}
+
 /// Handing a rebuilt instrument to the audio thread without allocating or
 /// freeing on it.
 ///
-/// A preset with a construction-time `design` override is a different
-/// instrument: `Piano::new_with_preset` builds all 88 key designs and their
-/// modal banks, which allocates. So the UI thread builds it (well under a
-/// millisecond) and passes ownership through `incoming`; the audio thread
+/// Two things travel this way, and they are the same thing to the audio
+/// thread: a preset with a construction-time `design` override is a different
+/// instrument, and a different ENGINE is a different instrument too. Both
+/// allocate to build — `Piano::new_with_preset` builds 88 key designs and
+/// their modal banks, `LearnedPiano::new` parses the network and precomputes
+/// all 88 key designs. So the UI thread builds either one and passes
+/// ownership through `incoming`; the audio thread
 /// takes it, and passes the instrument it replaced back through `retired` for
 /// the UI thread to drop. Neither slot ever holds more than one instrument:
 /// the audio side refuses to take a new one while it still owes the old one
@@ -208,21 +236,21 @@ impl SharedSound {
 /// completed. Nothing is allocated, freed, or waited on inside the callback.
 #[derive(Debug, Default)]
 struct InstrumentHandoff {
-    incoming: AtomicPtr<Piano>,
-    retired: AtomicPtr<Piano>,
+    incoming: AtomicPtr<PianoEngine>,
+    retired: AtomicPtr<PianoEngine>,
 }
 
 // The instrument is built on the UI thread and played on the audio thread.
 const _: () = {
     const fn assert_send<T: Send>() {}
-    assert_send::<Piano>();
+    assert_send::<PianoEngine>();
 };
 
 impl InstrumentHandoff {
     /// UI thread: offer a freshly built instrument. Handed back when the
     /// previous swap has not finished, so the caller can simply try again on
     /// the next frame with whatever the user has landed on by then.
-    fn offer(&self, piano: Box<Piano>) -> Option<Box<Piano>> {
+    fn offer(&self, piano: Box<PianoEngine>) -> Option<Box<PianoEngine>> {
         if !self.retired.load(Ordering::Acquire).is_null() {
             return Some(piano);
         }
@@ -242,7 +270,7 @@ impl InstrumentHandoff {
 
     /// UI thread: take back the instrument the audio thread replaced, so it is
     /// dropped here rather than in the callback.
-    fn reclaim(&self) -> Option<Box<Piano>> {
+    fn reclaim(&self) -> Option<Box<PianoEngine>> {
         let raw = self.retired.swap(ptr::null_mut(), Ordering::Acquire);
         // Safety: the audio thread published this pointer with Release and
         // never touches it again.
@@ -251,7 +279,7 @@ impl InstrumentHandoff {
 
     /// Audio thread: adopt an offered instrument, but only while the previous
     /// one has already been handed back.
-    fn take(&self) -> Option<Box<Piano>> {
+    fn take(&self) -> Option<Box<PianoEngine>> {
         if !self.retired.load(Ordering::Relaxed).is_null() {
             return None;
         }
@@ -264,7 +292,7 @@ impl InstrumentHandoff {
     /// Audio thread: give a replaced instrument back to be dropped. Never
     /// frees anything here — the slot is guaranteed empty because `take` only
     /// hands an instrument over while it is.
-    fn retire(&self, piano: Box<Piano>) {
+    fn retire(&self, piano: Box<PianoEngine>) {
         let previous = self.retired.swap(Box::into_raw(piano), Ordering::Release);
         debug_assert!(previous.is_null(), "the retired slot was not empty");
     }
@@ -297,7 +325,7 @@ pub struct PlaybackBridge {
     sound: Arc<SharedSound>,
     instrument: Arc<InstrumentHandoff>,
     /// A rebuilt instrument waiting for the audio thread to have room for it.
-    pending_instrument: Option<Box<Piano>>,
+    pending_instrument: Option<Box<PianoEngine>>,
     /// What the instrument is actually putting out, written by the audio
     /// thread once per rendered span. One relaxed store; read for display.
     peak: Arc<AtomicU32>,
@@ -363,7 +391,14 @@ impl PlaybackBridge {
         (rate.is_finite() && rate >= 8_000.0).then_some(rate)
     }
 
-    pub fn rebuild_instrument(&mut self, preset: &PianoPreset) {
+    /// Build a fresh instrument for this engine and preset and hand it over.
+    ///
+    /// Changing engine goes through exactly the same path as changing to a
+    /// preset that needs a rebuild: built here on the UI thread, adopted by
+    /// the audio thread, and crossfaded over `INSTRUMENT_FADE_FRAMES` against
+    /// the one it replaces — so switching engine mid-phrase is a dissolve,
+    /// not a cut, and never a panic.
+    pub fn rebuild_instrument(&mut self, engine: ScoreEngine, preset: &PianoPreset) {
         let rate = f32::from_bits(self.device_rate_bits.load(Ordering::Relaxed));
         let rate = if rate.is_finite() {
             rate.clamp(8_000.0, 192_000.0)
@@ -371,7 +406,7 @@ impl PlaybackBridge {
             PLAN_RATE as f32
         };
         // Latest request wins: an older pending build is simply dropped here.
-        self.pending_instrument = Some(Box::new(Piano::new_with_preset(rate, preset)));
+        self.pending_instrument = Some(Box::new(build_engine(engine, rate, preset)));
         self.service_instrument();
     }
 
@@ -384,13 +419,6 @@ impl PlaybackBridge {
         }
     }
 
-    /// The instrument's own output level, as the audio thread last measured
-    /// it: peak sample magnitude with a meter fall-back. This is what the
-    /// synth rendered, so it moves with the sound controls whether or not the
-    /// samples reach a speaker.
-    pub fn output_peak(&self) -> f32 {
-        f32::from_bits(self.peak.load(Ordering::Relaxed)).clamp(0.0, 16.0)
-    }
 
     pub fn rebuild_plan(&mut self, score: &Score, bpm: f64, count_in: bool) {
         self.plan = Arc::new(compile_plan(score, bpm, count_in));
@@ -640,9 +668,9 @@ struct SamplerBackend {
     sound_revision: u32,
     instrument: Arc<InstrumentHandoff>,
     peak: Arc<AtomicU32>,
-    piano: Box<Piano>,
-    /// The instrument a preset rebuild replaced, still ringing itself out.
-    fading: Option<Box<Piano>>,
+    piano: Box<PianoEngine>,
+    /// The instrument a rebuild replaced, still ringing itself out.
+    fading: Option<Box<PianoEngine>>,
     fade_frames_left: u32,
     fade_left: [f32; SCRATCH_FRAMES],
     fade_right: [f32; SCRATCH_FRAMES],
@@ -675,7 +703,12 @@ impl SamplerBackend {
             sound_revision: 0,
             instrument,
             peak,
-            piano: Box::new(Piano::new(sample_rate)),
+            piano: Box::new(build_engine(
+                ScoreEngine::Physical,
+                sample_rate,
+                &makepad_piano_model::PIANO_PRESETS
+                    [crate::sound::default_preset_index(ScoreEngine::Physical)],
+            )),
             fading: None,
             fade_frames_left: 0,
             fade_left: [0.0; SCRATCH_FRAMES],
@@ -835,17 +868,16 @@ impl SynthBackend for SamplerBackend {
                 ..
             } => {
                 let id = sampler_note_id(event.source, note_id);
+                let velocity = ((u32::from(velocity) * 127) / 65_535).max(1) as u8;
                 self.remember_key(id, key);
-                self.queue_piano(PianoEvent::NoteOn {
-                    key,
-                    velocity: ((u32::from(velocity) * 127) / 65_535).max(1) as u8,
-                })
+                self.queue_piano(PianoEvent::NoteOn { key, velocity })
             }
             SynthEventKind::NoteOff { note_id, .. } => {
                 let id = sampler_note_id(event.source, note_id);
                 if let Some(key) = self.take_key(id) {
                     self.queue_piano(PianoEvent::NoteOff { key });
                 }
+                self.queue(SamplerEvent::NoteOff { note_id: id });
             }
             SynthEventKind::Click { level } => {
                 self.click_id = self.click_id.wrapping_add(1).max(0xf000_0001);
@@ -879,6 +911,8 @@ impl SynthBackend for SamplerBackend {
             } else {
                 &[]
             };
+            // The sampler serves the metronome click, which is procedural
+            // and never reads a sample source.
             self.sampler.render(
                 &NoSamples,
                 events,
@@ -1024,7 +1058,7 @@ fn rational_f64(value: Rational) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use makepad_piano_model::PIANO_PRESETS;
+    use makepad_piano_model::{Piano, PIANO_PRESETS};
     use makepad_score::model::{Id, Measure};
     use makepad_score_play::PlaybackState;
 
@@ -1166,26 +1200,27 @@ mod tests {
             handoff.clone(),
             Arc::new(AtomicU32::new(0)),
         );
-        let upright = PIANO_PRESETS
-            .iter()
-            .find(|preset| preset.name == "Upright")
-            .expect("the shipped list has an Upright");
-        assert!(upright.needs_rebuild(), "Upright changes the design");
-
-        // UI side: publish the preset's sound, build the instrument, offer it.
-        shared.publish(SoundSettings::from_preset(
-            PIANO_PRESETS
-                .iter()
-                .position(|preset| preset.name == "Upright")
-                .expect("the shipped list has an Upright"),
+        // Changing instrument is the one thing that still rebuilds: the
+        // electric voice is a different engine and cannot be reached with a
+        // setter. UI side: publish its sound, build it, offer it.
+        let electric = SoundSettings::from_preset(
+            ScoreEngine::Learned,
+            0,
             RoomSettings::default(),
-        ));
+        );
+        shared.publish(electric);
         assert!(handoff
-            .offer(Box::new(Piano::new_with_preset(PLAN_RATE as f32, upright)))
+            .offer(Box::new(build_engine(
+                ScoreEngine::Learned,
+                PLAN_RATE as f32,
+                &PIANO_PRESETS[0],
+            )))
             .is_none());
         // A second offer while the first is in flight comes straight back.
         assert!(handoff
-            .offer(Box::new(Piano::new(PLAN_RATE as f32)))
+            .offer(Box::new(PianoEngine::Physical(Box::new(Piano::new(
+                PLAN_RATE as f32,
+            )))))
             .is_some());
 
         let mut left = vec![0.0_f32; 512];
@@ -1197,7 +1232,8 @@ mod tests {
         // The swap happened and the outgoing instrument is fading, not gone.
         assert!(backend.fading.is_some());
         assert!(handoff.reclaim().is_none(), "nothing is handed back mid-fade");
-        assert_eq!(backend.piano.voicing(), upright.voicing);
+        assert_eq!(backend.piano.kind(), makepad_piano_model::learned::EngineKind::Learned);
+        assert_eq!(backend.piano.reverb_mix(), electric.room.mix);
 
         // Render the fade out.
         for _ in 0..8 {
@@ -1256,12 +1292,10 @@ mod tests {
         // The meter is a real reading of what the instrument rendered.
         assert!(f32::from_bits(meter.load(Ordering::Relaxed)) > 1.0e-4);
 
-        let felt = PIANO_PRESETS
-            .iter()
-            .find(|preset| preset.name == "Felt Piano")
-            .expect("the shipped list has a Felt Piano");
         assert!(handoff
-            .offer(Box::new(Piano::new_with_preset(PLAN_RATE as f32, felt)))
+            .offer(Box::new(PianoEngine::Physical(Box::new(Piano::new(
+                PLAN_RATE as f32,
+            )))))
             .is_none());
         left.fill(0.0);
         right.fill(0.0);

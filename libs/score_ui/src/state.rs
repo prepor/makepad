@@ -10,6 +10,7 @@ use crate::{
     prefs::ScorePrefs,
     sound::{self, SoundParam, SoundSettings},
 };
+use crate::sound::{InstrumentId, ScoreEngine};
 use makepad_score::{model::AnnotationKind, symbol::Articulation};
 use makepad_score_play::PlaybackState;
 use makepad_score_render::{PageId, PlaybackPosition, SemanticId};
@@ -72,6 +73,9 @@ pub struct ScoreUiState {
     pub controls_hold_until: f64,
     /// The pointer is on the control strip itself. Never fade while it is.
     pub controls_pinned: bool,
+    /// What a drag on the page means. Navigate by default and after Escape,
+    /// so the resting state of the application cannot change the music.
+    pub tool: ScoreTool,
     pub page_layout: PageLayout,
     /// The page the reader is actually looking at. Derived from the view
     /// wherever the view moved on its own (a grab-pan, a scrollbar, a zoom),
@@ -129,6 +133,7 @@ impl Default for ScoreUiState {
             controls_visible: false,
             controls_hold_until: 0.0,
             controls_pinned: false,
+            tool: ScoreTool::Navigate,
             page_layout: PageLayout::Single,
             current_page: 0,
             zoom: 1.0,
@@ -325,9 +330,19 @@ impl Default for ScoreAppState {
         // A name that is no longer in the shipped list falls back rather than
         // resolving to whatever now sits at that index.
         let mut sound = SoundSettings::default();
-        if let Some(preset) = sound::preset_index_by_name(&prefs.instrument) {
+        sound.engine = prefs.engine();
+        if let Some(preset) = sound::preset_index_by_name(sound.engine, &prefs.instrument) {
             sound.apply_preset(preset);
         }
+        // The two exposed controls outlive the session too; they are applied
+        // after the instrument, which supplies the room they sit on.
+        if let Some(room) = crate::prefs::reverb_preset_by_name(&prefs.room) {
+            sound.room.preset = room;
+        }
+        if let Some(amount) = prefs.reverb {
+            SoundParam::Reverb.set(&mut sound, amount);
+        }
+        SoundParam::Brightness.set(&mut sound, prefs.brightness);
         let mut ui = ScoreUiState::from_prefs(&prefs);
         ui.draft.tempo = practice.tempo;
         let library = MusicLibrary::new(prefs.library_dir.as_deref());
@@ -490,6 +505,20 @@ impl ScoreAppState {
         self.ui.status = self.selection_description();
     }
 
+    /// What a rubber band swept up. Written straight rather than through
+    /// [`Self::handle_canvas_tap`], because a band replaces the whole
+    /// selection every pointer sample and must not audition sixty notes a
+    /// second while it does.
+    pub fn set_band_selection(&mut self, chosen: &[SemanticId]) {
+        if self.ui.selection.ordered == chosen {
+            return;
+        }
+        self.ui.selection.ordered = chosen.to_vec();
+        self.ui.selection.active = chosen.last().copied();
+        self.ui.caret = self.ui.selection.active;
+        self.ui.status = self.selection_description();
+    }
+
     pub fn handle_ink(&mut self, semantic: SemanticId, points: &[makepad_score_render::Point]) {
         let result = self.document.add_ink_annotation(semantic, points);
         self.report(result);
@@ -576,9 +605,13 @@ impl ScoreAppState {
             return;
         }
         self.instrument_rate = Some(rate);
-        let preset = sound::preset(self.sound.preset);
-        if preset.needs_rebuild() {
-            self.playback.rebuild_instrument(preset);
+        // The learned engine has to be built whatever the preset: unlike the
+        // physical model there is no "default instrument" already standing.
+        if self.sound.engine != ScoreEngine::Physical {
+            self.playback.rebuild_instrument(
+                self.sound.engine,
+                sound::build_preset(self.sound.engine, self.sound.preset),
+            );
         }
     }
 
@@ -887,6 +920,53 @@ impl ScoreAppState {
             .rebuild_plan(self.document.score(), self.practice.tempo, self.practice.count_in);
         self.playback.install_audio_output(cx);
     }
+
+    /// Which instrument is playing.
+    ///
+    /// Derived from the engine rather than stored beside it, so the list's
+    /// highlight cannot drift out of step with what is actually sounding.
+    pub fn selected_instrument(&self) -> InstrumentId {
+        match self.sound.engine {
+            ScoreEngine::Learned => InstrumentId::Electric(self.sound.preset),
+            _ => InstrumentId::Acoustic(self.sound.preset),
+        }
+    }
+
+    /// Pick an instrument. Routing to the right synthesis is this function's
+    /// job, not the reader's: that is the whole point of one flat list.
+    pub fn select_instrument(&mut self, id: InstrumentId) {
+        let (InstrumentId::Acoustic(index) | InstrumentId::Electric(index)) = id;
+        let engine = id.engine();
+        self.sound.engine = engine;
+        self.sound.apply_preset(index);
+        self.ui.sound_focus = None;
+        // A different engine is a different instrument and goes over the
+        // crossfaded handoff, so switching mid-phrase dissolves rather than
+        // cutting. Within one engine nothing has to be built.
+        if engine != ScoreEngine::Physical {
+            self.playback
+                .rebuild_instrument(engine, sound::build_preset(engine, index));
+        }
+        self.publish_sound();
+        // The instrument is a choice, so it outlives the session.
+        self.prefs.engine = crate::prefs::engine_name(engine).to_string();
+        self.prefs.instrument = sound::preset_name(engine, index).to_string();
+        self.prefs.save();
+        self.ui.status = format!(
+            "{} · {}",
+            sound::preset_name(engine, index),
+            sound::preset_description(engine, index)
+        );
+    }
+
+    /// Store the two exposed controls, so the room and the voicing the reader
+    /// settled on are still there next launch.
+    pub fn remember_sound(&mut self) {
+        self.prefs.room = crate::prefs::reverb_preset_name(self.sound.room.preset).to_string();
+        self.prefs.reverb = Some(self.sound.room.mix);
+        self.prefs.brightness = self.sound.eq_shelf_db;
+        self.prefs.save();
+    }
 }
 
 pub fn apply_score_action(cx: &mut Cx, state: &mut ScoreAppState, action: &ScoreAction) -> bool {
@@ -894,10 +974,64 @@ pub fn apply_score_action(cx: &mut Cx, state: &mut ScoreAppState, action: &Score
         ScoreAction::SetMode(mode) => {
             state.ui.mode = *mode;
             state.ui.chrome_visible = *mode == ProductMode::Editor;
+            if *mode == ProductMode::Pianist {
+                state.ui.tool = ScoreTool::Navigate;
+            }
             state.ui.status = match mode {
                 ProductMode::Pianist => "Pianist mode · score only".into(),
                 ProductMode::Editor => "Editor mode · notation tools revealed".into(),
             };
+        }
+        ScoreAction::SetTool(tool) => {
+            // Pianist mode is the reading face: it navigates and never edits,
+            // so arming an editing tool reveals the editor rather than quietly
+            // making the reading face dangerous.
+            if *tool != ScoreTool::Navigate && state.ui.mode == ProductMode::Pianist {
+                state.ui.mode = ProductMode::Editor;
+                state.ui.chrome_visible = true;
+            }
+            state.ui.tool = *tool;
+            state.ui.status = tool.hint().into();
+        }
+        ScoreAction::Transpose(semitones) => {
+            let selection = state.ui.selection.ordered.clone();
+            if selection.is_empty() {
+                state.ui.status = "Nothing selected to transpose".into();
+            } else {
+                match state.document.transpose(&selection, *semitones) {
+                    Ok(moved) => {
+                        state.ui.status = format!(
+                            "Transposed {} note{} by {}{}",
+                            moved,
+                            if moved == 1 { "" } else { "s" },
+                            if *semitones > 0 { "+" } else { "" },
+                            semitones
+                        );
+                        state.rebuild_playback(cx);
+                    }
+                    Err(error) => state.ui.status = format!("Transpose refused · {error}"),
+                }
+            }
+        }
+        ScoreAction::DeleteSelection => {
+            let selection = state.ui.selection.ordered.clone();
+            if selection.is_empty() {
+                state.ui.status = "Nothing selected to delete".into();
+            } else {
+                match state.document.delete_notes(&selection) {
+                    Ok(removed) => {
+                        state.ui.selection.clear();
+                        state.ui.caret = None;
+                        state.ui.status = format!(
+                            "Deleted {} note{}",
+                            removed,
+                            if removed == 1 { "" } else { "s" }
+                        );
+                        state.rebuild_playback(cx);
+                    }
+                    Err(error) => state.ui.status = format!("Delete refused · {error}"),
+                }
+            }
         }
         ScoreAction::ToggleMode | ScoreAction::ToggleChrome => {
             state.ui.mode = if state.ui.mode == ProductMode::Pianist {
@@ -1027,53 +1161,16 @@ pub fn apply_score_action(cx: &mut Cx, state: &mut ScoreAppState, action: &Score
         ScoreAction::SetReverbPreset(preset) => {
             state.sound.room.preset = *preset;
             state.publish_sound();
+            state.remember_sound();
             state.ui.status = format!("Room · {}", crate::playback::reverb_preset_label(*preset));
         }
-        ScoreAction::SetPerspective(perspective) => {
-            state.sound.room.perspective = *perspective;
-            state.publish_sound();
-            state.ui.status = format!("Listening from the {}", perspective_label(*perspective).to_lowercase());
-        }
-        ScoreAction::SetPianoPreset(index) => {
-            state.sound.apply_preset(*index);
-            state.ui.sound_focus = None;
-            let preset = sound::preset(state.sound.preset);
-            // The instrument is a choice, so it outlives the session.
-            state.prefs.instrument = preset.name.to_string();
-            state.prefs.save();
-            // A preset with a construction-time design override is a different
-            // instrument; one without is a voicing of this one and travels
-            // through the shared cell like any slider.
-            if preset.needs_rebuild() {
-                state.playback.rebuild_instrument(preset);
-            }
-            state.publish_sound();
-            state.ui.status = format!(
-                "{} · {}",
-                sound::preset_name(state.sound.preset),
-                preset.description
-            );
-        }
+        ScoreAction::SelectInstrument(id) => state.select_instrument(*id),
         ScoreAction::SetSoundParam { param, value } => {
             param.set(&mut state.sound, *value);
             state.ui.sound_focus = Some(*param);
             state.publish_sound();
+            state.remember_sound();
             state.ui.status = format!("{} · {}", param.label(), param.format(param.get(&state.sound)));
-        }
-        ScoreAction::ResetSoundToPreset => {
-            let preset_index = state.sound.preset;
-            state.sound.apply_preset(preset_index);
-            state.ui.sound_focus = None;
-            state.publish_sound();
-            state.ui.status = format!("Back to {}", sound::preset_name(preset_index));
-        }
-        ScoreAction::LiftDampers => {
-            let top = SoundParam::Sympathetic.range().1;
-            SoundParam::Sympathetic.set(&mut state.sound, top);
-            state.ui.sound_focus = Some(SoundParam::Sympathetic);
-            state.publish_sound();
-            state.ui.status =
-                "Dampers off · every string answers every note".into();
         }
         ScoreAction::SetAnnotationTool(tool) => {
             state.ui.annotation_tool = *tool;
@@ -1237,6 +1334,10 @@ pub fn apply_score_action(cx: &mut Cx, state: &mut ScoreAppState, action: &Score
             } else if state.ui.annotation_tool != AnnotationTool::None {
                 state.ui.annotation_tool = AnnotationTool::None;
                 state.ui.status = "Annotation tool closed".into();
+            } else if state.ui.tool != ScoreTool::Navigate {
+                // Escape always ends at the tool that cannot change anything.
+                state.ui.tool = ScoreTool::Navigate;
+                state.ui.status = ScoreTool::Navigate.hint().into();
             } else {
                 state.ui.selection.clear();
                 state.ui.status = "Selection cleared".into();
@@ -1452,7 +1553,12 @@ pub fn apply_score_action(cx: &mut Cx, state: &mut ScoreAppState, action: &Score
 }
 
 pub fn key_action(event: &KeyEvent, state: &ScoreAppState) -> Option<ScoreAction> {
-    crate::keymap::action_for_key(event, state.ui.mode, state.ui.text_input_focused)
+    crate::keymap::action_for_key(
+        event,
+        state.ui.mode,
+        state.ui.tool,
+        state.ui.text_input_focused,
+    )
 }
 
 pub fn transport_label(state: &ScoreAppState) -> &'static str {

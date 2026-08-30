@@ -4,16 +4,15 @@
 
 use crate::{
     action::{
-        perspective_label, room_summary, AnnotationTool, BrowseTarget, DialogKind,
-        InspectorTab, PageLayout, PaletteCommand, PrefToggle, ScoreAction,
+        room_summary, AnnotationTool, BrowseTarget, DialogKind,
+        InspectorTab, PageLayout, PaletteCommand, PrefToggle, ScoreAction, ScoreTool,
     },
     keymap::KEYMAP_ROWS,
     playback::REVERB_PRESETS,
-    sound::{self, SoundParam, DAMPERS_LIFTING},
+    sound::{self, SoundParam},
     state::{transport_label, ScoreAppState},
     ProductMode,
 };
-use makepad_piano_model::{fx::Perspective, PIANO_PRESETS};
 use makepad_widgets::*;
 use std::path::PathBuf;
 
@@ -95,6 +94,16 @@ script_mod! {
                     spacing: 5
                     draw_bg +: {color: score.color_chrome_raised}
                     mode_pianist := ScoreButton{text: "Pianist"}
+                    ScoreDivider{width: 1 height: 22 margin: Inset{left: 3 right: 3}}
+                    // What a drag MEANS, chosen rather than inferred. The
+                    // first is the safe one, and it is where the app rests.
+                    tool_navigate := ScoreButtonFlat{text: "Navigate"}
+                    tool_choose := ScoreButtonFlat{text: "Select"}
+                    tool_edit := ScoreButtonFlat{text: "Edit"}
+                    ScoreDivider{width: 1 height: 22 margin: Inset{left: 3 right: 3}}
+                    tool_transpose_up := ScoreToolButton{text: "▲"}
+                    tool_transpose_down := ScoreToolButton{text: "▼"}
+                    tool_delete := ScoreToolButton{text: "⌫"}
                     ScoreDivider{width: 1 height: 22 margin: Inset{left: 3 right: 3}}
                     tool_select := ScoreToolButton{text: "↖"}
                     duration_4 := ScoreToolButton{width: 38 text: "1/8"}
@@ -244,233 +253,35 @@ script_mod! {
                         ScoreDivider{}
                         // The room moved into the Sound panel: one place for
                         // everything that shapes what the piano sounds like.
-                        ScoreRow{ScoreLabelMuted{text: "Instrument, voicing and room · Sound tab"}}
+                        ScoreRow{ScoreLabelMuted{text: "Instrument, brightness and room · Sound tab"}}
                         Filler{}
                     }
                     sound_page := ScrollYView{
                         visible: false width: Fill height: Fill flow: Down
 
-                        ScoreSection{ScoreLabelDim{text: "Instrument"} Filler{} sound_state := ScoreLabelMuted{text: ""}}
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 3
-                            padding: Inset{left: 10 right: 10 top: 7 bottom: 7}
-                            sound_preset_name := ScoreHeader{text: ""}
-                            sound_preset_desc := ScoreLabelWrap{text: ""}
-                            View{
-                                width: Fill height: Fit flow: Right spacing: 5
-                                sound_reset := ScoreButton{text: "Back to preset"}
-                                Filler{}
-                            }
-                        }
-                        preset_0 := ScoreMenuRow{text: ""}
-                        preset_0_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_1 := ScoreMenuRow{text: ""}
-                        preset_1_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_2 := ScoreMenuRow{text: ""}
-                        preset_2_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_3 := ScoreMenuRow{text: ""}
-                        preset_3_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_4 := ScoreMenuRow{text: ""}
-                        preset_4_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_5 := ScoreMenuRow{text: ""}
-                        preset_5_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_6 := ScoreMenuRow{text: ""}
-                        preset_6_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_7 := ScoreMenuRow{text: ""}
-                        preset_7_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_8 := ScoreMenuRow{text: ""}
-                        preset_8_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_9 := ScoreMenuRow{text: ""}
-                        preset_9_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_10 := ScoreMenuRow{text: ""}
-                        preset_10_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_11 := ScoreMenuRow{text: ""}
-                        preset_11_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_12 := ScoreMenuRow{text: ""}
-                        preset_12_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_13 := ScoreMenuRow{text: ""}
-                        preset_13_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_14 := ScoreMenuRow{text: ""}
-                        preset_14_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_15 := ScoreMenuRow{text: ""}
-                        preset_15_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_16 := ScoreMenuRow{text: ""}
-                        preset_16_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_17 := ScoreMenuRow{text: ""}
-                        preset_17_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_18 := ScoreMenuRow{text: ""}
-                        preset_18_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
-                        preset_19 := ScoreMenuRow{text: ""}
-                        preset_19_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 5}}
+                        // Two instruments. The engine is a property of the
+                        // instrument, not a mode chosen first, so picking a
+                        // row is all there is to it.
+                        ScoreSection{ScoreLabelDim{text: "Instrument"}}
+                        inst_0 := ScoreMenuRow{text: ""}
+                        inst_0_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 7}}
+                        inst_1 := ScoreMenuRow{text: ""}
+                        inst_1_desc := ScoreLabelWrap{text: "" margin: Inset{left: 18 right: 10 top: 0 bottom: 7}}
                         ScoreDivider{}
 
-                        ScoreSection{ScoreLabelDim{text: "Character"} Filler{} ScoreLabelMuted{text: "1.00 = as voiced"}}
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_body_tap_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_body_tap_value := ScoreLabel{text: ""}
-                            }
-                            sl_body_tap := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_knock_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_knock_value := ScoreLabel{text: ""}
-                            }
-                            sl_knock := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_roughness_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_roughness_value := ScoreLabel{text: ""}
-                            }
-                            sl_roughness := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_phantoms_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_phantoms_value := ScoreLabel{text: ""}
-                            }
-                            sl_phantoms := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_attack_noise_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_attack_noise_value := ScoreLabel{text: ""}
-                            }
-                            sl_attack_noise := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_sympathetic_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_sympathetic_value := ScoreLabel{text: ""}
-                            }
-                            sl_sympathetic := ScoreSlider{}
-                        }
+                        // Brightness: one treble shelf over whichever
+                        // instrument is playing. See sound::BRIGHTNESS_HZ.
+                        ScoreSection{ScoreLabelDim{text: "Tone"}}
                         View{
                             width: Fill height: Fit flow: Down spacing: 3
-                            padding: Inset{left: 10 right: 10 top: 6 bottom: 9}
-                            View{
-                                width: Fill height: Fit flow: Right spacing: 5 align: Align{y: 0.5}
-                                sound_dampers := ScoreButton{text: "Dampers off"}
-                                Filler{}
-                            }
-                            sound_dampers_note := ScoreLabelWrap{text: ""}
-                        }
-                        ScoreDivider{}
-
-                        ScoreSection{ScoreLabelDim{text: "Tone"} Filler{} ScoreLabelMuted{text: "output trim"}}
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 8}
                             View{
                                 width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_shelf_db_name := ScoreLabelDim{text: ""}
+                                sl_brightness_name := ScoreLabelDim{text: ""}
                                 Filler{}
-                                sl_shelf_db_value := ScoreLabel{text: ""}
+                                sl_brightness_value := ScoreLabel{text: ""}
                             }
-                            sl_shelf_db := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_shelf_hz_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_shelf_hz_value := ScoreLabel{text: ""}
-                            }
-                            sl_shelf_hz := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_bell_hz_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_bell_hz_value := ScoreLabel{text: ""}
-                            }
-                            sl_bell_hz := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_bell_db_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_bell_db_value := ScoreLabel{text: ""}
-                            }
-                            sl_bell_db := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_bell_q_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_bell_q_value := ScoreLabel{text: ""}
-                            }
-                            sl_bell_q := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_tone_bass_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_tone_bass_value := ScoreLabel{text: ""}
-                            }
-                            sl_tone_bass := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_tone_treble_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_tone_treble_value := ScoreLabel{text: ""}
-                            }
-                            sl_tone_treble := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_master_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_master_value := ScoreLabel{text: ""}
-                            }
-                            sl_master := ScoreSlider{}
+                            sl_brightness := ScoreSlider{}
                         }
                         ScoreDivider{}
 
@@ -492,36 +303,18 @@ script_mod! {
                                 width: Fill height: Fit flow: Right spacing: 4
                                 room_cathedral := ScoreButtonFlat{text: "Cathedral"}
                                 Filler{}
-                                room_player := ScoreButtonFlat{text: "Player"}
-                                room_audience := ScoreButtonFlat{text: "Audience"}
                             }
                         }
                         View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
+                            width: Fill height: Fit flow: Down spacing: 3
+                            padding: Inset{left: 10 right: 10 top: 7 bottom: 4}
                             View{
                                 width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_reverb_mix_name := ScoreLabelDim{text: ""}
+                                sl_reverb_name := ScoreLabelDim{text: ""}
                                 Filler{}
-                                sl_reverb_mix_value := ScoreLabel{text: ""}
+                                sl_reverb_value := ScoreLabel{text: ""}
                             }
-                            sl_reverb_mix := ScoreSlider{}
-                        }
-                        View{
-                            width: Fill height: Fit flow: Down spacing: 1
-                            padding: Inset{left: 10 right: 10 top: 5 bottom: 2}
-                            View{
-                                width: Fill height: Fit flow: Right align: Align{x: 0.0 y: 0.5} spacing: 5
-                                sl_early_name := ScoreLabelDim{text: ""}
-                                Filler{}
-                                sl_early_value := ScoreLabel{text: ""}
-                            }
-                            sl_early := ScoreSlider{}
-                        }
-                        ScoreRow{
-                            ScoreLabelDim{text: "Output level"}
-                            Filler{}
-                            sound_meter := ScoreLabel{text: "—"}
+                            sl_reverb := ScoreSlider{}
                         }
                         View{
                             width: Fill height: Fit flow: Down
@@ -867,6 +660,9 @@ script_mod! {
                         key_row_18 := ScoreRow{height: 21 key_name_18 := ScoreLabel{text: ""} Filler{} key_action_18 := ScoreLabelDim{text: ""}}
                         key_row_19 := ScoreRow{height: 21 key_name_19 := ScoreLabel{text: ""} Filler{} key_action_19 := ScoreLabelDim{text: ""}}
                         key_row_20 := ScoreRow{height: 21 key_name_20 := ScoreLabel{text: ""} Filler{} key_action_20 := ScoreLabelDim{text: ""}}
+                        key_row_21 := ScoreRow{height: 21 key_name_21 := ScoreLabel{text: ""} Filler{} key_action_21 := ScoreLabelDim{text: ""}}
+                        key_row_22 := ScoreRow{height: 21 key_name_22 := ScoreLabel{text: ""} Filler{} key_action_22 := ScoreLabelDim{text: ""}}
+                        key_row_23 := ScoreRow{height: 21 key_name_23 := ScoreLabel{text: ""} Filler{} key_action_23 := ScoreLabelDim{text: ""}}
                     }
 
                     dialog_about := View{
@@ -1410,63 +1206,37 @@ impl ScoreShell {
             .set_enabled(cx, state.library_page + 1 < pages);
     }
 
-    /// The one panel that holds the whole piano sound. Preset list, the six
-    /// mechanism amounts, the output EQ and the room, plus what has been moved
-    /// away from the preset — a dot on the control and a count in the header.
+    /// The whole sound panel: two instruments, brightness, and the room.
+    /// Everything on it reaches the sounding instrument — there is nothing
+    /// here that only some of the instruments answer to.
     fn sync_sound_panel(&mut self, cx: &mut Cx2d, state: &ScoreAppState) {
         let sound = &state.sound;
-        let current = sound::preset(sound.preset);
-        self.view.label(cx, ids!(sound_preset_name)).set_text(
-            cx,
-            &if sound::preset_is_effect(sound.preset) {
-                format!("{}  ·  effect", sound::preset_name(sound.preset))
-            } else {
-                sound::preset_name(sound.preset).to_string()
-            },
-        );
-        self.view
-            .label(cx, ids!(sound_preset_desc))
-            .set_text(cx, current.description);
-        let moved = sound.diverged().count();
-        self.view.label(cx, ids!(sound_state)).set_text(
-            cx,
-            &match moved {
-                0 => "as voiced".to_string(),
-                1 => "1 control moved".to_string(),
-                count => format!("{count} controls moved"),
-            },
-        );
-        self.view
-            .button(cx, ids!(sound_reset))
-            .set_enabled(cx, moved > 0);
 
-        for (index, row) in PRESET_ROWS.iter().enumerate() {
-            let listed = index < PIANO_PRESETS.len();
-            self.view.button(cx, row).set_visible(cx, listed);
+        // The list. Two instruments, each saying what it is; the selected one
+        // is ticked. More rows than instruments simply stay hidden, so adding
+        // an instrument back is a row in a table plus a slot in the script.
+        let entries = sound::instrument_list();
+        let selected = state.selected_instrument();
+        for (slot, row) in INSTRUMENT_ROWS.iter().enumerate() {
+            let entry = entries.get(slot);
+            let shown = entry.is_some();
+            self.view.button(cx, row).set_visible(cx, shown);
             self.view
-                .label(cx, PRESET_DESCRIPTIONS[index])
-                .set_visible(cx, listed);
-            if !listed {
-                continue;
-            }
-            let selected = index == sound.preset;
+                .label(cx, INSTRUMENT_DESCRIPTIONS[slot])
+                .set_visible(cx, shown);
+            let Some(entry) = entry else { continue };
+            let is_selected = entry.id == selected;
             self.view.button(cx, row).set_text(
                 cx,
                 &format!(
                     "{}{}",
-                    if selected { "✓ " } else { "    " },
-                    sound::preset_name(index)
+                    if is_selected { "\u{2713} " } else { "    " },
+                    entry.name
                 ),
             );
-            let description = sound::preset(index).description;
-            self.view.label(cx, PRESET_DESCRIPTIONS[index]).set_text(
-                cx,
-                &if sound::preset_is_effect(index) {
-                    format!("Effect · {description}")
-                } else {
-                    description.to_string()
-                },
-            );
+            self.view
+                .label(cx, INSTRUMENT_DESCRIPTIONS[slot])
+                .set_text(cx, entry.description);
         }
 
         for (index, param) in SoundParam::ALL.into_iter().enumerate() {
@@ -1474,57 +1244,23 @@ impl ScoreShell {
             self.view
                 .slider(cx, SOUND_SLIDERS[index])
                 .set_value(cx, param.to_position(value));
-            // A dot marks a control the user has nudged off the preset.
-            self.view.label(cx, SOUND_SLIDER_NAMES[index]).set_text(
-                cx,
-                &if sound.is_diverged(param) {
-                    format!("• {}", param.label())
-                } else {
-                    param.label().to_string()
-                },
-            );
+            self.view
+                .label(cx, SOUND_SLIDER_NAMES[index])
+                .set_text(cx, param.label());
             self.view
                 .label(cx, SOUND_SLIDER_VALUES[index])
                 .set_text(cx, &param.format(value));
         }
 
-        let sympathetic = sound.voicing.sympathetic;
-        let wide_open = sympathetic >= SoundParam::Sympathetic.range().1 - 1.0e-3;
-        self.view
-            .button(cx, ids!(sound_dampers))
-            .set_text(cx, if wide_open { "✓ Dampers off" } else { "Dampers off" });
-        self.view
-            .button(cx, ids!(sound_dampers))
-            .set_enabled(cx, !wide_open);
-        self.view.label(cx, ids!(sound_dampers_note)).set_text(
-            cx,
-            if wide_open {
-                "Every damper off: the whole instrument answers every note."
-            } else if sympathetic > DAMPERS_LIFTING {
-                "The dampers are lifting — cross-note resonance is opening up."
-            } else if sympathetic > 0.0 {
-                "Sympathetic strings at the voiced level. Push past 1.25 and the dampers start to come off."
-            } else {
-                "Sympathetic field off: only the strings you strike sound."
-            },
-        );
-        // What the instrument is putting out, read back from the audio thread.
-        // Nothing else in this panel is a measurement, so it is also the one
-        // control surface that proves the settings landed.
-        let peak = state.playback.output_peak();
-        self.view.label(cx, ids!(sound_meter)).set_text(
-            cx,
-            &if peak > 1.0e-5 {
-                format!("{:.1} dB", 20.0 * peak.log10())
-            } else {
-                "silent".to_string()
-            },
-        );
+        // The room's own label and buttons are synced with the rest of the
+        // shell in draw_walk; this panel adds the hint under them.
         self.view.label(cx, ids!(sound_hint)).set_text(
             cx,
             match state.ui.sound_focus {
                 Some(param) => param.hint(),
-                None => "Every control here reaches the sounding instrument. Presets that change the physical design rebuild it and cross-fade, so a change mid-phrase never cuts.",
+                None => "Both controls reach the sounding instrument straight away, and \
+                         switching instrument dissolves rather than cuts — so either is \
+                         safe mid-phrase.",
             },
         );
     }
@@ -1689,78 +1425,20 @@ impl ScoreShell {
 /// Named-row helpers. The DSL declares a fixed number of slots because the
 /// script has no loops; these keep the Rust side from repeating the ids.
 const RECENT_SLOTS: usize = 6;
-const KEYMAP_SLOTS: usize = 21;
+const KEYMAP_SLOTS: usize = 24;
 const ABOUT_SLOTS: usize = 7;
 
-/// One row per shipped instrument preset, in `PIANO_PRESETS` order.
-const PRESET_ROWS: &[&[LiveId]] = ids_array!(
-    preset_0, preset_1, preset_2, preset_3, preset_4, preset_5, preset_6, preset_7, preset_8,
-    preset_9, preset_10, preset_11, preset_12, preset_13, preset_14, preset_15, preset_16,
-    preset_17, preset_18, preset_19,
-);
-const PRESET_DESCRIPTIONS: &[&[LiveId]] = ids_array!(
-    preset_0_desc, preset_1_desc, preset_2_desc, preset_3_desc, preset_4_desc, preset_5_desc,
-    preset_6_desc, preset_7_desc, preset_8_desc, preset_9_desc, preset_10_desc, preset_11_desc,
-    preset_12_desc, preset_13_desc, preset_14_desc, preset_15_desc, preset_16_desc,
-    preset_17_desc, preset_18_desc, preset_19_desc,
-);
+/// One fixed slot per instrument row: the row itself and its description.
+/// The script has no loops, so the slots are declared and `instrument_list`
+/// fills as many as it needs. Two instruments ship; kept honest by
+/// `every_declared_row_matches_the_list_it_shows`.
+const INSTRUMENT_ROWS: &[&[LiveId]] = ids_array!(inst_0, inst_1,);
+const INSTRUMENT_DESCRIPTIONS: &[&[LiveId]] = ids_array!(inst_0_desc, inst_1_desc,);
 
-/// One slider per [`SoundParam`], in `SoundParam::ALL` order. Kept honest by
-/// `sound_panel_has_a_slider_for_every_parameter`.
-const SOUND_SLIDERS: &[&[LiveId]] = ids_array!(
-    sl_body_tap,
-    sl_knock,
-    sl_roughness,
-    sl_phantoms,
-    sl_attack_noise,
-    sl_sympathetic,
-    sl_shelf_db,
-    sl_shelf_hz,
-    sl_bell_hz,
-    sl_bell_db,
-    sl_bell_q,
-    sl_tone_bass,
-    sl_tone_treble,
-    sl_master,
-    sl_reverb_mix,
-    sl_early,
-);
-const SOUND_SLIDER_NAMES: &[&[LiveId]] = ids_array!(
-    sl_body_tap_name,
-    sl_knock_name,
-    sl_roughness_name,
-    sl_phantoms_name,
-    sl_attack_noise_name,
-    sl_sympathetic_name,
-    sl_shelf_db_name,
-    sl_shelf_hz_name,
-    sl_bell_hz_name,
-    sl_bell_db_name,
-    sl_bell_q_name,
-    sl_tone_bass_name,
-    sl_tone_treble_name,
-    sl_master_name,
-    sl_reverb_mix_name,
-    sl_early_name,
-);
-const SOUND_SLIDER_VALUES: &[&[LiveId]] = ids_array!(
-    sl_body_tap_value,
-    sl_knock_value,
-    sl_roughness_value,
-    sl_phantoms_value,
-    sl_attack_noise_value,
-    sl_sympathetic_value,
-    sl_shelf_db_value,
-    sl_shelf_hz_value,
-    sl_bell_hz_value,
-    sl_bell_db_value,
-    sl_bell_q_value,
-    sl_tone_bass_value,
-    sl_tone_treble_value,
-    sl_master_value,
-    sl_reverb_mix_value,
-    sl_early_value,
-);
+/// One slider per [`SoundParam`], in `SoundParam::ALL` order.
+const SOUND_SLIDERS: &[&[LiveId]] = ids_array!(sl_brightness, sl_reverb,);
+const SOUND_SLIDER_NAMES: &[&[LiveId]] = ids_array!(sl_brightness_name, sl_reverb_name,);
+const SOUND_SLIDER_VALUES: &[&[LiveId]] = ids_array!(sl_brightness_value, sl_reverb_value,);
 
 /// One row per listed library entry; the browser pages when a folder holds
 /// more than this.
@@ -1805,7 +1483,10 @@ fn keymap_row(index: usize) -> (&'static [LiveId], &'static [LiveId], &'static [
         17 => (ids!(key_row_17), ids!(key_name_17), ids!(key_action_17)),
         18 => (ids!(key_row_18), ids!(key_name_18), ids!(key_action_18)),
         19 => (ids!(key_row_19), ids!(key_name_19), ids!(key_action_19)),
-        _ => (ids!(key_row_20), ids!(key_name_20), ids!(key_action_20)),
+        20 => (ids!(key_row_20), ids!(key_name_20), ids!(key_action_20)),
+        21 => (ids!(key_row_21), ids!(key_name_21), ids!(key_action_21)),
+        22 => (ids!(key_row_22), ids!(key_name_22), ids!(key_action_22)),
+        _ => (ids!(key_row_23), ids!(key_name_23), ids!(key_action_23)),
     }
 }
 
@@ -1933,6 +1614,16 @@ impl Widget for ScoreShell {
         self.emit_button(cx, actions, ids!(zoom_out), ScoreAction::ZoomBy(1.0 / 1.12));
         self.emit_button(cx, actions, ids!(zoom_in), ScoreAction::ZoomBy(1.12));
         self.emit_button(cx, actions, ids!(fit_page), ScoreAction::FitPage);
+        for (path, tool) in [
+            (ids!(tool_navigate), ScoreTool::Navigate),
+            (ids!(tool_choose), ScoreTool::Select),
+            (ids!(tool_edit), ScoreTool::Edit),
+        ] {
+            self.emit_button(cx, actions, path, ScoreAction::SetTool(tool));
+        }
+        self.emit_button(cx, actions, ids!(tool_transpose_up), ScoreAction::Transpose(1));
+        self.emit_button(cx, actions, ids!(tool_transpose_down), ScoreAction::Transpose(-1));
+        self.emit_button(cx, actions, ids!(tool_delete), ScoreAction::DeleteSelection);
         // The select tool is "no annotation tool": it puts the pointer back to
         // selecting notes, which is what the arrow promises.
         self.emit_button(cx, actions, ids!(tool_select), ScoreAction::SetAnnotationTool(AnnotationTool::None));
@@ -2006,13 +1697,23 @@ impl Widget for ScoreShell {
         ] {
             self.emit_button(cx, actions, path, ScoreAction::SetReverbPreset(preset));
         }
-        self.emit_button(cx, actions, ids!(room_player), ScoreAction::SetPerspective(Perspective::Player));
-        self.emit_button(cx, actions, ids!(room_audience), ScoreAction::SetPerspective(Perspective::Audience));
 
-        // The sound panel: instrument presets, the mechanism/tone/room
-        // sliders, and the two shortcuts that sit next to them.
-        for (index, row) in PRESET_ROWS.iter().enumerate().take(PIANO_PRESETS.len()) {
-            self.emit_button(cx, actions, row, ScoreAction::SetPianoPreset(index));
+        // The sound panel. Clicking a row picks that instrument; the engine
+        // follows it. The list is rebuilt here from the same source the panel
+        // drew from, so a row can never mean a different instrument than the
+        // one it shows.
+        {
+            let entries = sound::instrument_list();
+            let mut picked = None;
+            for (slot, row) in INSTRUMENT_ROWS.iter().enumerate() {
+                let Some(entry) = entries.get(slot) else { break };
+                if self.view.button(cx, row).clicked(actions) {
+                    picked = Some(entry.id);
+                }
+            }
+            if let Some(id) = picked {
+                cx.action(ScoreAction::SelectInstrument(id));
+            }
         }
         for (index, param) in SoundParam::ALL.into_iter().enumerate() {
             if let Some(position) = self.view.slider(cx, SOUND_SLIDERS[index]).slided(actions) {
@@ -2022,8 +1723,6 @@ impl Widget for ScoreShell {
                 });
             }
         }
-        self.emit_button(cx, actions, ids!(sound_reset), ScoreAction::ResetSoundToPreset);
-        self.emit_button(cx, actions, ids!(sound_dampers), ScoreAction::LiftDampers);
         for path in [ids!(pianist_sound), ids!(play_sound)] {
             if self.view.button(cx, path).clicked(actions) {
                 cx.action(ScoreAction::SetMode(ProductMode::Editor));
@@ -2326,8 +2025,26 @@ impl Widget for ScoreShell {
                 .button(cx, ids!(file_save))
                 .set_enabled(cx, state.document.is_dirty() || state.document.native_path().is_none());
 
-            // The active tool is the one you cannot pick again — the same
-            // convention the inspector tabs use.
+            // The armed pointer tool is the one you cannot pick again — the
+            // same convention the inspector tabs use, so the toolbar always
+            // says which of the three the pointer is obeying.
+            for (path, tool) in [
+                (ids!(tool_navigate), ScoreTool::Navigate),
+                (ids!(tool_choose), ScoreTool::Select),
+                (ids!(tool_edit), ScoreTool::Edit),
+            ] {
+                self.view.button(cx, path).set_enabled(cx, state.ui.tool != tool);
+            }
+            // Transpose and delete are selection operations, and they are
+            // edits: the safe tool does not offer them.
+            let may_edit = state.ui.tool != ScoreTool::Navigate && has_selection;
+            for path in [
+                ids!(tool_transpose_up),
+                ids!(tool_transpose_down),
+                ids!(tool_delete),
+            ] {
+                self.view.button(cx, path).set_enabled(cx, may_edit);
+            }
             for (path, tool) in [
                 (ids!(tool_select), AnnotationTool::None),
                 (ids!(annotate_highlight), AnnotationTool::Highlight),
@@ -2431,17 +2148,6 @@ impl Widget for ScoreShell {
                 };
                 self.view.button(cx, path).set_text(cx, &label);
             }
-            for (path, perspective) in [
-                (ids!(room_player), Perspective::Player),
-                (ids!(room_audience), Perspective::Audience),
-            ] {
-                let label = if room.perspective == perspective {
-                    format!("✓ {}", perspective_label(perspective))
-                } else {
-                    perspective_label(perspective).to_string()
-                };
-                self.view.button(cx, path).set_text(cx, &label);
-            }
 
             let history = state.history_lines();
             for index in 0..5 {
@@ -2469,20 +2175,18 @@ mod tests {
         assert_eq!(SOUND_SLIDERS.len(), SoundParam::ALL.len());
         assert_eq!(SOUND_SLIDER_NAMES.len(), SoundParam::ALL.len());
         assert_eq!(SOUND_SLIDER_VALUES.len(), SoundParam::ALL.len());
-        assert!(
-            PRESET_ROWS.len() >= PIANO_PRESETS.len(),
-            "{} presets ship but the panel only has {} rows",
-            PIANO_PRESETS.len(),
-            PRESET_ROWS.len()
-        );
-        assert_eq!(PRESET_ROWS.len(), PRESET_DESCRIPTIONS.len());
+        // Every shipped instrument must have a slot: the panel has no loop
+        // to grow one, so an instrument added to the table without a row in
+        // the script would simply not be listed.
+        assert_eq!(INSTRUMENT_ROWS.len(), crate::sound::instrument_list().len());
+        assert_eq!(INSTRUMENT_ROWS.len(), INSTRUMENT_DESCRIPTIONS.len());
         assert_eq!(LIBRARY_ROWS.len(), crate::state::LIBRARY_PAGE);
         assert_eq!(KEYMAP_SLOTS, KEYMAP_ROWS.len());
 
         let mut every: Vec<LiveId> = Vec::new();
         for table in [
-            PRESET_ROWS,
-            PRESET_DESCRIPTIONS,
+            INSTRUMENT_ROWS,
+            INSTRUMENT_DESCRIPTIONS,
             SOUND_SLIDERS,
             SOUND_SLIDER_NAMES,
             SOUND_SLIDER_VALUES,

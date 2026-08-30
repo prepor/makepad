@@ -3,7 +3,7 @@
 //! pointer input back into stable semantic IDs.
 
 use crate::{
-    action::{AnnotationTool, PageLayout, ScoreAction},
+    action::{AnnotationTool, PageLayout, ScoreAction, ScoreTool},
     document::{DragTarget, NoteDrag, SemanticKind, PAGE_HEIGHT_SP, PAGE_WIDTH_SP},
     state::ScoreAppState,
 };
@@ -11,7 +11,9 @@ use makepad_score::model::AnnotationKind;
 use makepad_score_render as render;
 use makepad_score_render::{MakepadScoreRenderer, Point as ScorePoint, SemanticId};
 use makepad_widgets::{
+    event::ScrollPhase,
     scroll_bar::{ScrollAxis, ScrollBarAction},
+    scroll_motion::{estimate_release_velocity, push_sample, ScrollSample, FLING_MIN_TOTAL_DELTA},
     *,
 };
 
@@ -108,6 +110,68 @@ const PAN_THRESHOLD: f64 = 6.0;
 const ZOOM_PER_SCROLL_POINT: f64 = 0.011;
 const ZOOM_PER_EVENT: (f64, f64) = (0.75, 1.33);
 
+/// How quickly a let-go coast loses speed, as a continuous rate in 1/s:
+/// `v' = -PAN_FRICTION * v`. It is the whole feel of the paper's mass. The
+/// total travel left in a release is `v / PAN_FRICTION`, so at 4.2 a brisk
+/// 1500 pt/s flick carries about a third of a page and is done inside a
+/// second — heavy enough to read as an object with weight, firm enough that
+/// the paper never wanders off on its own. (iOS scroll views run 2.0 and
+/// makepad's own lists 3.0; a page of music wants a shorter throw than a
+/// list, because the reader is aiming at a system, not scanning a feed.)
+const PAN_FRICTION: f64 = 4.2;
+/// The speed (window points/second) at which the coast is simply over. What
+/// is left at this point is 26/4.2 ≈ 6 points of travel spread over a further
+/// half second — invisible, and exactly the creep that keeps an idle app
+/// awake. Below it the motion ends and the app goes quiet.
+const PAN_STOP_SPEED: f64 = 26.0;
+/// A release slower than this (window points/second) is a hand that put the
+/// paper down, not one that threw it.
+const PAN_MIN_FLING_SPEED: f64 = 90.0;
+/// Ceiling on the launch speed, so a teleporting pointer (an injected event,
+/// a tablet jump, a dropped frame) cannot fling the document end to end.
+const PAN_MAX_FLING_SPEED: f64 = 6_000.0;
+/// The edge spring: a critically damped return with this rate in 1/s, so a
+/// stretch is 95% gone in 3/20 s and fully settled in about a quarter second.
+const EDGE_SPRING: f64 = 20.0;
+/// The share of the arriving speed the edge spring keeps. Half of it reads as
+/// the paper losing energy in the stop, which is what a real object does.
+const EDGE_ENERGY: f64 = 0.5;
+/// Ceiling on the speed handed to the edge spring. The peak stretch of a
+/// critically damped spring launched from rest is `v / (EDGE_SPRING * e)`, so
+/// this caps the bounce at about 44 points however hard the flick was.
+const EDGE_MAX_SPEED: f64 = 2_400.0;
+/// Below this stretch (window points) the spring has arrived.
+const EDGE_SETTLE: f64 = 0.4;
+/// Time constant (seconds) of the zoom ease: each frame closes
+/// `1 - e^(-dt/TAU)` of the remaining distance *in log scale*, so equal
+/// wheel notches produce equal-looking steps and the motion is smooth rather
+/// than a staircase. A notch is visually done in about a fifth of a second.
+const ZOOM_EASE_TAU: f64 = 0.045;
+/// How close (in log zoom) the ease has to be before it snaps to the target
+/// and stops asking for frames. Two parts in a thousand of the scale is a
+/// small fraction of a pixel anywhere on the page — chasing it further would
+/// be thirty more frames of invisible change keeping the app awake.
+const ZOOM_EASE_EPS: f64 = 2e-3;
+/// The longest gap (seconds) that still counts as one frame's worth of time.
+///
+/// An animation that starts after the app has been idle finds a frame clock
+/// pointing at whenever the view last drew — half a second ago, a minute ago.
+/// Reading that as elapsed time makes the FIRST frame of every ease and every
+/// coast a lurch. A gap this long is not a frame interval; it is the app
+/// waking up, and the step is the nominal one instead.
+const MAX_FRAME_GAP: f64 = 0.05;
+/// The step an animation's first frame takes, before there is a real interval
+/// to measure.
+const NOMINAL_FRAME: f64 = 1.0 / 60.0;
+/// How long after the last wheel or trackpad delta a further one still counts
+/// as the SAME zoom gesture, and so keeps the anchor the gesture started on.
+///
+/// Trackpad deltas arrive at display rate, so any real gesture is far inside
+/// this; a deliberate re-aim — look somewhere else, then scroll again — is
+/// far outside it. Platforms that report scroll phases do not need the
+/// heuristic at all and use those instead.
+const ZOOM_GESTURE_GAP: f64 = 0.25;
+
 /// Where every page of the document sits relative to every other, in staff
 /// spaces, plus the one scale that maps that space to the window.
 ///
@@ -146,6 +210,134 @@ struct GrabPan {
     last: DVec2,
     /// True once the pointer has travelled far enough for this to be a pan
     /// rather than a click that happened to wobble.
+    active: bool,
+}
+
+/// What the paper does once the hand lets go of it, and how it is caught at
+/// the ends of the document.
+///
+/// The model is deliberately physical, and deliberately absent while the
+/// button is down: a held sheet of paper tracks the hand *exactly*, so the
+/// drag path applies raw pointer deltas with no filter, no easing and no
+/// lag. This state only exists between the release and the paper coming to
+/// rest.
+///
+/// The coast is viscous friction, `v' = -PAN_FRICTION * v`, integrated in
+/// closed form: a step of `dt` moves the paper `v * (1 - e^(-k dt)) / k` and
+/// leaves it at `v * e^(-k dt)`. Two steps of `dt/2` therefore land in
+/// *exactly* the same place as one step of `dt`, which is what makes the feel
+/// identical at 60 and 120 Hz instead of merely similar.
+#[derive(Clone, Copy, Debug, Default)]
+struct PanMotion {
+    /// The coast, in window points per second.
+    velocity: DVec2,
+    /// How far the paper is stretched past the end of its travel, in window
+    /// points. This is a *visual* offset only: the pan that the scrollbars,
+    /// the page indicator and the overview click-to-navigate all read stays
+    /// inside the document, so a bounce can never make them disagree about
+    /// where the reader is.
+    overscroll: DVec2,
+    /// The stretch's own velocity, in window points per second.
+    overscroll_velocity: DVec2,
+}
+
+impl PanMotion {
+    /// Whether anything is still moving. Every term is driven to exactly zero
+    /// at its threshold rather than decaying towards it, so this eventually
+    /// answers false and the app stops asking for frames.
+    fn moving(&self) -> bool {
+        self.velocity != DVec2::default()
+            || self.overscroll != DVec2::default()
+            || self.overscroll_velocity != DVec2::default()
+    }
+
+    /// A hand caught the paper. The coast stops in this frame; any stretch is
+    /// left to settle, because snapping it away under the finger would be a
+    /// visible jump at the very moment the reader took hold.
+    fn catch(&mut self) {
+        self.velocity = DVec2::default();
+        self.overscroll_velocity = DVec2::default();
+    }
+
+    /// Advance by `dt` seconds and answer with the new pan.
+    fn advance(&mut self, pan: DVec2, min: DVec2, max: DVec2, dt: f64) -> DVec2 {
+        dvec2(
+            coast_axis(
+                &mut self.velocity.x,
+                &mut self.overscroll.x,
+                &mut self.overscroll_velocity.x,
+                pan.x,
+                min.x,
+                max.x,
+                dt,
+            ),
+            coast_axis(
+                &mut self.velocity.y,
+                &mut self.overscroll.y,
+                &mut self.overscroll_velocity.y,
+                pan.y,
+                min.y,
+                max.y,
+                dt,
+            ),
+        )
+    }
+}
+
+/// The pointer a zoom gesture is anchored on, and when its last delta came.
+///
+/// The anchor is LATCHED for the whole gesture rather than followed live.
+/// Zoom about a moving point is not zoom about a point: each frame would hold
+/// a different bit of paper still, and the sum of that is the paper sliding
+/// under the hand. Scrolling fast on a trackpad moves the pointer a little
+/// whether or not the reader means it to, so following it made a fast zoom
+/// wobble. The gesture aims once, at its first delta, and holds that aim.
+#[derive(Clone, Copy, Debug)]
+struct ZoomGesture {
+    anchor: DVec2,
+    last_delta: f64,
+}
+
+/// A wheel or trackpad zoom on its way to where the notches asked for.
+///
+/// The wheel names a *target* scale; the view walks towards it over a few
+/// frames rather than cutting, and every frame of the walk is re-anchored on
+/// the same pointer position, so the document point under the pointer stays
+/// under it throughout — pointer-centred zoom composes exactly, so easing it
+/// introduces no drift.
+#[derive(Clone, Copy, Debug, Default)]
+struct ZoomEase {
+    active: bool,
+    /// The scale the notches so far add up to.
+    target: f64,
+    /// The point the gesture latched onto, in absolute window points — NOT
+    /// wherever the pointer has drifted to since. See [`ZoomGesture`].
+    anchor: DVec2,
+    /// The zoom this ease last wrote. If the live zoom is something else,
+    /// somebody with a stronger claim (a menu, a key, Fit page) moved it and
+    /// the ease stands down rather than dragging the view back.
+    written: f64,
+}
+
+impl ZoomEase {
+    fn owns(&self, zoom: f64) -> bool {
+        self.active && (zoom - self.written).abs() < 1e-9
+    }
+}
+
+/// A rubber band being pulled out in the Select tool: every note the box
+/// touches joins the selection when the button comes up.
+#[derive(Clone, Debug)]
+struct BandSelect {
+    /// Where the press landed and where the pointer is now, in window points.
+    origin: DVec2,
+    current: DVec2,
+    /// The selection the band started from, so ⇧/⌘ add to what was already
+    /// chosen instead of replacing it.
+    base: Vec<SemanticId>,
+    extend: bool,
+    /// True once the pointer has travelled far enough to be a band rather
+    /// than a click that wobbled.
     active: bool,
 }
 
@@ -227,6 +419,27 @@ pub struct ScoreCanvas {
     next_frame: NextFrame,
     #[rust]
     last_frame_time: Option<f64>,
+    /// What the paper is doing on its own: the coast after a release and the
+    /// spring at the ends of the document.
+    #[rust]
+    motion: PanMotion,
+    /// A zoom on its way to the scale the wheel asked for.
+    #[rust]
+    zoom_ease: ZoomEase,
+    /// The point the current zoom gesture is anchored on.
+    #[rust]
+    zoom_gesture: Option<ZoomGesture>,
+    /// Recent pointer positions during a grab, one axis each, so the release
+    /// velocity is measured over a window of time rather than off the last
+    /// two events — which at a 500 Hz mouse span two milliseconds and turn
+    /// pure jitter into a maximum-speed fling.
+    #[rust]
+    fling_x: Vec<ScrollSample>,
+    #[rust]
+    fling_y: Vec<ScrollSample>,
+    /// A rubber-band selection in progress.
+    #[rust]
+    band: Option<BandSelect>,
 }
 
 impl ScoreCanvas {
@@ -311,7 +524,11 @@ impl ScoreCanvas {
                 }
             }
         }
-        self.placements = placements_for(rect, &doc, state.ui.pan);
+        // The paper is drawn at the pan PLUS whatever the edge spring has
+        // stretched it by; the pan itself stays inside the document, so the
+        // scrollbars, the page indicator and the overview's click-to-navigate
+        // all keep reading the same in-bounds journey while the paper bounces.
+        self.placements = placements_for(rect, &doc, state.ui.pan + self.motion.overscroll);
         self.doc = doc;
     }
 
@@ -322,15 +539,20 @@ impl ScoreCanvas {
         state.ui.pan += delta;
     }
 
-    /// Zoom about a point, keeping the document under that point where it is —
-    /// the gesture every map and document viewer has.
-    fn zoom_about(&mut self, cx: &mut Cx, state: &mut ScoreAppState, anchor: DVec2, factor: f64) {
+    /// Put the view at `zoom`, keeping the document point under `anchor`
+    /// exactly where it is — the gesture every map and document viewer has.
+    ///
+    /// Anchored zoom composes: zooming a→b→c about one point lands where
+    /// a→c about that point does, to the last bit. That is what lets the
+    /// wheel's step be *eased* over several frames without the paper drifting
+    /// out from under the pointer.
+    fn apply_zoom(&mut self, cx: &mut Cx, state: &mut ScoreAppState, anchor: DVec2, zoom: f64) {
         let rect = self.area.rect(cx);
         if rect.size.x <= 1.0 || rect.size.y <= 1.0 {
             return;
         }
-        let zoom = (state.ui.zoom * factor).clamp(crate::state::ZOOM_MIN, crate::state::ZOOM_MAX);
-        if (zoom - state.ui.zoom).abs() < 1e-9 {
+        let zoom = zoom.clamp(crate::state::ZOOM_MIN, crate::state::ZOOM_MAX);
+        if (zoom - state.ui.zoom).abs() < 1e-12 {
             return;
         }
         let count = state.document.page_count();
@@ -338,10 +560,201 @@ impl ScoreCanvas {
         let after = doc_layout(rect, count, state.ui.page_layout, zoom);
         state.ui.pan = zoom_pan_about(anchor - rect.pos, state.ui.pan, before.scale, after.scale);
         state.ui.zoom = zoom;
+    }
+
+    /// A wheel notch, or one delta of a trackpad's two-finger scroll.
+    ///
+    /// The notch does not move the view: it moves the *target*, and the view
+    /// walks there over the next few frames. Notches compound onto whatever
+    /// the walk is already heading for, so spinning the wheel accelerates
+    /// smoothly instead of restarting from wherever the animation happened to
+    /// have reached, and a trackpad's stream of tiny deltas simply keeps
+    /// nudging the same target rather than stacking into a jump.
+    fn zoom_towards(
+        &mut self,
+        cx: &mut Cx,
+        state: &mut ScoreAppState,
+        pointer: DVec2,
+        factor: f64,
+        time: f64,
+        fresh_gesture: bool,
+    ) {
+        // The gesture aims once and holds that aim. Following the pointer
+        // instead makes every later frame hold a different piece of paper
+        // still, and the sum of that is the wobble the reader sees.
+        //
+        // Measured in the running app, zooming 2.4x -> 6x across 25 rapid
+        // deltas with the pointer wandering: the aimed-at point holds to
+        // 0.001 window points. The ONE thing that still moves it is the pan
+        // clamp — against the ends of the document, and at low zoom where a
+        // page that fits locks its axis to centred, holding the aim would
+        // mean showing empty space, so the bound wins and the paper slides.
+        // That is the bound doing its job, not the anchor failing; chasing it
+        // would mean letting a fitted page be dragged off centre.
+        let anchor = zoom_anchor(self.zoom_gesture, pointer, time, fresh_gesture);
+        self.zoom_gesture = Some(ZoomGesture {
+            anchor,
+            last_delta: time,
+        });
+        let from = if self.zoom_ease.owns(state.ui.zoom) {
+            self.zoom_ease.target
+        } else {
+            state.ui.zoom
+        };
+        let target = (from * factor).clamp(crate::state::ZOOM_MIN, crate::state::ZOOM_MAX);
+        if (target - state.ui.zoom).abs() < 1e-9 {
+            return;
+        }
+        self.zoom_ease = ZoomEase {
+            active: true,
+            target,
+            anchor,
+            written: state.ui.zoom,
+        };
         state.ui.glide.active = false;
-        state.ui.status = format!("Zoom {}%", (zoom * 100.0).round());
+        // Taking hold of the scale is taking hold of the view.
+        self.motion.catch();
+        state.ui.status = format!("Zoom {}%", (target * 100.0).round());
+        self.keep_animating(cx);
         // The zoom readout and the status line live in the shell.
         cx.redraw_all();
+    }
+
+    /// One frame of the coast the hand left behind, and of the spring that
+    /// catches it at the ends of the document.
+    fn step_motion(&mut self, cx: &mut Cx, state: &mut ScoreAppState, dt: f64) {
+        if !self.motion.moving() {
+            return;
+        }
+        // Anything that *sends* the reader somewhere outranks a coast: the
+        // hand's momentum has been overruled by a decision.
+        if state.ui.glide.active || state.ui.recentre || state.ui.fit_all {
+            self.motion = PanMotion::default();
+            return;
+        }
+        let rect = self.area.rect(cx);
+        if rect.size.x <= 1.0 || rect.size.y <= 1.0 {
+            self.motion = PanMotion::default();
+            return;
+        }
+        let doc = doc_layout(
+            rect,
+            state.document.page_count(),
+            state.ui.page_layout,
+            state.ui.zoom,
+        );
+        let (min, max) = pan_bounds(rect, &doc);
+        state.ui.pan = self.motion.advance(state.ui.pan, min, max, dt);
+    }
+
+    /// One frame of the walk towards the scale the wheel asked for.
+    fn step_zoom(&mut self, cx: &mut Cx, state: &mut ScoreAppState, dt: f64) {
+        if !self.zoom_ease.active {
+            return;
+        }
+        if !self.zoom_ease.owns(state.ui.zoom) {
+            // Somebody with a stronger claim moved the zoom — a menu, a key,
+            // Fit page. The ease stands down rather than dragging it back.
+            self.zoom_ease.active = false;
+            return;
+        }
+        let (next, arrived) = zoom_ease_step(state.ui.zoom, self.zoom_ease.target, dt);
+        if arrived {
+            self.zoom_ease.active = false;
+        }
+        let anchor = self.zoom_ease.anchor;
+        self.apply_zoom(cx, state, anchor, next);
+        self.zoom_ease.written = state.ui.zoom;
+    }
+
+    /// Let go of the paper: it keeps the hand's velocity, and friction takes
+    /// it from there.
+    fn launch_coast(&mut self, cx: &mut Cx, state: &mut ScoreAppState) {
+        let (velocity, travel) = release_velocity(&self.fling_x, &self.fling_y);
+        self.fling_x.clear();
+        self.fling_y.clear();
+        let speed = velocity.length();
+        // A hand that had already stopped before it let go means stop. So
+        // does a gesture that barely moved: that is a click that wobbled.
+        if speed < PAN_MIN_FLING_SPEED || travel.length() <= FLING_MIN_TOTAL_DELTA {
+            return;
+        }
+        let rect = self.area.rect(cx);
+        if rect.size.x <= 1.0 || rect.size.y <= 1.0 {
+            return;
+        }
+        let launch = if speed > PAN_MAX_FLING_SPEED {
+            velocity * (PAN_MAX_FLING_SPEED / speed)
+        } else {
+            velocity
+        };
+        let doc = doc_layout(
+            rect,
+            state.document.page_count(),
+            state.ui.page_layout,
+            state.ui.zoom,
+        );
+        let (min, max) = pan_bounds(rect, &doc);
+        self.motion.velocity = unpinned(launch, state.ui.pan, min, max);
+        // The coast's first step is a nominal frame, not the gap back to
+        // whenever the view last happened to animate.
+        self.last_frame_time = None;
+        if self.motion.moving() {
+            self.keep_animating(cx);
+        }
+    }
+
+    /// Which tool the pointer is actually obeying. Pianist mode is the reading
+    /// face: it navigates and never edits, whatever the editor's tool was left
+    /// set to.
+    fn tool(&self, state: &ScoreAppState) -> ScoreTool {
+        if state.ui.mode == crate::ProductMode::Pianist {
+            ScoreTool::Navigate
+        } else {
+            state.ui.tool
+        }
+    }
+
+    /// Every note the rubber band has swept up, plus whatever it started from.
+    fn band_selection(&self, state: &ScoreAppState, band: &BandSelect) -> Vec<SemanticId> {
+        let box_rect = Rect {
+            pos: dvec2(
+                band.origin.x.min(band.current.x),
+                band.origin.y.min(band.current.y),
+            ),
+            size: dvec2(
+                (band.current.x - band.origin.x).abs(),
+                (band.current.y - band.origin.y).abs(),
+            ),
+        };
+        let mut chosen: Vec<SemanticId> = if band.extend {
+            band.base.clone()
+        } else {
+            Vec::new()
+        };
+        // Document order, so a band drawn right-to-left selects the same run
+        // as one drawn left-to-right and the arrow keys walk it sensibly.
+        for semantic in state.document.all_note_semantics() {
+            let Some(element) = state.document.element(semantic) else {
+                continue;
+            };
+            let Some(placement) = self
+                .placements
+                .iter()
+                .find(|placement| placement.index == element.page)
+            else {
+                continue;
+            };
+            let bounds = placement.transform.rect(element.bounds);
+            let note = Rect {
+                pos: dvec2(bounds.min.x, bounds.min.y),
+                size: dvec2(bounds.width(), bounds.height()),
+            };
+            if intersection_area(box_rect, note) > 0.0 && !chosen.contains(&semantic) {
+                chosen.push(semantic);
+            }
+        }
+        chosen
     }
 
     /// The scrollbars are given the event before the paper is: they are drawn
@@ -366,6 +779,8 @@ impl ScoreCanvas {
         if scrolled_x.is_none() && scrolled_y.is_none() {
             return;
         }
+        // A hand on the bar is a hand on the view.
+        self.motion.catch();
         // Only a bar that actually moved is worth the layout: this runs on
         // every pointer event.
         let rect = self.area.rect(cx);
@@ -548,9 +963,14 @@ impl Widget for ScoreCanvas {
         if let Event::NextFrame(frame) = event {
             if frame.set.contains(&self.next_frame) {
                 if let Some(state) = scope.data.get_mut::<ScoreAppState>() {
-                    let dt = self
-                        .last_frame_time
-                        .map_or(1.0 / 60.0, |last| (frame.time - last).clamp(0.0, 0.1));
+                    let dt = self.last_frame_time.map_or(NOMINAL_FRAME, |last| {
+                        let elapsed = frame.time - last;
+                        if elapsed <= 0.0 || elapsed > MAX_FRAME_GAP {
+                            NOMINAL_FRAME
+                        } else {
+                            elapsed
+                        }
+                    });
                     self.last_frame_time = Some(frame.time);
                     if state.ui.glide.active {
                         state.ui.glide.progress += dt / crate::state::PAGE_GLIDE_S;
@@ -559,8 +979,18 @@ impl Widget for ScoreCanvas {
                             state.ui.glide.active = false;
                         }
                     }
+                    self.step_motion(cx, state, dt);
+                    self.step_zoom(cx, state, dt);
                     state.sync_follow_page();
-                    if state.practice.playing || state.ui.glide.active {
+                    // Only while something is actually moving. Every term
+                    // above is driven to exactly zero at its threshold rather
+                    // than decaying towards one, so this eventually stops
+                    // asking and the app goes quiet.
+                    if state.practice.playing
+                        || state.ui.glide.active
+                        || self.motion.moving()
+                        || self.zoom_ease.active
+                    {
                         self.keep_animating(cx);
                     }
                 }
@@ -591,11 +1021,20 @@ impl Widget for ScoreCanvas {
                     }
                 });
                 state.audition_semantic(semantic);
-                // Empty paper is grabbable everywhere, and says so.
-                cx.set_cursor(match (semantic.is_some(), self.doc.scale < THUMBNAIL_SCALE) {
-                    (_, true) => MouseCursor::Hand,
-                    (true, false) => MouseCursor::Hand,
-                    (false, false) => MouseCursor::Grab,
+                // The cursor is the tool's promise. Zoomed out to thumbnails
+                // a click always means "take me there", whatever the tool.
+                cx.set_cursor(if self.doc.scale < THUMBNAIL_SCALE {
+                    MouseCursor::Hand
+                } else {
+                    match (self.tool(state), semantic.is_some()) {
+                        // Navigate takes hold of the paper anywhere, notes
+                        // included: that is the whole point of the mode.
+                        (ScoreTool::Navigate, _) => MouseCursor::Grab,
+                        (ScoreTool::Select, true) => MouseCursor::Arrow,
+                        (ScoreTool::Edit, true) => MouseCursor::Crosshair,
+                        // Empty paper still pans under every tool.
+                        (_, false) => MouseCursor::Grab,
+                    }
                 });
                 self.area.redraw(cx);
             }
@@ -620,34 +1059,94 @@ impl Widget for ScoreCanvas {
                     });
                     return;
                 }
+                // A press catches the paper: whatever it was coasting at stops
+                // in this frame, and the grab below takes hold of it exactly
+                // where it now is. Momentum that carried on under the finger
+                // would read as the app arguing with the hand.
+                self.motion.catch();
+                self.fling_x.clear();
+                self.fling_y.clear();
+                push_sample(&mut self.fling_x, down.abs.x, down.time);
+                push_sample(&mut self.fling_y, down.abs.y, down.time);
+                self.area.redraw(cx);
                 self.dragging = true;
                 self.last_drag_abs = Some(down.abs);
-                if state.ui.annotation_tool == AnnotationTool::Ink {
+
+                // The routing, in one place and in priority order. What a drag
+                // MEANS is now a decision the reader made with the toolbar,
+                // not an accident of what happened to be under the pointer:
+                // the default tool moves the paper and can never move music.
+                let tool = self.tool(state);
+                let middle = down
+                    .mouse_button()
+                    .is_some_and(|button| button.contains(MouseButton::MIDDLE));
+                let grab_paper = |canvas: &mut Self| {
+                    canvas.grab = Some(GrabPan {
+                        origin: down.abs,
+                        last: down.abs,
+                        active: false,
+                    });
+                };
+                if middle {
+                    // The escape hatch that works over anything, in any tool.
+                    grab_paper(self);
+                } else if state.ui.annotation_tool == AnnotationTool::Ink {
                     self.ink_target = semantic;
                     self.ink_points.clear();
                     if let Some((_page, point)) = self.page_point_at(down.abs) {
                         self.ink_points.push(point);
                     }
-                } else if let Some(session) =
-                    self.begin_note_drag(state, semantic, down.abs, down.modifiers.alt)
-                {
-                    state.handle_canvas_tap(session.drag.semantic, false);
-                    self.note_drag = Some(session);
-                    self.area.redraw(cx);
-                } else if down.modifiers.alt && semantic.is_some() {
+                } else if down.modifiers.alt && semantic.is_some() && tool != ScoreTool::Navigate {
+                    // Alt-scrub auditions the music under the pointer. It is
+                    // an editing gesture, so Navigate does not answer to it.
                     if let Some(id) = semantic {
                         state.scrub_semantic(id, 1.0);
                     }
                 } else if semantic.is_none() || self.doc.scale < THUMBNAIL_SCALE {
-                    // Nothing under the pointer — or nothing legible to aim at
-                    // — so the press takes hold of the paper itself. It only
-                    // becomes a pan once it has actually travelled; a press
-                    // that does not move is still a click.
-                    self.grab = Some(GrabPan {
-                        origin: down.abs,
-                        last: down.abs,
-                        active: false,
-                    });
+                    // Empty paper — or nothing legible to aim at — takes hold
+                    // of the paper under every tool. Being unable to move the
+                    // page because a tool is armed is worse than any accident
+                    // the tool prevents.
+                    grab_paper(self);
+                } else {
+                    match tool {
+                        // Over a note, the whole point of the mode.
+                        ScoreTool::Navigate => grab_paper(self),
+                        ScoreTool::Select => {
+                            // The press selects immediately, so the reader can
+                            // see what they took hold of; the band, if one
+                            // opens, grows from there. ⇧ and ⌘ add to what was
+                            // already chosen instead of replacing it.
+                            let extend = down.modifiers.shift || down.modifiers.is_primary();
+                            let base = if extend {
+                                state.ui.selection.ordered.clone()
+                            } else {
+                                Vec::new()
+                            };
+                            if let Some(id) = semantic {
+                                state.handle_canvas_tap(id, extend);
+                            }
+                            self.band = Some(BandSelect {
+                                origin: down.abs,
+                                current: down.abs,
+                                base,
+                                extend,
+                                active: false,
+                            });
+                            self.area.redraw(cx);
+                        }
+                        ScoreTool::Edit => {
+                            if let Some(session) =
+                                self.begin_note_drag(state, semantic, down.abs, down.modifiers.alt)
+                            {
+                                state.handle_canvas_tap(session.drag.semantic, false);
+                                self.note_drag = Some(session);
+                                self.area.redraw(cx);
+                            } else {
+                                grab_paper(self);
+                            }
+                        }
+                    }
                 }
             }
             Hit::FingerMove(moved) if self.note_drag.is_some() => {
@@ -656,10 +1155,30 @@ impl Widget for ScoreCanvas {
                 cx.set_cursor(MouseCursor::Grabbing);
                 self.area.redraw(cx);
             }
+            Hit::FingerMove(moved) if self.band.is_some() => {
+                let Some(mut band) = self.band.take() else {
+                    return;
+                };
+                if !band.active && (moved.abs - band.origin).length() >= PAN_THRESHOLD {
+                    band.active = true;
+                }
+                band.current = moved.abs;
+                if band.active {
+                    let chosen = self.band_selection(state, &band);
+                    state.set_band_selection(&chosen);
+                    cx.set_cursor(MouseCursor::Crosshair);
+                    self.area.redraw(cx);
+                }
+                self.band = Some(band);
+            }
             Hit::FingerMove(moved) if self.grab.is_some() => {
                 let Some(mut grab) = self.grab.take() else {
                     return;
                 };
+                // Sampled whether or not the press has become a pan yet: the
+                // travel that crossed the threshold is part of the flick.
+                push_sample(&mut self.fling_x, moved.abs.x, moved.time);
+                push_sample(&mut self.fling_y, moved.abs.y, moved.time);
                 if !grab.active && (moved.abs - grab.origin).length() >= PAN_THRESHOLD {
                     grab.active = true;
                 }
@@ -708,12 +1227,29 @@ impl Widget for ScoreCanvas {
                     self.keep_animating(cx);
                     return;
                 }
+                // A rubber band that actually opened is finished; the notes it
+                // swept are already selected, so the up only reports.
+                // A gesture that started on a note under the Select tool is
+                // that gesture from beginning to end: the press already chose
+                // the note, so the up only reports what is now selected.
+                if self.band.take().is_some() {
+                    self.dragging = false;
+                    self.last_drag_abs = None;
+                    cx.set_cursor(MouseCursor::Arrow);
+                    state.ui.status = state.selection_description();
+                    self.keep_animating(cx);
+                    cx.redraw_all();
+                    return;
+                }
                 // A gesture that panned is finished; it was never a click.
                 let panned = self.grab.take().is_some_and(|grab| grab.active);
                 if panned {
                     self.dragging = false;
                     self.last_drag_abs = None;
                     cx.set_cursor(MouseCursor::Grab);
+                    push_sample(&mut self.fling_x, up.abs.x, up.time);
+                    push_sample(&mut self.fling_y, up.abs.y, up.time);
+                    self.launch_coast(cx, state);
                     state.ui.status = format!(
                         "Page {} of {}",
                         state.ui.current_page + 1,
@@ -754,7 +1290,10 @@ impl Widget for ScoreCanvas {
                             .document
                             .element(id)
                             .filter(|element| {
-                                state.ui.mode == crate::ProductMode::Editor
+                                // Writing a note by clicking a bar is direct
+                                // manipulation: it belongs to the Edit tool,
+                                // and to nothing the reader has not armed.
+                                self.tool(state) == ScoreTool::Edit
                                     && state.ui.annotation_tool == AnnotationTool::None
                                     && element.kind == SemanticKind::Measure
                             })
@@ -800,7 +1339,21 @@ impl Widget for ScoreCanvas {
                 let factor = (-scroll.scroll.y * ZOOM_PER_SCROLL_POINT)
                     .exp()
                     .clamp(ZOOM_PER_EVENT.0, ZOOM_PER_EVENT.1);
-                self.zoom_about(cx, state, scroll.abs, factor);
+                // A platform that reports scroll phases says exactly where a
+                // gesture starts and ends, so the anchor latch follows those
+                // rather than guessing from timing. A plain wheel reports no
+                // phase at all and falls back to the gap.
+                let fresh = matches!(
+                    scroll.phase,
+                    ScrollPhase::Began | ScrollPhase::Touched
+                );
+                if matches!(
+                    scroll.phase,
+                    ScrollPhase::Ended | ScrollPhase::MomentumEnded
+                ) {
+                    self.zoom_gesture = None;
+                }
+                self.zoom_towards(cx, state, scroll.abs, factor, scroll.time, fresh);
             }
             Hit::KeyDown(key) => {
                 if let Some(action) = crate::state::key_action(&key, state) {
@@ -903,13 +1456,14 @@ impl Widget for ScoreCanvas {
         self.draw_annotation_details(cx, state, &annotations);
         self.draw_entry_affordances(cx, state);
         self.draw_note_drag(cx);
+        self.draw_band(cx);
         let pan = state.ui.pan;
         let playing = state.practice.playing;
         let gliding = state.ui.glide.active;
         self.draw_scroll_bars(cx, rect, pan);
 
         cx.end_turtle_with_area(&mut self.area);
-        if playing || gliding {
+        if playing || gliding || self.motion.moving() || self.zoom_ease.active {
             self.next_frame = cx.new_next_frame();
         }
         DrawStep::done()
@@ -1029,6 +1583,30 @@ impl ScoreCanvas {
         self.draw_vector
             .ellipse(to.x as f32, to.y as f32, radius_x, radius_y);
         self.draw_vector.fill();
+        self.draw_vector.end(cx);
+        self.draw_vector.draw_depth = depth;
+    }
+
+    /// The rubber band itself: a soft wash with a crisp edge, drawn above the
+    /// engraving it is sweeping so it reads over noteheads rather than under
+    /// them.
+    fn draw_band(&mut self, cx: &mut Cx2d) {
+        let Some(band) = self.band.as_ref().filter(|band| band.active) else {
+            return;
+        };
+        let x = band.origin.x.min(band.current.x) as f32;
+        let y = band.origin.y.min(band.current.y) as f32;
+        let w = (band.current.x - band.origin.x).abs() as f32;
+        let h = (band.current.y - band.origin.y).abs() as f32;
+        let depth = self.draw_vector.draw_depth;
+        self.draw_vector.draw_depth = depth + 6.0;
+        self.draw_vector.begin();
+        self.draw_vector.set_color(0.18, 0.50, 0.86, 0.12);
+        self.draw_vector.rect(x, y, w, h);
+        self.draw_vector.fill();
+        self.draw_vector.set_color(0.18, 0.50, 0.86, 0.85);
+        self.draw_vector.rect(x, y, w, h);
+        self.draw_vector.stroke(1.0);
         self.draw_vector.end(cx);
         self.draw_vector.draw_depth = depth;
     }
@@ -1249,6 +1827,43 @@ fn centre_pan(rect: Rect, doc: &DocLayout, page: usize) -> DVec2 {
     clamp_pan(pan, rect, doc)
 }
 
+/// The point a zoom notch anchors on.
+///
+/// While a gesture is still running it keeps the point it first aimed at; a
+/// notch that starts a new gesture — a reported phase change, or a long
+/// enough silence — aims at wherever the pointer is now. This is the whole
+/// fix for zoom wobble: an anchor that follows the pointer holds a different
+/// piece of paper still on every frame, and the sum of that is a slide.
+fn zoom_anchor(
+    gesture: Option<ZoomGesture>,
+    pointer: DVec2,
+    time: f64,
+    fresh_gesture: bool,
+) -> DVec2 {
+    match gesture {
+        Some(gesture)
+            if !fresh_gesture && (time - gesture.last_delta) < ZOOM_GESTURE_GAP =>
+        {
+            gesture.anchor
+        }
+        _ => pointer,
+    }
+}
+
+/// One frame of the walk toward a target scale, eased in log space so equal
+/// notches are equal-looking steps. Returns the next zoom and whether it has
+/// arrived (at which point it IS the target exactly, not merely near it).
+fn zoom_ease_step(current: f64, target: f64, dt: f64) -> (f64, bool) {
+    let current_ln = current.max(1e-9).ln();
+    let target_ln = target.max(1e-9).ln();
+    let next = current_ln + (target_ln - current_ln) * (1.0 - (-dt / ZOOM_EASE_TAU).exp());
+    if (target_ln - next).abs() < ZOOM_EASE_EPS {
+        (target, true)
+    } else {
+        (next.exp(), false)
+    }
+}
+
 /// Keep the document point under the pointer under the pointer.
 ///
 /// `anchor` is canvas-local; `from`/`to` are the scales either side of the
@@ -1260,6 +1875,104 @@ fn zoom_pan_about(anchor: DVec2, pan: DVec2, from: f64, to: f64) -> DVec2 {
     }
     let document_point = (anchor - pan) / from;
     anchor - document_point * to
+}
+
+/// One axis of the coast, plus the spring that catches it at the ends of the
+/// document. Returns the axis's new pan.
+///
+/// Both integrations are closed-form rather than per-frame approximations,
+/// which is the whole trick behind frame-rate independence: the friction step
+/// `v * (1 - e^(-k dt)) / k` and the critically damped spring step both
+/// compose exactly, so N steps of `dt/N` and one step of `dt` land in the same
+/// place to the last bit. Nothing here is tuned against a 60 Hz assumption.
+fn coast_axis(
+    velocity: &mut f64,
+    stretch: &mut f64,
+    stretch_velocity: &mut f64,
+    pan: f64,
+    min: f64,
+    max: f64,
+    dt: f64,
+) -> f64 {
+    let mut pan = pan;
+    if max - min <= 1e-9 {
+        // Nowhere to go on this axis: no coast, and nothing to bounce off.
+        // Flinging a locked axis into the void is not a feature.
+        *velocity = 0.0;
+        *stretch = 0.0;
+        *stretch_velocity = 0.0;
+        return pan.clamp(min, max);
+    }
+    if *velocity != 0.0 {
+        let decay = (-PAN_FRICTION * dt).exp();
+        let travel = *velocity * (1.0 - decay) / PAN_FRICTION;
+        *velocity *= decay;
+        let landed = (pan + travel).clamp(min, max);
+        if (pan + travel - landed).abs() > 1e-9 {
+            // The coast reached the end of the document. Its remaining speed
+            // is not thrown away: it goes into the edge spring, so the paper
+            // decelerates into the stop and eases back instead of hitting a
+            // wall at full tilt.
+            *stretch_velocity +=
+                (*velocity * EDGE_ENERGY).clamp(-EDGE_MAX_SPEED, EDGE_MAX_SPEED);
+            *velocity = 0.0;
+        }
+        pan = landed;
+        if velocity.abs() <= PAN_STOP_SPEED {
+            // Driven to exactly zero, not merely towards it: a coast that
+            // creeps forever is an app that never idles.
+            *velocity = 0.0;
+        }
+    }
+    if *stretch != 0.0 || *stretch_velocity != 0.0 {
+        let decay = (-EDGE_SPRING * dt).exp();
+        let slope = *stretch_velocity + EDGE_SPRING * *stretch;
+        let next = (*stretch + slope * dt) * decay;
+        let next_velocity = (*stretch_velocity - EDGE_SPRING * slope * dt) * decay;
+        *stretch = next;
+        *stretch_velocity = next_velocity;
+        if stretch.abs() < EDGE_SETTLE && stretch_velocity.abs() < EDGE_SETTLE * EDGE_SPRING {
+            *stretch = 0.0;
+            *stretch_velocity = 0.0;
+        }
+    }
+    pan
+}
+
+/// The velocity the hand had when it let go, in window points per second, and
+/// how far the retained samples travelled in total.
+///
+/// Both come from [`estimate_release_velocity`], which measures over a window
+/// of *time* rather than over the last two events: a 500 Hz mouse delivers two
+/// samples two milliseconds apart, and dividing pointer jitter by that turns a
+/// careful drag into a maximum-speed fling.
+fn release_velocity(x: &[ScrollSample], y: &[ScrollSample]) -> (DVec2, DVec2) {
+    let (velocity_x, travel_x) = estimate_release_velocity(x);
+    let (velocity_y, travel_y) = estimate_release_velocity(y);
+    (
+        dvec2(velocity_x, velocity_y),
+        dvec2(travel_x, travel_y),
+    )
+}
+
+/// Drop the speed on any axis that is already pinned against the end of the
+/// document in the direction it points.
+///
+/// The hand goes on moving after the paper has stopped, so the pointer's
+/// velocity at release says nothing about what the paper was doing. A bounce
+/// it never earned reads as the document shoving back.
+fn unpinned(velocity: DVec2, pan: DVec2, min: DVec2, max: DVec2) -> DVec2 {
+    let axis = |v: f64, at: f64, low: f64, high: f64| {
+        if (v > 0.0 && at >= high - 1e-6) || (v < 0.0 && at <= low + 1e-6) {
+            0.0
+        } else {
+            v
+        }
+    };
+    dvec2(
+        axis(velocity.x, pan.x, min.x, max.x),
+        axis(velocity.y, pan.y, min.y, max.y),
+    )
 }
 
 /// The page the reader is looking at: the one showing the most of itself.
@@ -1537,6 +2250,395 @@ mod tests {
         let single_total = scroll_total(rect, &single);
         assert!((single_total.x - rect.size.x).abs() < 1e-6);
         assert!((single_total.y - rect.size.y).abs() < 1e-6);
+    }
+
+    fn samples(points: &[(f64, f64)]) -> Vec<ScrollSample> {
+        points
+            .iter()
+            .map(|(time, abs)| ScrollSample {
+                abs: *abs,
+                time: *time,
+            })
+            .collect()
+    }
+
+    /// The release velocity is measured over a window of time, not off the
+    /// last two events.
+    ///
+    /// This is the difference between a usable flick and a lottery. A mouse
+    /// reporting at 500 Hz puts its last two samples two milliseconds apart,
+    /// so one pixel of jitter there reads as 500 pt/s; over the 40 ms window
+    /// the same jitter is 25 pt/s and the estimate stays on the real speed.
+    #[test]
+    fn the_release_velocity_is_windowed_not_the_last_two_events() {
+        // A steady 1000 pt/s drag sampled every 2 ms, with one jittery last
+        // sample two points off the line.
+        let mut points: Vec<(f64, f64)> = (0..=40).map(|i| (i as f64 * 0.002, i as f64 * 2.0)).collect();
+        let truth = 1000.0;
+        let last = points.last_mut().unwrap();
+        last.1 += 2.0;
+        let taken = samples(&points);
+        let (velocity, travel) = release_velocity(&taken, &[]);
+        // The last two events alone would read 2000 pt/s — twice the truth.
+        let naive = (points[40].1 - points[39].1) / (points[40].0 - points[39].0);
+        assert!(naive > 1.8 * truth, "the last two events are noisy: {naive}");
+        assert!(
+            (velocity.x - truth).abs() < 0.15 * truth,
+            "windowed estimate {} should stay near {truth}",
+            velocity.x
+        );
+        assert!((travel.x - 82.0).abs() < 1e-9);
+        // No samples at all is no velocity, not a division by zero.
+        assert_eq!(release_velocity(&[], &[]).0, DVec2::default());
+    }
+
+    /// An axis pinned against the end of the document keeps no momentum: the
+    /// paper stopped there while the hand went on moving, and a bounce it
+    /// never earned would read as the document shoving back.
+    #[test]
+    fn a_pinned_axis_keeps_no_momentum() {
+        let min = dvec2(-500.0, -200.0);
+        let max = dvec2(100.0, 50.0);
+        let at_end = dvec2(100.0, 0.0);
+        // Pushing further into the end it is already against: dropped.
+        assert_eq!(unpinned(dvec2(900.0, 0.0), at_end, min, max).x, 0.0);
+        // Pushing away from it: kept.
+        assert_eq!(unpinned(dvec2(-900.0, 0.0), at_end, min, max).x, -900.0);
+        // The other axis is judged on its own.
+        assert_eq!(unpinned(dvec2(900.0, 400.0), at_end, min, max).y, 400.0);
+        // Mid-document, nothing is pinned.
+        let middle = dvec2(-200.0, 0.0);
+        assert_eq!(unpinned(dvec2(900.0, -400.0), middle, min, max), dvec2(900.0, -400.0));
+    }
+
+    fn coast(velocity: DVec2, steps: usize, dt: f64) -> (DVec2, PanMotion) {
+        let mut motion = PanMotion {
+            velocity,
+            ..PanMotion::default()
+        };
+        let min = dvec2(-1.0e6, -1.0e6);
+        let max = dvec2(1.0e6, 1.0e6);
+        let mut pan = DVec2::default();
+        for _ in 0..steps {
+            pan = motion.advance(pan, min, max, dt);
+        }
+        (pan, motion)
+    }
+
+    /// The coast is driven by elapsed time, not by frames.
+    ///
+    /// The friction is integrated in closed form, so half a second of coasting
+    /// covers the same ground whether it arrives as 30 frames, 60, 120 or one
+    /// — which is what makes the feel identical on a 60 Hz panel and a 120 Hz
+    /// one instead of merely similar. A per-frame decay constant would put
+    /// these three numbers wildly apart.
+    #[test]
+    fn the_coast_is_time_based_not_frame_based() {
+        let launch = dvec2(1400.0, -600.0);
+        let (at_60, after_60) = coast(launch, 30, 1.0 / 60.0);
+        let (at_120, after_120) = coast(launch, 60, 1.0 / 120.0);
+        let (at_240, _) = coast(launch, 120, 1.0 / 240.0);
+        let (in_one, _) = coast(launch, 1, 0.5);
+        for other in [at_120, at_240, in_one] {
+            assert!(
+                (at_60.x - other.x).abs() < 1e-9 && (at_60.y - other.y).abs() < 1e-9,
+                "half a second is half a second: {at_60:?} vs {other:?}"
+            );
+        }
+        // And the velocity left is the analytic one.
+        let expected = (-PAN_FRICTION * 0.5).exp();
+        assert!((after_60.velocity.x - launch.x * expected).abs() < 1e-9);
+        assert!((after_120.velocity.y - launch.y * expected).abs() < 1e-9);
+        // A coast can never carry further than v/k, whatever the frame rate.
+        assert!(at_60.x < launch.x / PAN_FRICTION);
+    }
+
+    /// The coast ends: it reaches a stop, hands back exactly zero velocity,
+    /// and stops asking for frames. A view that creeps forever is an app that
+    /// never idles.
+    #[test]
+    fn the_coast_stops_cleanly_and_the_view_goes_quiet() {
+        let (_, motion) = coast(dvec2(2200.0, 0.0), 240, 1.0 / 60.0);
+        assert_eq!(motion.velocity, DVec2::default());
+        assert!(!motion.moving(), "four seconds later, nothing is moving");
+        // And it got there in about a second, not in ten.
+        let mut quick = PanMotion {
+            velocity: dvec2(2200.0, 0.0),
+            ..PanMotion::default()
+        };
+        let mut pan = DVec2::default();
+        let mut frames = 0;
+        while quick.moving() && frames < 600 {
+            pan = quick.advance(pan, dvec2(-1.0e6, -1.0e6), dvec2(1.0e6, 1.0e6), 1.0 / 60.0);
+            frames += 1;
+        }
+        let seconds = frames as f64 / 60.0;
+        assert!(
+            (0.5..1.6).contains(&seconds),
+            "a hard flick should settle in about a second, took {seconds}"
+        );
+    }
+
+    /// Reaching the end of the document at speed decelerates into it and
+    /// springs back, rather than stopping dead against a wall. The pan itself
+    /// never leaves the document — only the drawn offset does — so the
+    /// scrollbars and the page indicator cannot be dragged out of step by a
+    /// bounce.
+    #[test]
+    fn the_ends_of_the_document_catch_the_coast_instead_of_walling_it() {
+        let min = dvec2(-300.0, 0.0);
+        let max = dvec2(0.0, 0.0);
+        let mut motion = PanMotion {
+            velocity: dvec2(2000.0, 0.0),
+            ..PanMotion::default()
+        };
+        let mut pan = dvec2(-40.0, 0.0);
+        let mut peak: f64 = 0.0;
+        let mut frames = 0;
+        while motion.moving() && frames < 600 {
+            pan = motion.advance(pan, min, max, 1.0 / 60.0);
+            assert!(pan.x <= max.x + 1e-9 && pan.x >= min.x - 1e-9, "the pan stays in the document");
+            peak = peak.max(motion.overscroll.x.abs());
+            frames += 1;
+        }
+        assert!(peak > 1.0, "the paper gives at the end rather than stopping dead");
+        assert!(peak < 90.0, "the give is a bounce, not a hole: {peak}");
+        assert_eq!(motion.overscroll, DVec2::default(), "and it settles back exactly");
+        assert!(!motion.moving());
+        // A locked axis (a page that fits) neither coasts nor bounces.
+        let mut locked = PanMotion {
+            velocity: dvec2(0.0, 3000.0),
+            ..PanMotion::default()
+        };
+        let settled = locked.advance(dvec2(0.0, 12.0), dvec2(0.0, 12.0), dvec2(0.0, 12.0), 1.0 / 60.0);
+        assert_eq!(settled.y, 12.0);
+        assert!(!locked.moving());
+    }
+
+    /// A press catches the paper in the frame it lands: the coast is over, and
+    /// the grab starts from wherever the paper had got to.
+    #[test]
+    fn a_press_stops_the_coast_in_one_frame() {
+        let mut motion = PanMotion {
+            velocity: dvec2(1800.0, 0.0),
+            ..PanMotion::default()
+        };
+        let min = dvec2(-1.0e6, -1.0e6);
+        let max = dvec2(1.0e6, 1.0e6);
+        let caught_at = motion.advance(DVec2::default(), min, max, 1.0 / 60.0);
+        assert!(caught_at.x > 0.0);
+        motion.catch();
+        assert!(!motion.moving(), "nothing is left to animate");
+        assert_eq!(motion.advance(caught_at, min, max, 1.0 / 60.0), caught_at);
+    }
+
+    /// Easing the wheel's step over several frames must not let the document
+    /// drift out from under the pointer: anchored zoom composes exactly, so a
+    /// walk of many small steps lands where one big step would.
+    #[test]
+    fn an_eased_zoom_lands_exactly_where_the_notch_asked() {
+        let anchor = dvec2(412.0, 291.0);
+        let pan = dvec2(-260.0, -85.0);
+        let (from, to) = (2.0, 2.0 * 1.33);
+        let direct = zoom_pan_about(anchor, pan, from, to);
+        // The same journey as an eased walk in log scale.
+        let mut scale = from;
+        let mut walked = pan;
+        for _ in 0..120 {
+            let next = (scale.ln() + (to.ln() - scale.ln()) * 0.25).exp();
+            walked = zoom_pan_about(anchor, walked, scale, next);
+            scale = next;
+        }
+        assert!((scale - to).abs() < 1e-9, "the walk arrives at the target");
+        assert!((walked.x - direct.x).abs() < 1e-6, "{walked:?} vs {direct:?}");
+        assert!((walked.y - direct.y).abs() < 1e-6);
+    }
+
+    /// The whole zoom pipeline, driven exactly as the canvas drives it: a
+    /// stream of wheel/trackpad deltas interleaved with animation frames.
+    ///
+    /// `follow_pointer` reproduces the OLD behaviour — re-anchoring on the
+    /// live pointer at every delta — so the test can show what that costs.
+    struct ZoomRig {
+        /// Window points per staff space at zoom 1, as `doc_layout` computes.
+        base: f64,
+        zoom: f64,
+        pan: DVec2,
+        gesture: Option<ZoomGesture>,
+        ease_active: bool,
+        ease_target: f64,
+        ease_anchor: DVec2,
+        follow_pointer: bool,
+        /// The worst drift seen at any point, mid-ease included.
+        worst: f64,
+    }
+
+    impl ZoomRig {
+        fn new(follow_pointer: bool) -> Self {
+            Self {
+                base: 3.2,
+                zoom: 1.0,
+                pan: dvec2(-140.0, -90.0),
+                gesture: None,
+                ease_active: false,
+                ease_target: 1.0,
+                ease_anchor: DVec2::default(),
+                follow_pointer: follow_pointer,
+                worst: 0.0,
+            }
+        }
+        /// The document point currently under a screen point, in staff spaces.
+        fn under(&self, screen: DVec2) -> DVec2 {
+            (screen - self.pan) / (self.base * self.zoom)
+        }
+        fn notch(&mut self, pointer: DVec2, time: f64, factor: f64) {
+            let anchor = if self.follow_pointer {
+                pointer
+            } else {
+                zoom_anchor(self.gesture, pointer, time, false)
+            };
+            self.gesture = Some(ZoomGesture {
+                anchor,
+                last_delta: time,
+            });
+            let from = if self.ease_active { self.ease_target } else { self.zoom };
+            self.ease_target =
+                (from * factor).clamp(crate::state::ZOOM_MIN, crate::state::ZOOM_MAX);
+            self.ease_active = true;
+            self.ease_anchor = anchor;
+        }
+        fn frame(&mut self, dt: f64) {
+            if !self.ease_active {
+                return;
+            }
+            let (next, arrived) = zoom_ease_step(self.zoom, self.ease_target, dt);
+            if arrived {
+                self.ease_active = false;
+            }
+            let before = self.base * self.zoom;
+            let after = self.base * next;
+            self.pan = zoom_pan_about(self.ease_anchor, self.pan, before, after);
+            self.zoom = next;
+        }
+    }
+
+    /// The invariant a pointer-centred zoom exists to keep: whatever the
+    /// reader aimed at stays where they aimed, for the whole gesture and at
+    /// every frame inside it — not merely once the animation has settled.
+    ///
+    /// Reproduces the reported wobble: many rapid deltas with the pointer
+    /// drifting a little, which is what a hand on a trackpad actually does.
+    /// A clean burst at a fixed point passes either way, which is why the
+    /// earlier tests missed this.
+    #[test]
+    fn a_fast_zoom_holds_the_point_it_was_aimed_at() {
+        let start = dvec2(420.0, 300.0);
+        let mut latched = ZoomRig::new(false);
+        let mut following = ZoomRig::new(true);
+        // Where the reader was pointing when the gesture began, and the bit
+        // of music that was under it. That is what must not move.
+        let aimed_screen = start;
+        let aimed_at = latched.under(aimed_screen);
+        assert_eq!(aimed_at, following.under(aimed_screen));
+
+        // 40 deltas over ~0.33 s, the pointer wandering up to ~12 points as a
+        // hand does mid-scroll, with a couple of animation frames between.
+        let mut time = 0.0;
+        for step in 0..40 {
+            let drift = dvec2(
+                (step as f64 * 0.7).sin() * 12.0,
+                (step as f64 * 0.4).cos() * 9.0,
+            );
+            // The gesture starts exactly under the reader's aim and wanders
+            // from there, which is what a hand on a trackpad does.
+            let pointer = if step == 0 { aimed_screen } else { aimed_screen + drift };
+            time += 1.0 / 120.0;
+            for rig in [&mut latched, &mut following] {
+                rig.notch(pointer, time, 1.06);
+                for _ in 0..2 {
+                    rig.frame(1.0 / 240.0);
+                    // The aim must hold DURING the ease, not just after it.
+                    let held = (rig.under(aimed_screen) - aimed_at).length();
+                    rig.worst = rig.worst.max(held);
+                }
+            }
+        }
+        // And let both settle.
+        for _ in 0..200 {
+            for rig in [&mut latched, &mut following] {
+                rig.frame(1.0 / 120.0);
+                rig.worst = rig.worst.max((rig.under(aimed_screen) - aimed_at).length());
+            }
+        }
+
+        // Latched: the point aimed at never moves, at any frame.
+        assert!(
+            latched.worst < 1.0e-9,
+            "the aimed-at point drifted {:.6} staff spaces while zooming",
+            latched.worst
+        );
+        // The scale still arrives exactly where the notches asked.
+        let expected = (1.06f64).powi(40).min(crate::state::ZOOM_MAX);
+        assert!(
+            (latched.zoom - expected).abs() < 1e-9,
+            "{} vs {expected}",
+            latched.zoom
+        );
+        // Following the live pointer is the bug, and it slides the paper by a
+        // plainly visible amount. Without this the test could pass for the
+        // wrong reason — a drift too small to have been worth fixing.
+        let on_screen = following.worst * following.base * following.zoom;
+        assert!(
+            following.worst > 0.1 && on_screen > 4.0,
+            "the follow-the-pointer rig should visibly slide, drifted {:.4} staff spaces \
+             ({on_screen:.1} points on screen)",
+            following.worst
+        );
+    }
+
+    /// A gesture holds its aim; a deliberate re-aim after a pause takes the
+    /// new one. Phase-reporting platforms say so explicitly.
+    #[test]
+    fn a_zoom_gesture_latches_its_aim_and_a_new_one_takes_a_new_aim() {
+        let first = dvec2(100.0, 100.0);
+        let moved = dvec2(400.0, 260.0);
+        let gesture = Some(ZoomGesture {
+            anchor: first,
+            last_delta: 10.0,
+        });
+        // Mid-gesture, the pointer drifting: the aim is kept.
+        assert_eq!(zoom_anchor(gesture, moved, 10.05, false), first);
+        // A long enough silence is a new gesture: the new aim is taken.
+        assert_eq!(
+            zoom_anchor(gesture, moved, 10.0 + ZOOM_GESTURE_GAP + 0.01, false),
+            moved
+        );
+        // A platform that reports a phase change says so outright.
+        assert_eq!(zoom_anchor(gesture, moved, 10.05, true), moved);
+        // With nothing latched yet, the pointer is the aim.
+        assert_eq!(zoom_anchor(None, moved, 0.0, false), moved);
+    }
+
+    /// The ease arrives exactly on the target rather than merely near it, so
+    /// a sequence of notches cannot accumulate scale error.
+    #[test]
+    fn the_zoom_ease_lands_exactly_and_stops() {
+        let (mut zoom, target) = (1.0, 2.5);
+        let mut frames = 0;
+        loop {
+            let (next, arrived) = zoom_ease_step(zoom, target, 1.0 / 120.0);
+            zoom = next;
+            frames += 1;
+            if arrived {
+                break;
+            }
+            assert!(frames < 200, "the ease must terminate");
+        }
+        assert_eq!(zoom, target, "it lands ON the target");
+        assert!(frames > 5 && frames < 60, "a notch settles in about a fifth of a second: {frames}");
+        // Zooming out lands exactly too.
+        let (out, arrived) = zoom_ease_step(1.0, 1.0, 1.0 / 120.0);
+        assert!(arrived && out == 1.0, "already there is already arrived");
     }
 
     /// An empty document must not place, clamp or divide by anything.

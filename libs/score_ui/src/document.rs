@@ -624,6 +624,118 @@ impl ScoreDocument {
         self.finish_measure_edit(element.measure)
     }
 
+    /// Move every selected note by `semitones`, as **one** journal
+    /// transaction — one gesture, one undo step, however many notes it
+    /// touched. A selection that would leave the keyboard is refused whole
+    /// rather than transposed in part, so undo never has to unpick a partial
+    /// edit.
+    pub fn transpose(
+        &mut self,
+        selection: &[SemanticId],
+        semitones: i32,
+    ) -> Result<usize, DocumentError> {
+        if semitones == 0 {
+            return Ok(0);
+        }
+        let mut commands = Vec::new();
+        let mut measures = BTreeSet::new();
+        for semantic in selection {
+            let Some((note_id, measure)) = self
+                .elements
+                .get(semantic)
+                .and_then(|element| Some((element.note?, element.measure)))
+            else {
+                continue;
+            };
+            let before = self
+                .score()
+                .note(note_id)
+                .and_then(|note| note.written_pitch)
+                .ok_or(DocumentError::InvalidSelection)?;
+            let midi = i32::from(pitch_to_midi(before)) + semitones;
+            if midi < i32::from(PIANO_LOWEST) || midi > i32::from(PIANO_HIGHEST) {
+                return Err(DocumentError::Edit(
+                    "that would take a note off the keyboard".into(),
+                ));
+            }
+            commands.push(EditCommand::ChangePitch {
+                note: note_id,
+                pitch: pitch_from_midi(midi as u8),
+            });
+            measures.insert(measure);
+        }
+        if commands.is_empty() {
+            return Err(DocumentError::InvalidSelection);
+        }
+        let moved = commands.len();
+        self.workspace
+            .transact(commands)
+            .map_err(|error| DocumentError::Edit(error.to_string()))?;
+        for measure in measures {
+            self.finish_measure_edit(measure)?;
+        }
+        Ok(moved)
+    }
+
+    /// Remove every selected note, as **one** journal transaction.
+    ///
+    /// A chord loses only the notes that were chosen: the event is rewritten
+    /// without them, and only disappears outright when the last of its notes
+    /// goes. Deleting the whole event because one of its notes was selected
+    /// would silently take the rest of the chord with it.
+    pub fn delete_notes(&mut self, selection: &[SemanticId]) -> Result<usize, DocumentError> {
+        let mut by_event: BTreeMap<EventId, (VoiceId, MeasureId, BTreeSet<NoteId>)> =
+            BTreeMap::new();
+        for semantic in selection {
+            let Some(element) = self.elements.get(semantic) else {
+                continue;
+            };
+            let (Some(note), Some(event)) = (element.note, element.event) else {
+                continue;
+            };
+            by_event
+                .entry(event)
+                .or_insert_with(|| (element.voice, element.measure, BTreeSet::new()))
+                .2
+                .insert(note);
+        }
+        if by_event.is_empty() {
+            return Err(DocumentError::InvalidSelection);
+        }
+        let mut commands = Vec::new();
+        let mut measures = BTreeSet::new();
+        let mut removed = 0_usize;
+        for (event_id, (voice, measure, notes)) in by_event {
+            let Some(event) = self.score().event(event_id).cloned() else {
+                continue;
+            };
+            measures.insert(measure);
+            let remaining: Vec<Note> = event
+                .chord_notes()
+                .iter()
+                .filter(|note| !notes.contains(&note.id))
+                .cloned()
+                .collect();
+            removed += event.chord_notes().len() - remaining.len();
+            commands.push(EditCommand::DeleteEvent { event: event_id });
+            if !remaining.is_empty() {
+                let mut kept = event;
+                kept.kind = EventKind::Chord(remaining);
+                commands.push(EditCommand::InsertEvent { voice, event: kept });
+            }
+        }
+        if commands.is_empty() {
+            return Err(DocumentError::InvalidSelection);
+        }
+        self.workspace
+            .transact(commands)
+            .map_err(|error| DocumentError::Edit(error.to_string()))?;
+        for measure in measures {
+            self.finish_measure_edit(measure)?;
+        }
+        Ok(removed)
+    }
+
     pub fn set_duration(&mut self, semantic: SemanticId, key: u8) -> Result<(), DocumentError> {
         let element = self
             .elements
@@ -1803,6 +1915,87 @@ mod tests {
         assert!(!stats.full && !stats.rebreak);
         assert_eq!(stats.measures_summarized, 1);
         assert_eq!(stats.systems_spaced, 1);
+    }
+
+    /// Transposing a selection is ONE undo step, however many notes it moved
+    /// — the same law the note drag follows.
+    #[test]
+    fn transposing_a_selection_is_one_journal_transaction() {
+        let mut document = ScoreDocument::demo().unwrap();
+        let selection: Vec<_> = document.all_note_semantics().into_iter().take(5).collect();
+        let before: Vec<u8> = selection
+            .iter()
+            .map(|id| document.element(*id).unwrap().midi.unwrap())
+            .collect();
+        let journal = document.workspace().journal().len();
+        assert_eq!(document.transpose(&selection, 2).unwrap(), 5);
+        assert_eq!(
+            document.workspace().journal().len(),
+            journal + 1,
+            "five notes, one undo step"
+        );
+        let after: Vec<u8> = selection
+            .iter()
+            .map(|id| document.element(*id).unwrap().midi.unwrap())
+            .collect();
+        for (was, now) in before.iter().zip(&after) {
+            assert_eq!(i32::from(*now), i32::from(*was) + 2);
+        }
+        // An octave is the same operation, and undo puts every note back.
+        assert_eq!(document.transpose(&selection, -12).unwrap(), 5);
+        document.undo().unwrap();
+        document.undo().unwrap();
+        let restored: Vec<u8> = selection
+            .iter()
+            .map(|id| document.element(*id).unwrap().midi.unwrap())
+            .collect();
+        assert_eq!(restored, before);
+        // Nothing to move is not an edit.
+        assert!(document.transpose(&[], 1).is_err());
+        assert_eq!(document.transpose(&selection, 0).unwrap(), 0);
+    }
+
+    /// A transposition that would walk off the keyboard is refused whole,
+    /// rather than moving the notes that happen to fit: undo must never have
+    /// to unpick half an edit.
+    #[test]
+    fn a_transpose_off_the_keyboard_is_refused_whole() {
+        let mut document = ScoreDocument::demo().unwrap();
+        let selection: Vec<_> = document.all_note_semantics().into_iter().take(4).collect();
+        let before: Vec<u8> = selection
+            .iter()
+            .map(|id| document.element(*id).unwrap().midi.unwrap())
+            .collect();
+        let journal = document.workspace().journal().len();
+        assert!(document.transpose(&selection, 120).is_err());
+        assert_eq!(document.workspace().journal().len(), journal, "nothing was written");
+        let after: Vec<u8> = selection
+            .iter()
+            .map(|id| document.element(*id).unwrap().midi.unwrap())
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    /// Deleting a selection is one undo step, and a chord loses only the
+    /// notes that were chosen — never its siblings.
+    #[test]
+    fn deleting_a_selection_is_one_step_and_spares_the_rest_of_the_chord() {
+        let mut document = ScoreDocument::demo().unwrap();
+        let all = document.all_note_semantics();
+        let total = all.len();
+        let chosen: Vec<_> = all.into_iter().take(3).collect();
+        let journal = document.workspace().journal().len();
+        let removed = document.delete_notes(&chosen).unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(
+            document.workspace().journal().len(),
+            journal + 1,
+            "three notes, one undo step"
+        );
+        assert_eq!(document.all_note_semantics().len(), total - 3);
+        document.undo().unwrap();
+        assert_eq!(document.all_note_semantics().len(), total);
+        assert!(document.delete_notes(&[]).is_err());
     }
 
     #[test]

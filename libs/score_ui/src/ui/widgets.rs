@@ -222,6 +222,23 @@ script_mod! {
         padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
     }
 
+    // The panel's chooser. Used for the one choice that changes what every
+    // other control in the panel means: which synthesis is playing.
+    mod.widgets.ScoreDropDown = DropDown{
+        width: Fill
+        height: 26
+        padding: Inset{left: 9 right: 9 top: 0 bottom: 0}
+        draw_bg +: {
+            color: uniform(score.color_button)
+            border_radius: score.radius
+            border_size: 1.0
+        }
+        draw_text +: {
+            color: score.color_text
+            text_style: theme.font_regular{font_size: 9.5}
+        }
+    }
+
     mod.widgets.ScoreKeyCap = RoundedView{
         width: 92
         height: 23

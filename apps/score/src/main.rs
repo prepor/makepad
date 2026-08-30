@@ -131,6 +131,9 @@ impl MatchEvent for App {
                         self.state.ui.status = "File panel cancelled".into();
                     }
                     FileDialogAction::None => {}
+                    // The platform grew real file/save panels after this was
+                    // written; the score still drives folder selection only.
+                    _ => {}
                 }
                 self.ui.redraw(cx);
             }

@@ -6,6 +6,8 @@
 //! never inside the checkout — and is a plain `key = value` text file so a
 //! corrupt or half-written line costs one setting, not the whole file.
 
+use crate::sound::ScoreEngine;
+use makepad_piano_model::fx::ReverbPreset;
 use std::path::{Path, PathBuf};
 
 /// How many opened files the File menu and the Open dialog remember.
@@ -34,12 +36,25 @@ pub struct ScorePrefs {
     /// the choice survives the shipped instrument list growing or reordering,
     /// and an unknown name simply falls back to the app default.
     pub instrument: String,
+    /// Which synthesis the app starts on: `physical` or `learned`. Stored as
+    /// a name for the same reason the instrument is — an engine list that
+    /// grows must not silently move anyone to a different sound — and an
+    /// unknown name falls back to the physical model.
+    pub engine: String,
     /// Folder the music library browses. `None` falls back to whatever
     /// [`crate::library::default_library_dir`] finds, so the browser is
     /// useful out of the box and configurable the moment it is not.
     pub library_dir: Option<PathBuf>,
     /// Most recently opened scores, newest first.
     pub recent: Vec<PathBuf>,
+    /// The room, by the name the panel's buttons use. An unknown name falls
+    /// back to the instrument's own room.
+    pub room: String,
+    /// Reverb amount, 0..=1. `None` when nothing has been stored yet, in
+    /// which case the instrument's own amount stands.
+    pub reverb: Option<f32>,
+    /// Brightness, in dB on the treble shelf.
+    pub brightness: f32,
 }
 
 impl Default for ScorePrefs {
@@ -53,13 +68,52 @@ impl Default for ScorePrefs {
             dark_paper: false,
             last_dir: None,
             library_dir: None,
-            instrument: crate::sound::DEFAULT_PRESET.to_string(),
+            instrument: crate::sound::preset_name(ScoreEngine::Physical, 0).to_string(),
+            engine: ENGINE_PHYSICAL.to_string(),
             recent: Vec::new(),
+            room: String::new(),
+            reverb: None,
+            brightness: 0.0,
         }
     }
 }
 
+/// The stored spellings of the engines. Plain words rather than an index,
+/// so the file stays readable and reorderable.
+pub const ENGINE_PHYSICAL: &str = "physical";
+pub const ENGINE_HYBRID: &str = "hybrid";
+pub const ENGINE_LEARNED: &str = "learned";
+
+/// The stored engine name.
+pub fn engine_name(engine: ScoreEngine) -> &'static str {
+    match engine {
+        ScoreEngine::Physical => ENGINE_PHYSICAL,
+        ScoreEngine::Hybrid => ENGINE_HYBRID,
+        ScoreEngine::Learned => ENGINE_LEARNED,
+    }
+}
+
 impl ScorePrefs {
+    /// The stored engine, or the physical model when the name is unknown.
+    /// The stored engine, if the application still offers it.
+    ///
+    /// An engine that has been withdrawn from the chooser (hybrid, for now)
+    /// must not strand whoever had it selected on something they can no
+    /// longer see or change, so anything unrecognised — or no longer
+    /// offered — falls back to the physical model.
+    pub fn engine(&self) -> ScoreEngine {
+        let stored = match self.engine.as_str() {
+            ENGINE_LEARNED => ScoreEngine::Learned,
+            ENGINE_HYBRID => ScoreEngine::Hybrid,
+            _ => ScoreEngine::Physical,
+        };
+        if crate::sound::ENGINES.contains(&stored) {
+            stored
+        } else {
+            ScoreEngine::Physical
+        }
+    }
+
     /// The stored preferences, or the defaults when nothing is stored yet.
     /// A read never fails: an unreadable file simply means "no preferences".
     pub fn load() -> Self {
@@ -92,6 +146,18 @@ impl ScorePrefs {
                     prefs.library_dir = Some(PathBuf::from(value))
                 }
                 "instrument" if !value.is_empty() => prefs.instrument = value.to_string(),
+                "engine" if !value.is_empty() => prefs.engine = value.to_string(),
+                "room" if !value.is_empty() => prefs.room = value.to_string(),
+                "reverb" => {
+                    if let Ok(amount) = value.parse::<f32>() {
+                        prefs.reverb = Some(amount);
+                    }
+                }
+                "brightness" => {
+                    if let Ok(db) = value.parse::<f32>() {
+                        prefs.brightness = db;
+                    }
+                }
                 "recent" if !value.is_empty() => {
                     let path = PathBuf::from(value);
                     if !prefs.recent.contains(&path) {
@@ -139,6 +205,14 @@ impl ScorePrefs {
             out.push_str(&format!("library_dir = {}\n", dir.display()));
         }
         out.push_str(&format!("instrument = {}\n", self.instrument));
+        out.push_str(&format!("engine = {}\n", self.engine));
+        if !self.room.is_empty() {
+            out.push_str(&format!("room = {}\n", self.room));
+        }
+        if let Some(amount) = self.reverb {
+            out.push_str(&format!("reverb = {amount}\n"));
+        }
+        out.push_str(&format!("brightness = {}\n", self.brightness));
         for path in self.recent.iter().take(MAX_RECENT) {
             out.push_str(&format!("recent = {}\n", path.display()));
         }
@@ -178,6 +252,7 @@ mod tests {
     #[test]
     fn text_round_trips_every_flag() {
         let prefs = ScorePrefs {
+            engine: ENGINE_PHYSICAL.to_string(),
             start_in_editor: true,
             audition_on_hover: false,
             follow_cursor: false,
@@ -186,8 +261,11 @@ mod tests {
             dark_paper: true,
             last_dir: Some(PathBuf::from("/tmp/scores")),
             library_dir: Some(PathBuf::from("/tmp/library")),
-            instrument: "Upright".to_string(),
+            instrument: "Concert Grand".to_string(),
             recent: vec![PathBuf::from("/tmp/scores/a.mid")],
+            room: String::new(),
+            reverb: None,
+            brightness: 0.0,
         };
         let text = prefs.to_text();
         // Parse it back through the same reader the loader uses.
@@ -239,14 +317,28 @@ mod tests {
         assert_eq!(prefs.recent[0], PathBuf::from("/tmp/a.mid"));
     }
 
-    /// A fresh install lands on the felt piano and in the editor. Both are
-    /// defaults, not forced values: a stored file overrides either.
+    /// A fresh install lands on the shipped piano and in the editor. Both
+    /// are defaults, not forced values: a stored file overrides either.
     #[test]
-    fn a_fresh_install_starts_felt_and_in_the_editor() {
+    fn a_fresh_install_starts_on_the_shipped_piano_and_in_the_editor() {
         let prefs = ScorePrefs::default();
-        assert_eq!(prefs.instrument, "Felt Piano");
+        assert_eq!(
+            prefs.instrument,
+            crate::sound::preset_name(ScoreEngine::Physical, 0)
+        );
         assert!(prefs.start_in_editor);
-        assert!(crate::sound::preset_index_by_name(&prefs.instrument).is_some());
+        assert!(crate::sound::preset_index_by_name(prefs.engine(), &prefs.instrument).is_some());
+        assert_eq!(prefs.engine(), ScoreEngine::Physical, "the app opens on the physical model");
+        // Every OFFERED engine round-trips through its stored spelling.
+        for engine in crate::sound::ENGINES {
+            let mut prefs = ScorePrefs::default();
+            prefs.engine = engine_name(engine).to_string();
+            assert_eq!(prefs.engine(), engine);
+        }
+        // One that is no longer offered does not strand the reader on it.
+        let mut withdrawn = ScorePrefs::default();
+        withdrawn.engine = ENGINE_HYBRID.to_string();
+        assert_eq!(withdrawn.engine(), ScoreEngine::Physical);
     }
 
     /// Someone who chose pianist mode and another instrument keeps both.
@@ -272,5 +364,51 @@ mod tests {
         let path = ScorePrefs::path().expect("a home directory");
         assert!(path.ends_with("makepad-score/preferences.conf"));
         assert!(!path.to_string_lossy().contains("/makepad/makepad"));
+    }
+}
+
+/// The stored spellings of the rooms — the same words the panel's buttons
+/// carry, so the file reads as what the reader chose.
+pub fn reverb_preset_name(preset: ReverbPreset) -> &'static str {
+    match preset {
+        ReverbPreset::PracticeRoom => "practice",
+        ReverbPreset::Studio => "studio",
+        ReverbPreset::SmallHall => "small-hall",
+        ReverbPreset::ConcertHall => "concert-hall",
+        ReverbPreset::Cathedral => "cathedral",
+    }
+}
+
+/// The stored room, or `None` when the name is unknown — in which case the
+/// instrument's own room stands.
+pub fn reverb_preset_by_name(name: &str) -> Option<ReverbPreset> {
+    ReverbPreset::ALL
+        .into_iter()
+        .find(|preset| reverb_preset_name(*preset) == name)
+}
+
+/// Kept honest about the two controls the panel offers.
+#[cfg(test)]
+mod control_persistence {
+    use super::*;
+
+    #[test]
+    fn the_two_controls_and_the_room_survive_a_round_trip() {
+        let mut prefs = ScorePrefs::default();
+        prefs.room = reverb_preset_name(ReverbPreset::Cathedral).to_string();
+        prefs.reverb = Some(0.42);
+        prefs.brightness = -3.5;
+        let text = prefs.to_text();
+        assert!(text.contains("room = cathedral"));
+        assert!(text.contains("reverb = 0.42"));
+        assert!(text.contains("brightness = -3.5"));
+        assert_eq!(reverb_preset_by_name("cathedral"), Some(ReverbPreset::Cathedral));
+        assert_eq!(reverb_preset_by_name("harpsichord"), None);
+        // Every room the panel offers has a stored spelling and comes back.
+        for preset in ReverbPreset::ALL {
+            assert_eq!(reverb_preset_by_name(reverb_preset_name(preset)), Some(preset));
+        }
+        // Nothing stored leaves the instrument's own amount alone.
+        assert_eq!(ScorePrefs::default().reverb, None);
     }
 }

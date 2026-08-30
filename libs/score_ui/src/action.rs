@@ -1,5 +1,6 @@
 use crate::{playback::RoomSettings, sound::SoundParam};
-use makepad_piano_model::fx::{Perspective, ReverbPreset};
+use makepad_piano_model::fx::ReverbPreset;
+use crate::sound::InstrumentId;
 use makepad_score::model::AnnotationKind;
 use makepad_widgets::*;
 use std::path::PathBuf;
@@ -9,6 +10,69 @@ pub enum ProductMode {
     #[default]
     Pianist,
     Editor,
+}
+
+/// What a drag on the page MEANS. The reader chooses it; it is never inferred
+/// from what happened to be under the pointer.
+///
+/// The old rule — a drag that starts on a note edits that note, a drag on
+/// paper moves the page — made every mis-aimed drag a silent edit of the
+/// music. So the tool is explicit, the safe one is the default, and the one
+/// that moves music has to be asked for.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ScoreTool {
+    /// Read and move about. Dragging anywhere moves the paper — over a note
+    /// exactly as over empty staff — and the wheel zooms. Nothing on the page
+    /// can be changed by dragging. This is where you land.
+    #[default]
+    Navigate,
+    /// Choose music and operate on it: click a note, drag a band across a run,
+    /// ⇧ or ⌘ to add. What is chosen can be transposed and deleted.
+    Select,
+    /// Direct manipulation: drag a note to change its pitch and its beat,
+    /// click a bar to write one, delete what is chosen.
+    Edit,
+}
+
+impl ScoreTool {
+    pub const ALL: [Self; 3] = [Self::Navigate, Self::Select, Self::Edit];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Navigate => "Navigate",
+            Self::Select => "Select",
+            Self::Edit => "Edit",
+        }
+    }
+
+    /// The single key that arms it.
+    pub const fn shortcut(self) -> &'static str {
+        match self {
+            Self::Navigate => "H",
+            Self::Select => "V",
+            Self::Edit => "N",
+        }
+    }
+
+    /// What the status bar says the pointer will now do.
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Navigate => {
+                "Navigate · drag anywhere to move the page, scroll to zoom · notes are safe"
+            }
+            Self::Select => {
+                "Select · click or drag a band over notes · ↑↓ transposes, ⌫ deletes"
+            }
+            Self::Edit => {
+                "Edit · drag a note to move it, click a bar to write one · ⌫ deletes"
+            }
+        }
+    }
+
+    /// True for the tools that may change the music by pointer alone.
+    pub const fn edits(self) -> bool {
+        matches!(self, Self::Edit)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,13 +168,6 @@ pub fn room_summary(room: RoomSettings) -> String {
     )
 }
 
-pub fn perspective_label(perspective: Perspective) -> &'static str {
-    match perspective {
-        Perspective::Player => "Player",
-        Perspective::Audience => "Audience",
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaletteCommand {
     Staccato,
@@ -144,6 +201,12 @@ pub enum BrowseTarget {
 #[derive(Clone, Debug)]
 pub enum ScoreAction {
     SetMode(ProductMode),
+    /// Arm a pointer tool. The one thing that decides what a drag means.
+    SetTool(ScoreTool),
+    /// Move every selected note by this many semitones, as one undo step.
+    Transpose(i32),
+    /// Remove every selected note, as one undo step.
+    DeleteSelection,
     ToggleMode,
     ToggleChrome,
     SetPageLayout(PageLayout),
@@ -165,18 +228,11 @@ pub enum ScoreAction {
     SetTempo(f64),
     SeekQuarter(f64),
     SetReverbPreset(ReverbPreset),
-    SetPerspective(Perspective),
-    /// Adopt one of the shipped instrument presets whole: voicing, suggested
-    /// room and a clean trim on top of it.
-    SetPianoPreset(usize),
-    /// Move one continuous sound control. The value is in the parameter's own
-    /// unit; the panel converts from slider travel before sending it.
+    /// Move one of the two continuous sound controls. The value is in the
+    /// parameter's own unit; the panel converts from slider travel first.
     SetSoundParam { param: SoundParam, value: f32 },
-    /// Put every control back where the current preset had it.
-    ResetSoundToPreset,
-    /// Lift the resonance bed's dampers all the way — the "whole instrument
-    /// open" sound, reachable in one press from the panel.
-    LiftDampers,
+    /// Pick an instrument from the list. The engine follows it.
+    SelectInstrument(InstrumentId),
     SetAnnotationTool(AnnotationTool),
     ApplyAnnotationText(String),
     SetInspectorTab(InspectorTab),

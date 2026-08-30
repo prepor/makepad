@@ -1,37 +1,169 @@
 //! The whole piano sound as one value.
 //!
-//! Everything the sound panel offers — the instrument preset, the six voicing
-//! amounts, the output EQ and the room — is one plain `Copy` struct. The UI
-//! edits it, [`crate::playback::PlaybackBridge::set_sound`] publishes it into
-//! the shared cell, and the audio thread applies it with the setters
+//! The sound panel offers two instruments and two controls, and this is what
+//! they edit: one plain `Copy` struct. The UI changes it,
+//! [`crate::playback::PlaybackBridge::set_sound`] publishes it into the
+//! shared cell, and the audio thread applies it with the setters
 //! `makepad_piano_model` documents. Nothing here allocates and nothing here
 //! touches the synth.
 //!
-//! Two kinds of preset change exist, and the difference is `PianoPreset::
-//! needs_rebuild`: a voicing+room preset is a value change and travels through
-//! the shared cell like any slider; a preset with a construction-time `design`
-//! override is a *different instrument* and has to be built (on this thread)
-//! and handed to the audio thread whole.
+//! There used to be twenty-one physical presets, six electric ones, seven
+//! voicing sliders and a five-control EQ. The mechanisms they drove are all
+//! still in `makepad_piano_model` and still reachable from here — the panel
+//! simply does not offer them, because one good piano beats thirty choices.
 
 use crate::playback::RoomSettings;
-use makepad_piano_model::{PianoPreset, Voicing, PIANO_PRESETS};
+use makepad_piano_model::{
+    fx::ReverbPreset, learned::EngineKind, PianoPreset, Voicing, PIANO_PRESETS,
+};
 
-/// The deliberate-exaggeration ceiling `Voicing` clamps to. Above 1.0 the
-/// sympathetic amount progressively lifts the resonance bed's dampers, which
-/// is the whole "play with the dampers off" sound, so the sliders run all the
-/// way up rather than stopping at the reference level.
-pub const VOICING_MAX: f32 = 2.5;
+/// The synthesis kinds the application can build.
+///
+/// [`ScoreEngine::Hybrid`] is the physical model with its per-partial targets
+/// pulled toward the learned engine's measured ladder (see [`crate::hybrid`]).
+/// It is built and its table is baked, but listening said it is worse than
+/// either engine it is made from, so it is not in [`ENGINES`] and nothing in
+/// the app can select it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScoreEngine {
+    /// Strings, hammers and soundboard, simulated.
+    Physical,
+    /// The physical model, corrected toward what a recorded piano measures.
+    Hybrid,
+    /// The trained network on its own — the electric voice.
+    Learned,
+}
 
-/// The point on the sympathetic slider above which the dampers are audibly
-/// coming off the strings, used only to caption the control honestly.
-pub const DAMPERS_LIFTING: f32 = 1.25;
+impl ScoreEngine {
+    /// The `makepad_piano_model` synthesis underneath. Hybrid IS the physical
+    /// model — that is the whole point of it.
+    pub const fn kind(self) -> EngineKind {
+        match self {
+            Self::Physical | Self::Hybrid => EngineKind::Physical,
+            Self::Learned => EngineKind::Learned,
+        }
+    }
+}
+
+/// The engines an instrument can name. Hybrid is deliberately absent; see
+/// [`ScoreEngine`].
+pub const ENGINES: [ScoreEngine; 2] = [ScoreEngine::Physical, ScoreEngine::Learned];
+
+/// One instrument in the list.
+///
+/// The engine is a PROPERTY of the instrument, not a mode the reader chooses
+/// first: picking a row routes to the right synthesis by itself. The indices
+/// are kept even though each table currently holds one entry, so adding an
+/// instrument back is one row in a table and nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentId {
+    /// A modelled acoustic instrument: index into `PIANO_PRESETS`.
+    Acoustic(usize),
+    /// A learned electric voice: index into [`LEARNED_PRESETS`].
+    Electric(usize),
+}
+
+impl InstrumentId {
+    /// Which engine plays it. The reader never chooses this; it follows.
+    pub const fn engine(self) -> ScoreEngine {
+        match self {
+            Self::Acoustic(_) => ScoreEngine::Physical,
+            Self::Electric(_) => ScoreEngine::Learned,
+        }
+    }
+}
+
+/// One row of the instrument list.
+pub struct InstrumentEntry {
+    pub id: InstrumentId,
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+/// Every instrument the application can play, in one flat list.
+pub fn instrument_list() -> Vec<InstrumentEntry> {
+    let mut out = Vec::with_capacity(PIANO_PRESETS.len() + LEARNED_PRESETS.len());
+    for (index, preset) in PIANO_PRESETS.iter().enumerate() {
+        out.push(InstrumentEntry {
+            id: InstrumentId::Acoustic(index),
+            name: preset.name,
+            description: preset.description,
+        });
+    }
+    for (index, preset) in LEARNED_PRESETS.iter().enumerate() {
+        out.push(InstrumentEntry {
+            id: InstrumentId::Electric(index),
+            name: preset.name,
+            description: preset.description,
+        });
+    }
+    out
+}
+
+/// The learned engine's electric voices.
+///
+/// One entry. The engine's voicing amounts are inert and it has no physical
+/// design, so everything that can differ between electric voices is the
+/// output desk and the room — six names for one instrument in five rooms was
+/// not worth the list. This is the clean reference voice, close-miked.
+pub const LEARNED_PRESETS: &[ElectricPreset] = &[ElectricPreset {
+    name: "Electric Piano",
+    description: "Clean, even and bell-like — the learned network, close-miked",
+    room: ReverbPreset::Studio,
+    reverb_mix: 0.18,
+    is_default: true,
+}];
+
+/// One entry of the electric family: a room over the one learned voice.
+pub struct ElectricPreset {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub room: ReverbPreset,
+    pub reverb_mix: f32,
+    pub is_default: bool,
+}
+
+/// The learned engine stores a voicing and uses none of it, so it carries the
+/// reference one rather than pretending to differ.
+const LEARNED_VOICING: Voicing = Voicing {
+    body_tap: 1.0,
+    knock: 1.0,
+    roughness: 1.0,
+    phantoms: 1.0,
+    attack_noise: 1.0,
+    attack_body: 0.0,
+    sympathetic: 1.0,
+};
+
+/// Where the brightness shelf sits.
+///
+/// Brightness is ONE treble shelf, at a fixed corner, over whatever is
+/// playing. 3.5 kHz is where a piano reads as bright or dull rather than airy
+/// or dark, and it is the only tone control that reaches BOTH engines — the
+/// felt-hardness route would be more physical but would leave the electric
+/// voice with a dead slider.
+pub const BRIGHTNESS_HZ: f32 = 3500.0;
+
+/// The engine's own defaults for everything the panel no longer offers.
+const FLAT_BELL_HZ: f32 = 2500.0;
+const FLAT_BELL_Q: f32 = 1.0;
+const DEFAULT_EARLY: f32 = 0.7;
 
 /// Every number that shapes the piano, in one place.
+///
+/// Only `eq_shelf_db` (brightness) and `room` (the room and its dry/wet) are
+/// reachable from the panel. The rest are the instrument's own shipped values
+/// — kept as fields because the audio thread applies the whole struct in one
+/// pass, and because putting a control back means exposing a field that is
+/// already published rather than building a path for it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SoundSettings {
-    /// Index into [`PIANO_PRESETS`]; the sound this was last set from.
+    /// Which synthesis is playing.
+    pub engine: ScoreEngine,
+    /// Index into this engine's instrument table.
     pub preset: usize,
     pub voicing: Voicing,
+    /// Brightness: the treble shelf's gain, in dB, at [`BRIGHTNESS_HZ`].
     pub eq_shelf_db: f32,
     pub eq_shelf_hz: f32,
     pub eq_bell_hz: f32,
@@ -44,20 +176,14 @@ pub struct SoundSettings {
     pub early_reflections: f32,
 }
 
-/// The engine's own defaults for the controls no preset describes: flat EQ,
-/// flat tone, unity output, the shipped early-reflection level.
-const FLAT_SHELF_HZ: f32 = 6000.0;
-const FLAT_BELL_HZ: f32 = 2500.0;
-const FLAT_BELL_Q: f32 = 1.0;
-const DEFAULT_EARLY: f32 = 0.7;
-
 impl Default for SoundSettings {
     fn default() -> Self {
         let mut settings = Self {
-            preset: default_preset_index(),
+            engine: ScoreEngine::Physical,
+            preset: default_preset_index(ScoreEngine::Physical),
             voicing: Voicing::default(),
             eq_shelf_db: 0.0,
-            eq_shelf_hz: FLAT_SHELF_HZ,
+            eq_shelf_hz: BRIGHTNESS_HZ,
             eq_bell_hz: FLAT_BELL_HZ,
             eq_bell_db: 0.0,
             eq_bell_q: FLAT_BELL_Q,
@@ -72,307 +198,164 @@ impl Default for SoundSettings {
     }
 }
 
-/// The instrument the app opens on when nothing is stored.
-///
-/// The library's own `is_default` is the Concert Grand — the right default for
-/// a piano *library*, since it is the reference-matched instrument everything
-/// else is a departure from. This application starts somewhere else: the felt
-/// piano is the sound people practise and read to, and it is what the user
-/// asked to land on.
-pub const DEFAULT_PRESET: &str = "Felt Piano";
-
-/// Which shipped preset the app starts on.
-pub fn default_preset_index() -> usize {
-    preset_index_by_name(DEFAULT_PRESET)
-        .or_else(|| PIANO_PRESETS.iter().position(|preset| preset.is_default))
-        .unwrap_or(0)
+/// Which of the engine's instruments the app starts on.
+pub fn default_preset_index(engine: ScoreEngine) -> usize {
+    match engine {
+        ScoreEngine::Learned => LEARNED_PRESETS.iter().position(|p| p.is_default),
+        _ => PIANO_PRESETS.iter().position(|p| p.is_default),
+    }
+    .unwrap_or(0)
 }
 
-/// A preset by its library name. Names are what preferences store, so a
-/// shipped list that grows or is reordered never silently changes anyone's
-/// instrument; a name that is no longer in the list simply has no index.
-pub fn preset_index_by_name(name: &str) -> Option<usize> {
-    PIANO_PRESETS.iter().position(|preset| preset.name == name)
+/// How many instruments this engine ships.
+pub fn preset_count(engine: ScoreEngine) -> usize {
+    match engine {
+        ScoreEngine::Learned => LEARNED_PRESETS.len(),
+        _ => PIANO_PRESETS.len(),
+    }
 }
 
-pub fn preset(index: usize) -> &'static PianoPreset {
-    &PIANO_PRESETS[index.min(PIANO_PRESETS.len() - 1)]
+/// The line under an instrument's name in the panel.
+pub fn preset_description(engine: ScoreEngine, index: usize) -> &'static str {
+    match engine {
+        ScoreEngine::Learned => LEARNED_PRESETS[index.min(LEARNED_PRESETS.len() - 1)].description,
+        _ => PIANO_PRESETS[index.min(PIANO_PRESETS.len() - 1)].description,
+    }
 }
 
-/// A preset's name without the `(effect)` suffix it carries in the library;
-/// the panel says "effect" in its own column instead of inside the name.
-pub fn preset_name(index: usize) -> &'static str {
-    preset(index).name.trim_end_matches(" (effect)")
+/// The `PianoPreset` an engine is constructed from. The learned engine has no
+/// physical design, so it is built from the shipped one and ignores it.
+pub fn build_preset(engine: ScoreEngine, index: usize) -> &'static PianoPreset {
+    match engine {
+        ScoreEngine::Learned => &PIANO_PRESETS[0],
+        _ => &PIANO_PRESETS[index.min(PIANO_PRESETS.len() - 1)],
+    }
 }
 
-pub fn preset_is_effect(index: usize) -> bool {
-    preset(index).name.ends_with("(effect)")
+/// An instrument by its name. Names are what preferences store, so the
+/// shipped list may grow or be reordered without silently moving anyone's
+/// instrument; an unknown name simply has no index.
+pub fn preset_index_by_name(engine: ScoreEngine, name: &str) -> Option<usize> {
+    match engine {
+        ScoreEngine::Learned => LEARNED_PRESETS.iter().position(|p| p.name == name),
+        _ => PIANO_PRESETS.iter().position(|p| p.name == name),
+    }
+}
+
+/// An instrument's name.
+pub fn preset_name(engine: ScoreEngine, index: usize) -> &'static str {
+    match engine {
+        ScoreEngine::Learned => LEARNED_PRESETS[index.min(LEARNED_PRESETS.len() - 1)].name,
+        _ => PIANO_PRESETS[index.min(PIANO_PRESETS.len() - 1)].name,
+    }
 }
 
 impl SoundSettings {
-    /// Adopt a preset whole: its voicing, its suggested room and reverb
-    /// amount, and a clean slate for the engineer's trim on top. The
-    /// listening position is deliberately kept — where you are sitting is not
-    /// a property of the instrument.
+    /// Adopt an instrument whole: its voicing and the room it is heard in.
+    ///
+    /// Brightness is deliberately NOT reset. It is one control over both
+    /// instruments — the engineer's, not the instrument's — so changing
+    /// instrument does not silently undo it.
     pub fn apply_preset(&mut self, index: usize) {
-        let index = index.min(PIANO_PRESETS.len() - 1);
-        let preset = preset(index);
+        let index = index.min(preset_count(self.engine).saturating_sub(1));
         self.preset = index;
-        self.voicing = preset.voicing;
-        self.room.preset = preset.room;
-        self.room.mix = preset.reverb_mix;
         self.early_reflections = DEFAULT_EARLY;
-        self.eq_shelf_db = 0.0;
-        self.eq_shelf_hz = FLAT_SHELF_HZ;
+        self.master_gain = 1.0;
+        self.eq_shelf_hz = BRIGHTNESS_HZ;
         self.eq_bell_hz = FLAT_BELL_HZ;
         self.eq_bell_db = 0.0;
         self.eq_bell_q = FLAT_BELL_Q;
         self.tone_bass_db = 0.0;
         self.tone_treble_db = 0.0;
-        self.master_gain = 1.0;
+        match self.engine {
+            ScoreEngine::Learned => {
+                let preset = &LEARNED_PRESETS[index.min(LEARNED_PRESETS.len() - 1)];
+                self.voicing = LEARNED_VOICING;
+                self.room.preset = preset.room;
+                self.room.mix = preset.reverb_mix;
+            }
+            _ => {
+                let preset = &PIANO_PRESETS[index.min(PIANO_PRESETS.len() - 1)];
+                self.voicing = preset.voicing;
+                self.room.preset = preset.room;
+                self.room.mix = preset.reverb_mix;
+            }
+        }
     }
 
-    /// The settings this preset would produce, for comparison.
-    pub fn from_preset(index: usize, room: RoomSettings) -> Self {
+    /// The settings this instrument would produce, for comparison.
+    pub fn from_preset(engine: ScoreEngine, index: usize, room: RoomSettings) -> Self {
         let mut settings = Self {
+            engine,
             room,
             ..Self::default()
         };
         settings.apply_preset(index);
         settings
     }
-
-    /// True while every control still sits where the preset put it.
-    pub fn matches_preset(&self) -> bool {
-        *self == Self::from_preset(self.preset, self.room)
-    }
-
-    /// The controls the user has moved away from the preset.
-    pub fn diverged(&self) -> impl Iterator<Item = SoundParam> + '_ {
-        let reference = Self::from_preset(self.preset, self.room);
-        SoundParam::ALL
-            .into_iter()
-            .filter(move |param| param.get(self) != param.get(&reference))
-    }
-
-    pub fn is_diverged(&self, param: SoundParam) -> bool {
-        let reference = Self::from_preset(self.preset, self.room);
-        param.get(self) != param.get(&reference)
-    }
-
-    /// True when this preset describes a different instrument rather than a
-    /// different voicing of the reference one — it has to be rebuilt.
-    pub fn preset_needs_rebuild(&self) -> bool {
-        preset(self.preset).needs_rebuild()
-    }
 }
 
 /// One continuous control of the sound panel.
 ///
-/// Every variant is backed by a documented `makepad_piano_model` setter, so a
-/// slider that exists is a slider that reaches the audio thread. The panel
-/// draws them straight from [`SoundParam::ALL`]: label, range, formatting and
-/// the slider mapping all live here, not in the shell.
+/// Two of them. Every variant is backed by a documented
+/// `makepad_piano_model` setter, so a slider that exists is a slider that
+/// reaches the audio thread — and both of these reach BOTH engines.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SoundParam {
-    // Character: the runtime mechanism mix (Voicing).
-    BodyTap,
-    Knock,
-    Roughness,
-    Phantoms,
-    AttackNoise,
-    Sympathetic,
-    // Tone: the output EQ and trim.
-    ShelfDb,
-    ShelfHz,
-    BellHz,
-    BellDb,
-    BellQ,
-    ToneBass,
-    ToneTreble,
-    MasterGain,
-    // Room.
-    ReverbMix,
-    EarlyReflections,
-}
-
-/// How a slider's 0..1 travel maps onto the parameter's range. Frequencies and
-/// Q are logarithmic; a linear 200 Hz..12 kHz slider spends 85% of its travel
-/// above 2 kHz and is unusable in the range that matters.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Scale {
-    Linear,
-    Log,
-}
-
-/// How the value is written next to its slider.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Unit {
-    /// A multiplier on the reference-matched level.
-    Amount,
-    Decibels,
-    Hertz,
-    Quality,
-    Percent,
+    /// One treble shelf at [`BRIGHTNESS_HZ`]: `set_eq_shelf`.
+    Brightness,
+    /// Tail send on top of the dry instrument: `set_reverb_mix`.
+    Reverb,
 }
 
 impl SoundParam {
-    pub const ALL: [Self; 16] = [
-        Self::BodyTap,
-        Self::Knock,
-        Self::Roughness,
-        Self::Phantoms,
-        Self::AttackNoise,
-        Self::Sympathetic,
-        Self::ShelfDb,
-        Self::ShelfHz,
-        Self::BellHz,
-        Self::BellDb,
-        Self::BellQ,
-        Self::ToneBass,
-        Self::ToneTreble,
-        Self::MasterGain,
-        Self::ReverbMix,
-        Self::EarlyReflections,
-    ];
-
-    /// The mechanism sliders, in the order the panel groups them.
-    pub const CHARACTER: [Self; 6] = [
-        Self::BodyTap,
-        Self::Knock,
-        Self::Roughness,
-        Self::Phantoms,
-        Self::AttackNoise,
-        Self::Sympathetic,
-    ];
-    pub const TONE: [Self; 8] = [
-        Self::ShelfDb,
-        Self::ShelfHz,
-        Self::BellHz,
-        Self::BellDb,
-        Self::BellQ,
-        Self::ToneBass,
-        Self::ToneTreble,
-        Self::MasterGain,
-    ];
-    pub const ROOM: [Self; 2] = [Self::ReverbMix, Self::EarlyReflections];
+    pub const ALL: [Self; 2] = [Self::Brightness, Self::Reverb];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::BodyTap => "Body tap",
-            Self::Knock => "Hammer knock",
-            Self::Roughness => "Contact grit",
-            Self::Phantoms => "Phantom partials",
-            Self::AttackNoise => "Key & action noise",
-            Self::Sympathetic => "Sympathetic strings",
-            Self::ShelfDb => "Air shelf",
-            Self::ShelfHz => "Shelf corner",
-            Self::BellHz => "Presence centre",
-            Self::BellDb => "Presence",
-            Self::BellQ => "Presence width",
-            Self::ToneBass => "Bass",
-            Self::ToneTreble => "Treble",
-            Self::MasterGain => "Output",
-            Self::ReverbMix => "Reverb",
-            Self::EarlyReflections => "Early reflections",
+            Self::Brightness => "Brightness",
+            Self::Reverb => "Reverb",
         }
     }
 
-    /// One line saying what moving this actually does to the instrument.
+    /// One line saying what moving this actually does.
     pub const fn hint(self) -> &'static str {
         match self {
-            Self::BodyTap => "Diffuse wooden body in the attack. 0 gives a digital-clean strike.",
-            Self::Knock => "The blow reaching the bridge — the percussive front edge.",
-            Self::Roughness => "Hammer contact roughness: fortissimo grit.",
-            Self::Phantoms => "Longitudinal string modes: the bass's metallic sheen.",
-            Self::AttackNoise => "Key-bottom thump and action resonance.",
-            Self::Sympathetic => "Open strings, damped-string coupling and the duplex scale. Above 1.0 the dampers come off.",
-            Self::ShelfDb => "Treble shelf on the output.",
-            Self::ShelfHz => "Where the treble shelf starts.",
-            Self::BellHz => "Centre of the parametric presence bell.",
-            Self::BellDb => "Cut or lift at the presence centre.",
-            Self::BellQ => "How narrow the presence bell is.",
-            Self::ToneBass => "Gentle output shelf at 120 Hz.",
-            Self::ToneTreble => "Gentle output shelf at 6 kHz.",
-            Self::MasterGain => "Output level on the calibrated instrument.",
-            Self::ReverbMix => "Tail send on top of the dry piano — 0 is the dry instrument.",
-            Self::EarlyReflections => "Lid and wall slapback: the room's size cue.",
+            Self::Brightness => {
+                "Voices the instrument brighter or duller: one treble shelf at 3.5 kHz, \
+                 the whole way up and the whole way down. 0 dB is how it is voiced."
+            }
+            Self::Reverb => {
+                "Tail send on top of the dry instrument — 0% is the instrument on its own, \
+                 in no room at all."
+            }
         }
     }
 
     /// Inclusive `(min, max)` in the parameter's own unit.
     pub const fn range(self) -> (f32, f32) {
         match self {
-            Self::BodyTap
-            | Self::Knock
-            | Self::Roughness
-            | Self::Phantoms
-            | Self::AttackNoise
-            | Self::Sympathetic => (0.0, VOICING_MAX),
-            Self::ShelfDb | Self::BellDb => (-24.0, 12.0),
-            Self::ShelfHz => (1000.0, 16000.0),
-            Self::BellHz => (200.0, 12000.0),
-            Self::BellQ => (0.3, 8.0),
-            Self::ToneBass | Self::ToneTreble => (-12.0, 12.0),
-            Self::MasterGain => (0.0, 2.0),
-            Self::ReverbMix => (0.0, 1.0),
-            Self::EarlyReflections => (0.0, 1.5),
+            // +/-9 dB is the whole useful travel of a voicing shelf: past it
+            // the piano stops sounding like a piano rather than sounding
+            // brighter.
+            Self::Brightness => (-9.0, 9.0),
+            Self::Reverb => (0.0, 1.0),
         }
     }
 
-    /// The value the preset/engine considers neutral, drawn as a tick.
+    /// The value the instrument considers neutral: what a non-finite value
+    /// falls back to, and where brightness detents.
     pub const fn neutral(self) -> f32 {
         match self {
-            Self::BodyTap
-            | Self::Knock
-            | Self::Roughness
-            | Self::Phantoms
-            | Self::AttackNoise
-            | Self::Sympathetic
-            | Self::MasterGain => 1.0,
-            Self::ShelfHz => FLAT_SHELF_HZ,
-            Self::BellHz => FLAT_BELL_HZ,
-            Self::BellQ => FLAT_BELL_Q,
-            Self::EarlyReflections => DEFAULT_EARLY,
-            _ => 0.0,
-        }
-    }
-
-    const fn scale(self) -> Scale {
-        match self {
-            Self::ShelfHz | Self::BellHz | Self::BellQ => Scale::Log,
-            _ => Scale::Linear,
-        }
-    }
-
-    const fn unit(self) -> Unit {
-        match self {
-            Self::ShelfDb | Self::BellDb | Self::ToneBass | Self::ToneTreble => Unit::Decibels,
-            Self::ShelfHz | Self::BellHz => Unit::Hertz,
-            Self::BellQ => Unit::Quality,
-            Self::ReverbMix => Unit::Percent,
-            _ => Unit::Amount,
+            Self::Brightness => 0.0,
+            Self::Reverb => 0.0,
         }
     }
 
     pub fn get(self, settings: &SoundSettings) -> f32 {
         match self {
-            Self::BodyTap => settings.voicing.body_tap,
-            Self::Knock => settings.voicing.knock,
-            Self::Roughness => settings.voicing.roughness,
-            Self::Phantoms => settings.voicing.phantoms,
-            Self::AttackNoise => settings.voicing.attack_noise,
-            Self::Sympathetic => settings.voicing.sympathetic,
-            Self::ShelfDb => settings.eq_shelf_db,
-            Self::ShelfHz => settings.eq_shelf_hz,
-            Self::BellHz => settings.eq_bell_hz,
-            Self::BellDb => settings.eq_bell_db,
-            Self::BellQ => settings.eq_bell_q,
-            Self::ToneBass => settings.tone_bass_db,
-            Self::ToneTreble => settings.tone_treble_db,
-            Self::MasterGain => settings.master_gain,
-            Self::ReverbMix => settings.room.mix,
-            Self::EarlyReflections => settings.early_reflections,
+            Self::Brightness => settings.eq_shelf_db,
+            Self::Reverb => settings.room.mix,
         }
     }
 
@@ -386,34 +369,25 @@ impl SoundParam {
             self.neutral()
         };
         match self {
-            Self::BodyTap => settings.voicing.body_tap = value,
-            Self::Knock => settings.voicing.knock = value,
-            Self::Roughness => settings.voicing.roughness = value,
-            Self::Phantoms => settings.voicing.phantoms = value,
-            Self::AttackNoise => settings.voicing.attack_noise = value,
-            Self::Sympathetic => settings.voicing.sympathetic = value,
-            Self::ShelfDb => settings.eq_shelf_db = value,
-            Self::ShelfHz => settings.eq_shelf_hz = value,
-            Self::BellHz => settings.eq_bell_hz = value,
-            Self::BellDb => settings.eq_bell_db = value,
-            Self::BellQ => settings.eq_bell_q = value,
-            Self::ToneBass => settings.tone_bass_db = value,
-            Self::ToneTreble => settings.tone_treble_db = value,
-            Self::MasterGain => settings.master_gain = value,
-            Self::ReverbMix => settings.room.mix = value,
-            Self::EarlyReflections => settings.early_reflections = value,
+            Self::Brightness => {
+                // A detent at flat. The shelf bypasses itself below 0.01 dB,
+                // so anything inside this band already IS flat; snapping to
+                // exactly 0 means the control can be put back where it
+                // started with the mouse, and says "+0.0 dB" when it is.
+                settings.eq_shelf_db = if value.abs() < 0.1 { 0.0 } else { value };
+                settings.eq_shelf_hz = BRIGHTNESS_HZ;
+            }
+            Self::Reverb => settings.room.mix = value,
         }
     }
 
-    /// Slider travel (0..=1) for a value.
+    /// Slider travel (0..=1) for a value. Both controls are linear in their
+    /// own unit — dB already is a perceptual scale, and a dry/wet is a ratio.
     pub fn to_position(self, value: f32) -> f64 {
         let (min, max) = self.range();
         let value = value.clamp(min, max) as f64;
         let (min, max) = (min as f64, max as f64);
-        match self.scale() {
-            Scale::Linear => ((value - min) / (max - min)).clamp(0.0, 1.0),
-            Scale::Log => ((value / min).ln() / (max / min).ln()).clamp(0.0, 1.0),
-        }
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
     }
 
     /// The value a slider at `position` (0..=1) asks for.
@@ -424,28 +398,15 @@ impl SoundParam {
             0.0
         };
         let (min, max) = self.range();
-        let (min_f, max_f) = (min as f64, max as f64);
-        let value = match self.scale() {
-            Scale::Linear => min_f + (max_f - min_f) * position,
-            Scale::Log => min_f * (max_f / min_f).powf(position),
-        };
+        let value = min as f64 + (max as f64 - min as f64) * position;
         (value as f32).clamp(min, max)
     }
 
     /// The value as the panel writes it beside the slider.
     pub fn format(self, value: f32) -> String {
-        match self.unit() {
-            Unit::Amount => format!("{value:.2}"),
-            Unit::Decibels => format!("{value:+.1} dB"),
-            Unit::Hertz => {
-                if value >= 1000.0 {
-                    format!("{:.2} kHz", value / 1000.0)
-                } else {
-                    format!("{value:.0} Hz")
-                }
-            }
-            Unit::Quality => format!("Q {value:.2}"),
-            Unit::Percent => format!("{:.0}%", value * 100.0),
+        match self {
+            Self::Brightness => format!("{value:+.1} dB"),
+            Self::Reverb => format!("{:.0}%", value * 100.0),
         }
     }
 }
@@ -454,75 +415,90 @@ impl SoundParam {
 mod tests {
     use super::*;
 
-    /// The app opens on the felt piano, whole: its voicing, its room, and
-    /// nothing trimmed on top. It is a *different instrument* (it carries a
-    /// construction-time design override), so the caller has to build it —
-    /// which is what `preset_needs_rebuild` is asked here to prove.
+    /// The app opens on the shipped physical piano — the instrument the user
+    /// approved — with its own room and nothing trimmed on top.
     #[test]
-    fn the_default_sound_is_the_felt_piano() {
+    fn the_default_sound_is_the_shipped_physical_piano() {
         let settings = SoundSettings::default();
-        assert_eq!(preset_name(settings.preset), DEFAULT_PRESET);
-        assert_eq!(settings.preset, default_preset_index());
-        assert!(settings.matches_preset());
-        assert_eq!(settings.diverged().count(), 0);
-        assert!(settings.preset_needs_rebuild());
+        assert_eq!(settings.engine, ScoreEngine::Physical);
+        assert_eq!(settings.preset, 0);
+        assert_eq!(settings.voicing, PIANO_PRESETS[0].voicing);
+        assert_eq!(settings.room.preset, PIANO_PRESETS[0].room);
+        assert_eq!(settings.room.mix, PIANO_PRESETS[0].reverb_mix);
+        // Flat: the brightness shelf is bypassed at 0 dB, so the default is
+        // the instrument itself and not the instrument through an EQ.
+        assert_eq!(settings.eq_shelf_db, 0.0);
+        assert_eq!(settings.eq_bell_db, 0.0);
+        assert_eq!(settings.tone_bass_db, 0.0);
+        assert_eq!(settings.tone_treble_db, 0.0);
+        assert_eq!(settings.master_gain, 1.0);
     }
 
-    /// Preferences store a name, so the shipped list may grow or be reordered
-    /// without moving anyone's instrument; an unknown name has no index at all
-    /// rather than resolving to whatever now sits at that position.
+    /// The whole model: two instruments, each naming the engine that plays
+    /// it, each with something to say about itself.
     #[test]
-    fn presets_resolve_by_name_and_unknown_names_do_not() {
-        for (index, preset) in PIANO_PRESETS.iter().enumerate() {
-            assert_eq!(preset_index_by_name(preset.name), Some(index));
+    fn the_list_is_two_instruments() {
+        let list = instrument_list();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, InstrumentId::Acoustic(0));
+        assert_eq!(list[0].id.engine(), ScoreEngine::Physical);
+        assert_eq!(list[1].id, InstrumentId::Electric(0));
+        assert_eq!(list[1].id.engine(), ScoreEngine::Learned);
+        for entry in &list {
+            assert!(!entry.name.is_empty());
+            assert!(!entry.description.is_empty());
         }
-        assert_eq!(preset_index_by_name("Harpsichord From Another App"), None);
-        assert_eq!(preset_index_by_name(DEFAULT_PRESET), Some(default_preset_index()));
     }
 
-    /// Picking a preset must set the whole sound — voicing *and* the room it
-    /// suggests — and leave every slider free to move afterwards.
+    /// Preferences store a name, so a list that grows or is reordered never
+    /// silently changes anyone's instrument.
     #[test]
-    fn a_preset_sets_voicing_and_room_together_and_divergence_is_visible() {
+    fn instruments_resolve_by_name_and_unknown_names_do_not() {
+        for (index, preset) in PIANO_PRESETS.iter().enumerate() {
+            assert_eq!(
+                preset_index_by_name(ScoreEngine::Physical, preset.name),
+                Some(index)
+            );
+        }
+        assert_eq!(
+            preset_index_by_name(ScoreEngine::Physical, "Harpsichord From Another App"),
+            None
+        );
+        assert_eq!(
+            preset_index_by_name(ScoreEngine::Learned, LEARNED_PRESETS[0].name),
+            Some(0)
+        );
+    }
+
+    /// Choosing the electric voice adopts its room; brightness is the
+    /// engineer's and survives the change.
+    #[test]
+    fn switching_instrument_takes_the_room_and_keeps_brightness() {
         let mut settings = SoundSettings::default();
-        let cathedral = PIANO_PRESETS
-            .iter()
-            .position(|preset| preset.name == "Cathedral Wash")
-            .expect("the shipped preset list has Cathedral Wash");
-        settings.apply_preset(cathedral);
-        assert_eq!(settings.voicing, preset(cathedral).voicing);
-        assert_eq!(settings.room.preset, preset(cathedral).room);
-        assert_eq!(settings.room.mix, preset(cathedral).reverb_mix);
-        assert!(settings.matches_preset());
-
-        SoundParam::Knock.set(&mut settings, 2.4);
-        assert!(!settings.matches_preset());
-        assert!(settings.is_diverged(SoundParam::Knock));
-        assert!(!settings.is_diverged(SoundParam::BodyTap));
-        assert_eq!(settings.diverged().collect::<Vec<_>>(), vec![SoundParam::Knock]);
+        SoundParam::Brightness.set(&mut settings, 4.0);
+        settings.engine = ScoreEngine::Learned;
+        settings.apply_preset(0);
+        assert_eq!(settings.room.preset, LEARNED_PRESETS[0].room);
+        assert_eq!(settings.room.mix, LEARNED_PRESETS[0].reverb_mix);
+        assert_eq!(settings.eq_shelf_db, 4.0);
+        assert_eq!(settings.eq_shelf_hz, BRIGHTNESS_HZ);
     }
 
-    /// The user's "all the dampers off" wash: sympathetic has to run well past
-    /// the reference level, not stop at it.
+    /// The centre of the brightness slider is exactly flat, so a reader who
+    /// moved it can put it back without typing a number.
     #[test]
-    fn the_sympathetic_slider_reaches_past_the_reference_level() {
-        let (min, max) = SoundParam::Sympathetic.range();
-        assert_eq!(min, 0.0);
-        assert_eq!(max, VOICING_MAX);
-        assert!(max > DAMPERS_LIFTING);
+    fn brightness_snaps_to_flat_at_the_centre_of_its_travel() {
         let mut settings = SoundSettings::default();
-        SoundParam::Sympathetic.set(&mut settings, 9.0);
-        assert_eq!(settings.voicing.sympathetic, VOICING_MAX);
-        // And a shipped preset already lives up there, so the range is real.
-        let lifted = PIANO_PRESETS
-            .iter()
-            .find(|preset| preset.name == "Dampers Lifted")
-            .expect("the shipped preset list has Dampers Lifted");
-        assert!(lifted.voicing.sympathetic > 2.0);
+        SoundParam::Brightness.set(&mut settings, SoundParam::Brightness.from_position(0.5));
+        assert_eq!(settings.eq_shelf_db, 0.0);
+        assert_eq!(SoundParam::Brightness.format(settings.eq_shelf_db), "+0.0 dB");
+        // And a real move is left alone.
+        SoundParam::Brightness.set(&mut settings, 4.5);
+        assert_eq!(settings.eq_shelf_db, 4.5);
     }
 
     #[test]
-    fn every_parameter_round_trips_through_its_slider_position() {
+    fn both_controls_round_trip_through_their_slider_position() {
         for param in SoundParam::ALL {
             let (min, max) = param.range();
             for step in 0..=20 {
@@ -535,7 +511,6 @@ mod tests {
                     "{param:?} at {position} came back as {back}"
                 );
             }
-            // Reading a live value and writing it back must not move it.
             let mut settings = SoundSettings::default();
             param.set(&mut settings, param.neutral());
             let held = param.get(&settings);
@@ -557,32 +532,155 @@ mod tests {
             assert!(param.get(&settings).is_finite());
         }
     }
+}
 
-    #[test]
-    fn effect_presets_are_named_as_effects_and_the_panel_can_say_so() {
-        let effects: Vec<&str> = (0..PIANO_PRESETS.len())
-            .filter(|index| preset_is_effect(*index))
-            .map(preset_name)
-            .collect();
-        assert!(effects.contains(&"Wire Cembalo"), "{effects:?}");
-        assert!(effects.contains(&"Toy Piano"), "{effects:?}");
-        assert!(effects.contains(&"Phantom Metal"), "{effects:?}");
-        // The stripped name never keeps the marker.
-        assert!(effects.iter().all(|name| !name.contains("effect")));
-        // And a plain preset is not marked.
-        assert!(!preset_is_effect(default_preset_index()));
+/// The claims the sound panel makes, checked against the engines themselves.
+#[cfg(test)]
+mod engine_truth {
+    use super::*;
+    use makepad_piano_model::{learned::PianoEngine, PianoEvent, TimedEvent};
+
+    const RATE: f32 = 48_000.0;
+    const TAIL: usize = 24_000;
+
+    fn build_for_test(engine: ScoreEngine, preset: &PianoPreset) -> PianoEngine {
+        match engine {
+            ScoreEngine::Hybrid => {
+                let mut piano = makepad_piano_model::Piano::new_with_preset(RATE, preset);
+                crate::hybrid::apply_targets(&mut piano);
+                PianoEngine::Physical(Box::new(piano))
+            }
+            other => PianoEngine::new(other.kind(), RATE, preset),
+        }
     }
 
-    /// Every preset in the shipped list has to be reachable and describable.
+    fn peak_difference(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// One note through a freshly built engine, with the published settings
+    /// applied the way the audio thread applies them.
+    fn voice(id: InstrumentId, tweak: impl FnOnce(&mut SoundSettings)) -> Vec<f32> {
+        let engine = id.engine();
+        let index = match id {
+            InstrumentId::Acoustic(index) | InstrumentId::Electric(index) => index,
+        };
+        let mut settings = SoundSettings {
+            engine,
+            ..SoundSettings::default()
+        };
+        settings.apply_preset(index);
+        tweak(&mut settings);
+        let mut piano = build_for_test(engine, build_preset(engine, index));
+        piano.set_voicing(settings.voicing);
+        piano.set_reverb_preset(settings.room.preset);
+        piano.set_reverb_mix(settings.room.mix);
+        piano.set_eq_shelf(settings.eq_shelf_db, settings.eq_shelf_hz);
+        piano.set_eq_bell(settings.eq_bell_hz, settings.eq_bell_db, settings.eq_bell_q);
+        piano.set_tone(settings.tone_bass_db, settings.tone_treble_db);
+        let events = [TimedEvent {
+            offset: 0,
+            event: PianoEvent::NoteOn {
+                key: 60,
+                velocity: 96,
+            },
+        }];
+        let (mut left, mut right) = (vec![0.0f32; TAIL], vec![0.0f32; TAIL]);
+        piano.process(&events, &mut left, &mut right);
+        left
+    }
+
+    /// Brightness is one control over BOTH instruments — that is why it is a
+    /// shelf and not the model's felt hardness, which the learned engine has
+    /// no equivalent of. Measured on each, not assumed.
     #[test]
-    fn every_shipped_preset_has_a_name_and_a_description() {
-        assert!(PIANO_PRESETS.len() >= 20);
-        for index in 0..PIANO_PRESETS.len() {
-            assert!(!preset_name(index).is_empty());
-            assert!(!preset(index).description.is_empty());
-            let settings = SoundSettings::from_preset(index, RoomSettings::default());
-            assert_eq!(settings.preset, index);
-            assert!(settings.matches_preset());
+    #[cfg_attr(debug_assertions, ignore = "renders four takes; run with --release")]
+    fn brightness_reaches_both_instruments_and_is_flat_at_zero() {
+        for id in [InstrumentId::Acoustic(0), InstrumentId::Electric(0)] {
+            let flat = voice(id, |_| {});
+            let bright = voice(id, |s| SoundParam::Brightness.set(s, 9.0));
+            let dull = voice(id, |s| SoundParam::Brightness.set(s, -9.0));
+            assert!(
+                peak_difference(&flat, &bright) > 1.0e-3,
+                "{id:?}: brightness must bite upward"
+            );
+            assert!(
+                peak_difference(&flat, &dull) > 1.0e-3,
+                "{id:?}: brightness must bite downward"
+            );
+            // And the default is the bare instrument: the shelf is bypassed
+            // at 0 dB, so a take at 0 dB is the take with no EQ at all.
+            let untouched = voice(id, |s| s.eq_shelf_db = 0.0);
+            assert_eq!(
+                peak_difference(&flat, &untouched),
+                0.0,
+                "{id:?}: 0 dB brightness is not a bypass"
+            );
         }
+    }
+
+    /// THE approved instrument, sample for sample.
+    ///
+    /// The user approved the physical model at its shipped default, and this
+    /// application must not quietly become a different piano. So: render the
+    /// bare instrument, then render it again through the whole published
+    /// settings path the audio thread uses (`PlaybackBridge::set_sound` ->
+    /// `apply_sound`), and require the two to be BIT-IDENTICAL. Any control
+    /// whose default is not a true no-op — a shelf that filters at 0 dB, a
+    /// tone stage that is not bypassed flat, a gain that is not unity —
+    /// fails here rather than in someone's ears.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "renders two takes; run with --release")]
+    fn the_default_settings_are_the_bare_instrument() {
+        let settings = SoundSettings::default();
+        assert_eq!(settings.engine, ScoreEngine::Physical);
+        let events = [TimedEvent {
+            offset: 0,
+            event: PianoEvent::NoteOn {
+                key: 60,
+                velocity: 96,
+            },
+        }];
+
+        // The instrument as `makepad_piano_model` builds it, untouched.
+        let mut bare = makepad_piano_model::Piano::new_with_preset(
+            RATE,
+            build_preset(ScoreEngine::Physical, settings.preset),
+        );
+        let (mut bl, mut br) = (vec![0.0f32; TAIL], vec![0.0f32; TAIL]);
+        bare.process(&events, &mut bl, &mut br);
+
+        // The same instrument with the app's default settings published onto
+        // it, in the order the audio thread applies them.
+        let mut played = makepad_piano_model::Piano::new_with_preset(
+            RATE,
+            build_preset(ScoreEngine::Physical, settings.preset),
+        );
+        played.set_reverb_preset(settings.room.preset);
+        played.set_reverb_mix(settings.room.mix);
+        played.set_perspective(settings.room.perspective);
+        played.set_early_reflection_level(settings.early_reflections);
+        played.set_voicing(settings.voicing);
+        played.set_eq_shelf(settings.eq_shelf_db, settings.eq_shelf_hz);
+        played.set_eq_bell(settings.eq_bell_hz, settings.eq_bell_db, settings.eq_bell_q);
+        played.set_tone(settings.tone_bass_db, settings.tone_treble_db);
+        played.set_master_gain(settings.master_gain);
+        let (mut pl, mut pr) = (vec![0.0f32; TAIL], vec![0.0f32; TAIL]);
+        played.process(&events, &mut pl, &mut pr);
+
+        assert_eq!(bl, pl, "the default settings changed the left channel");
+        assert_eq!(br, pr, "the default settings changed the right channel");
+    }
+
+    /// The two instruments are two instruments, not one name twice.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "renders two takes; run with --release")]
+    fn the_two_instruments_are_audibly_different() {
+        let acoustic = voice(InstrumentId::Acoustic(0), |s| s.room.mix = 0.0);
+        let electric = voice(InstrumentId::Electric(0), |s| s.room.mix = 0.0);
+        assert!(peak_difference(&acoustic, &electric) > 1.0e-3);
     }
 }

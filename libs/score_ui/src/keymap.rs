@@ -1,9 +1,19 @@
-use crate::{ProductMode, ScoreAction};
+use crate::{ProductMode, ScoreAction, ScoreTool};
 use makepad_widgets::*;
 
 /// Stable, discoverable product keymap. Bare note-entry keys are active only
 /// in editor mode; global transport/navigation remains useful in pianist mode.
-pub fn action_for_key(event: &KeyEvent, mode: ProductMode, text_focused: bool) -> Option<ScoreAction> {
+///
+/// `tool` gates the operations that change music. Transpose and delete are
+/// real edits, so they answer to the keyboard only where a pointer could have
+/// made them too: never under Navigate, which is the mode the application
+/// rests in.
+pub fn action_for_key(
+    event: &KeyEvent,
+    mode: ProductMode,
+    tool: ScoreTool,
+    text_focused: bool,
+) -> Option<ScoreAction> {
     let m = event.modifiers;
     if event.is_repeat && event.key_code != KeyCode::ArrowLeft && event.key_code != KeyCode::ArrowRight {
         return None;
@@ -33,6 +43,33 @@ pub fn action_for_key(event: &KeyEvent, mode: ProductMode, text_focused: bool) -
     }
     if text_focused {
         return None;
+    }
+    // The tools. Single keys, in the conventional spirit: H is the hand that
+    // moves the page, V the arrow that chooses, N the one that writes notes.
+    // They work in either product mode — arming an editing tool is itself the
+    // request to leave the reading face.
+    match event.key_code {
+        KeyCode::KeyH => return Some(ScoreAction::SetTool(ScoreTool::Navigate)),
+        KeyCode::KeyV => return Some(ScoreAction::SetTool(ScoreTool::Select)),
+        KeyCode::KeyN => return Some(ScoreAction::SetTool(ScoreTool::Edit)),
+        _ => {}
+    }
+    // Transpose and delete operate on the selection. They are edits, so the
+    // safe tool does not answer to them: Navigate can never change the music,
+    // by pointer or by key.
+    if mode == ProductMode::Editor && tool != ScoreTool::Navigate {
+        match event.key_code {
+            KeyCode::ArrowUp => {
+                return Some(ScoreAction::Transpose(if m.shift { 12 } else { 1 }))
+            }
+            KeyCode::ArrowDown => {
+                return Some(ScoreAction::Transpose(if m.shift { -12 } else { -1 }))
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                return Some(ScoreAction::DeleteSelection)
+            }
+            _ => {}
+        }
     }
     match event.key_code {
         KeyCode::F1 => Some(ScoreAction::OpenDialog(crate::DialogKind::Keymap)),
@@ -75,7 +112,10 @@ pub const KEYMAP_ROWS: &[(&str, &str)] = &[
     ("M", "Metronome"),
     ("L", "Practice loop"),
     ("F", "Follow playback cursor (⇧F in editor)"),
-    ("Escape", "Close dialog, then tool, then selection"),
+    ("H / V / N", "Navigate / select / edit tool"),
+    ("↑ / ↓", "Transpose selection a semitone (⇧ an octave)"),
+    ("Delete", "Delete the selection"),
+    ("Escape", "Back to Navigate, then clear the selection"),
     ("⌘E", "Pianist / editor mode"),
     ("⌘N", "New score"),
     ("⌘O", "Open…"),
@@ -104,9 +144,9 @@ mod tests {
             modifiers: KeyModifiers::default(),
             time: 0.0,
         };
-        assert!(action_for_key(&event, ProductMode::Pianist, false).is_none());
+        assert!(action_for_key(&event, ProductMode::Pianist, ScoreTool::Edit, false).is_none());
         assert!(matches!(
-            action_for_key(&event, ProductMode::Editor, false),
+            action_for_key(&event, ProductMode::Editor, ScoreTool::Edit, false),
             Some(ScoreAction::EnterPitch('C'))
         ));
     }
@@ -136,6 +176,9 @@ mod tests {
             ("M", key(KeyCode::KeyM, false, false), ProductMode::Pianist),
             ("L", key(KeyCode::KeyL, false, false), ProductMode::Pianist),
             ("F", key(KeyCode::KeyF, false, false), ProductMode::Pianist),
+            ("H / V / N", key(KeyCode::KeyH, false, false), ProductMode::Pianist),
+            ("↑ / ↓", key(KeyCode::ArrowUp, false, false), ProductMode::Editor),
+            ("Delete", key(KeyCode::Backspace, false, false), ProductMode::Editor),
             ("Escape", key(KeyCode::Escape, false, false), ProductMode::Pianist),
             ("⌘E", key(KeyCode::KeyE, false, true), ProductMode::Pianist),
             ("⌘N", key(KeyCode::KeyN, false, true), ProductMode::Pianist),
@@ -158,10 +201,75 @@ mod tests {
                 KEYMAP_ROWS.iter().any(|(key, _)| key == label),
                 "{label} is dispatched but missing from the keymap dialog"
             );
+            // Every row is checked under the tool it is documented for; the
+            // editing rows are the two that need one armed.
+            let tool = if *mode == ProductMode::Editor {
+                ScoreTool::Edit
+            } else {
+                ScoreTool::Navigate
+            };
             assert!(
-                action_for_key(event, *mode, false).is_some(),
+                action_for_key(event, *mode, tool, false).is_some(),
                 "the keymap dialog shows {label}, but nothing is bound to it"
             );
+        }
+    }
+
+    /// The whole point of the tool split: the mode the application rests in
+    /// cannot change the music, by pointer OR by key.
+    #[test]
+    fn navigate_answers_to_nothing_that_changes_the_music() {
+        for code in [KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::Backspace, KeyCode::Delete] {
+            let event = key(code, false, false);
+            let under_navigate =
+                action_for_key(&event, ProductMode::Editor, ScoreTool::Navigate, false);
+            assert!(
+                !matches!(
+                    under_navigate,
+                    Some(ScoreAction::Transpose(_)) | Some(ScoreAction::DeleteSelection)
+                ),
+                "{code:?} must not edit under the Navigate tool, got {under_navigate:?}"
+            );
+        }
+        // With a tool armed they are exactly the operations they promise.
+        let up = key(KeyCode::ArrowUp, false, false);
+        assert!(matches!(
+            action_for_key(&up, ProductMode::Editor, ScoreTool::Select, false),
+            Some(ScoreAction::Transpose(1))
+        ));
+        let octave = key(KeyCode::ArrowUp, true, false);
+        assert!(matches!(
+            action_for_key(&octave, ProductMode::Editor, ScoreTool::Select, false),
+            Some(ScoreAction::Transpose(12))
+        ));
+        let down = key(KeyCode::ArrowDown, true, false);
+        assert!(matches!(
+            action_for_key(&down, ProductMode::Editor, ScoreTool::Edit, false),
+            Some(ScoreAction::Transpose(-12))
+        ));
+        // Pianist mode is the reading face and never edits, tool or no tool.
+        assert!(!matches!(
+            action_for_key(&up, ProductMode::Pianist, ScoreTool::Edit, false),
+            Some(ScoreAction::Transpose(_))
+        ));
+    }
+
+    /// The tool keys are one press away from anywhere, including the reading
+    /// face — being stuck in a tool is worse than the accident it prevents.
+    #[test]
+    fn the_tool_keys_reach_every_tool_from_either_mode() {
+        for mode in [ProductMode::Pianist, ProductMode::Editor] {
+            for (code, tool) in [
+                (KeyCode::KeyH, ScoreTool::Navigate),
+                (KeyCode::KeyV, ScoreTool::Select),
+                (KeyCode::KeyN, ScoreTool::Edit),
+            ] {
+                let action = action_for_key(&key(code, false, false), mode, ScoreTool::Edit, false);
+                assert!(
+                    matches!(action, Some(ScoreAction::SetTool(armed)) if armed == tool),
+                    "{code:?} in {mode:?} armed {action:?}"
+                );
+            }
         }
     }
 }

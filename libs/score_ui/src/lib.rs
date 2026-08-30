@@ -8,6 +8,7 @@ pub use makepad_widgets;
 
 pub mod action;
 pub mod document;
+pub mod hybrid;
 pub mod engrave;
 pub mod font;
 pub mod keymap;

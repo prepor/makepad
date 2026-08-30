@@ -485,6 +485,7 @@ impl ScoreCanvas {
             state.ui.fit_all = false;
             state.ui.zoom = fit_all_zoom(rect, count, state.ui.page_layout);
             state.ui.glide.active = false;
+        state.ui.zooming = true;
             fit_all = true;
         }
         let doc = doc_layout(rect, count, state.ui.page_layout, state.ui.zoom);
@@ -656,11 +657,13 @@ impl ScoreCanvas {
             // Somebody with a stronger claim moved the zoom — a menu, a key,
             // Fit page. The ease stands down rather than dragging it back.
             self.zoom_ease.active = false;
+            state.ui.zooming = false;
             return;
         }
         let (next, arrived) = zoom_ease_step(state.ui.zoom, self.zoom_ease.target, dt);
         if arrived {
             self.zoom_ease.active = false;
+            state.ui.zooming = false;
         }
         let anchor = self.zoom_ease.anchor;
         self.apply_zoom(cx, state, anchor, next);
@@ -1329,6 +1332,13 @@ impl Widget for ScoreCanvas {
                 self.keep_animating(cx);
             }
             Hit::FingerScroll(scroll) => {
+                // A dialog is drawn OVER the paper, and hit testing by area
+                // does not know that: a wheel notch over a list would reach
+                // the page underneath and zoom it. Whatever is on top owns
+                // the wheel.
+                if state.ui.dialog != crate::DialogKind::None {
+                    return;
+                }
                 // Scrolling zooms, about the pointer, the way every map and
                 // document viewer works. Pages are reached by dragging the
                 // paper, the scrollbars, the click zones, the keys and the

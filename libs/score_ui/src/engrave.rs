@@ -1523,6 +1523,7 @@ pub(crate) mod tests {
                 duration: Some(Duration::new(note.duration.0, note.duration.1).unwrap()),
                 grace: None,
                 kind: EventKind::Chord(vec![Note {
+                    performance: None,
                     id,
                     written_pitch: Some(Pitch::new(note.step, Alter::NATURAL, note.octave)),
                     unpitched_sound: None,

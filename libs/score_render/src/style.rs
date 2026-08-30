@@ -112,6 +112,10 @@ pub struct ScorePalette {
     /// Selection, annotation and hover are *washes*: they are composited under
     /// the notation, once, so the ink they mark stays fully readable through
     /// them. Their alpha is the finished tint, never a per-copy value to stack.
+    ///
+    /// Selection is Makepad's orange. A cool blue wash under black notation on
+    /// cream paper is nearly invisible — the paper is warm, so a warm mark has
+    /// to be read against hue as well as value, and the blue lost both.
     pub selection: LinearRgba,
     pub annotation: LinearRgba,
     /// The note the pointer is on, which the app is also sounding. Warm and
@@ -131,7 +135,7 @@ impl ScorePalette {
             secondary_ink: LinearRgba::from_srgb8(0x4A, 0x49, 0x43, 0xE8),
             playback_cursor: LinearRgba::from_srgb8(0xC8, 0x6B, 0x4A, 0xFF),
             playback_wash: LinearRgba::from_srgb8(0xC8, 0x6B, 0x4A, 0x0D),
-            selection: LinearRgba::from_srgb8(0x4B, 0x8F, 0xD8, 0x3A),
+            selection: LinearRgba::from_srgb8(0xFF, 0x80, 0x00, 0x4A),
             annotation: LinearRgba::from_srgb8(0xD4, 0x91, 0x3B, 0x32),
             hover: LinearRgba::from_srgb8(0x3F, 0x7C, 0x6A, 0x24),
         }
@@ -148,7 +152,7 @@ impl ScorePalette {
             secondary_ink: LinearRgba::from_srgb8(0xA8, 0xA4, 0x9B, 0xE0),
             playback_cursor: LinearRgba::from_srgb8(0xE0, 0x82, 0x5F, 0xFF),
             playback_wash: LinearRgba::from_srgb8(0xE0, 0x82, 0x5F, 0x10),
-            selection: LinearRgba::from_srgb8(0x70, 0xAE, 0xEA, 0x42),
+            selection: LinearRgba::from_srgb8(0xFF, 0x94, 0x33, 0x4E),
             annotation: LinearRgba::from_srgb8(0xE0, 0xA6, 0x52, 0x3C),
             hover: LinearRgba::from_srgb8(0x86, 0xC9, 0xB2, 0x2C),
         }

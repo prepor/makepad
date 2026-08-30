@@ -95,6 +95,9 @@ pub struct ScoreUiState {
     /// Ask the canvas for the zoom that holds the whole document. The zoom is
     /// geometry the canvas owns, so the request travels rather than the value.
     pub fit_all: bool,
+    /// A zoom gesture, or the ease that finishes one, is in flight. The
+    /// playback follow stands down while it is: see `sync_follow_page`.
+    pub zooming: bool,
     pub selection: SelectionState,
     pub hover: Option<SemanticId>,
     pub caret: Option<SemanticId>,
@@ -141,6 +144,7 @@ impl Default for ScoreUiState {
             glide: PageGlide::default(),
             recentre: true,
             fit_all: false,
+            zooming: false,
             selection: SelectionState::default(),
             hover: None,
             caret: None,
@@ -302,6 +306,9 @@ pub struct ScoreAppState {
     pub library: MusicLibrary,
     /// Which page of the library list the browser is showing.
     pub library_page: usize,
+    /// Who played the open piece, when it is somebody's performance. Shown in
+    /// About and on the status line; `None` for an engraving.
+    pub performance_credit: Option<&'static str>,
     midi_input: MidiInput,
     midi_output: MidiOutput,
     midi_ready: bool,
@@ -356,6 +363,7 @@ impl Default for ScoreAppState {
             prefs,
             library,
             library_page: 0,
+            performance_credit: None,
             midi_input: MidiInput::default(),
             midi_output: MidiOutput::default(),
             midi_ready: false,
@@ -774,7 +782,11 @@ impl ScoreAppState {
         {
             self.ui.status = "Reached the end".into();
         }
-        if !self.practice.follow_cursor || !self.practice.playing {
+        // A reader who is zooming has taken hold of the view. The follow
+        // would re-centre the page under them on the very frames the zoom is
+        // holding a point still, and the two writing `pan` in turn is the
+        // wobble that only ever showed up during playback.
+        if !self.practice.follow_cursor || !self.practice.playing || self.ui.zooming {
             return;
         }
         let (position, _, _) = self.playback_overlay();
@@ -883,7 +895,7 @@ fn score_opening_tempo(score: &makepad_score::model::Score) -> Option<f64> {
 }
 
 /// How many library entries one page of the browser lists.
-pub const LIBRARY_PAGE: usize = 40;
+pub const LIBRARY_PAGE: usize = 16;
 
 impl ScoreAppState {
     /// Hand the whole sound to the audio thread. One release store; the synth
@@ -940,13 +952,14 @@ impl ScoreAppState {
         self.sound.engine = engine;
         self.sound.apply_preset(index);
         self.ui.sound_focus = None;
-        // A different engine is a different instrument and goes over the
-        // crossfaded handoff, so switching mid-phrase dissolves rather than
-        // cutting. Within one engine nothing has to be built.
-        if engine != ScoreEngine::Physical {
-            self.playback
-                .rebuild_instrument(engine, sound::build_preset(engine, index));
-        }
+        // Every instrument is BUILT, the physical one included: its 88 key
+        // designs and modal banks are constructed from the preset just as the
+        // learned engine's network is. Skipping the build for one engine
+        // leaves the other one installed and still sounding, so the list moves
+        // and the ear does not. The handoff is crossfaded, so switching
+        // mid-phrase dissolves rather than cuts.
+        self.playback
+            .rebuild_instrument(engine, sound::build_preset(engine, index));
         self.publish_sound();
         // The instrument is a choice, so it outlives the session.
         self.prefs.engine = crate::prefs::engine_name(engine).to_string();
@@ -1431,11 +1444,34 @@ pub fn apply_score_action(cx: &mut Cx, state: &mut ScoreAppState, action: &Score
         ScoreAction::OpenLibraryEntry(row) => {
             let index = state.library_page * LIBRARY_PAGE + row;
             if let Some(entry) = state.library.entries().get(index) {
-                let (path, line) = (entry.path.clone(), entry.line());
-                let opened = apply_score_action(cx, state, &ScoreAction::OpenPath(path));
-                // Say what was picked, not what the file titles itself.
+                let line = entry.line();
+                let opened = match entry.source.clone() {
+                    // A piece the binary carries opens from its own bytes;
+                    // there is no file to name.
+                    crate::library::EntrySource::Bundled {
+                        bytes,
+                        extension,
+                        credit,
+                        attribution,
+                    } => {
+                        let title = entry.title.clone();
+                        let opened =
+                            state.open_bundled_score(cx, bytes, extension, &title, credit);
+                        state.performance_credit = attribution;
+                        opened
+                    }
+                    crate::library::EntrySource::File => {
+                        let path = entry.path.clone();
+                        apply_score_action(cx, state, &ScoreAction::OpenPath(path))
+                    }
+                };
+                // Say what was picked, not what the file titles itself — and
+                // who played it, when somebody did.
                 if state.ui.dialog_error.is_none() {
-                    state.ui.status = line;
+                    state.ui.status = match state.performance_credit {
+                        Some(credit) => format!("{line}   ·   {credit}"),
+                        None => line,
+                    };
                 }
                 return opened;
             }

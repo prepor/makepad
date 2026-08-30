@@ -1086,6 +1086,7 @@ impl ScoreDocument {
                 return Err(DocumentError::InvalidSelection);
             };
             notes.push(Note {
+                performance: None,
                 id: note_id,
                 written_pitch: Some(target.pitch),
                 unpitched_sound: None,
@@ -1693,6 +1694,7 @@ fn demo_score(measure_count: usize) -> Result<(Score, u64, LayerId), DocumentErr
             );
             if let EventKind::Chord(notes) = &mut event.kind {
                 notes.push(Note {
+                    performance: None,
                     id: fifth_id,
                     written_pitch: Some(pitch_from_midi(root.saturating_add(7))),
                     unpitched_sound: None,
@@ -1766,6 +1768,7 @@ fn note_event(
         duration: Some(duration),
         grace: None,
         kind: EventKind::Chord(vec![Note {
+            performance: None,
             id: note,
             written_pitch: Some(pitch),
             unpitched_sound: None,

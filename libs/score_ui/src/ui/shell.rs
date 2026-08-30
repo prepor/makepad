@@ -135,6 +135,33 @@ script_mod! {
                 left_panel := ScorePanel{
                     visible: false
                     width: score.panel_width
+                    ScorePanelHeader{
+                        ScoreHeader{text: "MUSIC"}
+                        Filler{}
+                        music_folder := ScoreButtonFlat{text: "Folder…"}
+                    }
+                    music_list := ScrollYView{
+                        width: Fill height: 244 flow: Down
+                        music_0 := ScoreMenuRow{text: ""}
+                        music_1 := ScoreMenuRow{text: ""}
+                        music_2 := ScoreMenuRow{text: ""}
+                        music_3 := ScoreMenuRow{text: ""}
+                        music_4 := ScoreMenuRow{text: ""}
+                        music_5 := ScoreMenuRow{text: ""}
+                        music_6 := ScoreMenuRow{text: ""}
+                        music_7 := ScoreMenuRow{text: ""}
+                        music_8 := ScoreMenuRow{text: ""}
+                        music_9 := ScoreMenuRow{text: ""}
+                        music_10 := ScoreMenuRow{text: ""}
+                        music_11 := ScoreMenuRow{text: ""}
+                        music_12 := ScoreMenuRow{text: ""}
+                        music_13 := ScoreMenuRow{text: ""}
+                        music_14 := ScoreMenuRow{text: ""}
+                        music_15 := ScoreMenuRow{text: ""}
+                    }
+                    music_empty := ScoreLabelWrap{visible: false text: ""}
+                    music_credit := ScoreLabelMuted{text: ""}
+                    ScoreDivider{}
                     panel_parts_header := ScorePanelHeader{
                         ScoreHeader{text: "PARTS & INSTRUMENTS"}
                         Filler{}
@@ -534,58 +561,7 @@ script_mod! {
                             library_browse := ScoreButton{text: "Browse…"}
                             library_rescan := ScoreButton{text: "Rescan"}
                         }
-                        View{
-                            width: Fill height: Fit flow: Right spacing: 6 align: Align{y: 0.5}
-                            library_summary := ScoreLabelMuted{text: ""}
-                            Filler{}
-                            library_prev := ScoreButtonFlat{text: "‹"}
-                            library_page_label := ScoreLabelMuted{text: ""}
-                            library_next := ScoreButtonFlat{text: "›"}
-                        }
-                        library_empty := ScoreLabelWrap{visible: false text: ""}
-                        library_list := ScrollYView{
-                            width: Fill height: 392 flow: Down
-                            lib_0 := ScoreMenuRow{text: ""}
-                            lib_1 := ScoreMenuRow{text: ""}
-                            lib_2 := ScoreMenuRow{text: ""}
-                            lib_3 := ScoreMenuRow{text: ""}
-                            lib_4 := ScoreMenuRow{text: ""}
-                            lib_5 := ScoreMenuRow{text: ""}
-                            lib_6 := ScoreMenuRow{text: ""}
-                            lib_7 := ScoreMenuRow{text: ""}
-                            lib_8 := ScoreMenuRow{text: ""}
-                            lib_9 := ScoreMenuRow{text: ""}
-                            lib_10 := ScoreMenuRow{text: ""}
-                            lib_11 := ScoreMenuRow{text: ""}
-                            lib_12 := ScoreMenuRow{text: ""}
-                            lib_13 := ScoreMenuRow{text: ""}
-                            lib_14 := ScoreMenuRow{text: ""}
-                            lib_15 := ScoreMenuRow{text: ""}
-                            lib_16 := ScoreMenuRow{text: ""}
-                            lib_17 := ScoreMenuRow{text: ""}
-                            lib_18 := ScoreMenuRow{text: ""}
-                            lib_19 := ScoreMenuRow{text: ""}
-                            lib_20 := ScoreMenuRow{text: ""}
-                            lib_21 := ScoreMenuRow{text: ""}
-                            lib_22 := ScoreMenuRow{text: ""}
-                            lib_23 := ScoreMenuRow{text: ""}
-                            lib_24 := ScoreMenuRow{text: ""}
-                            lib_25 := ScoreMenuRow{text: ""}
-                            lib_26 := ScoreMenuRow{text: ""}
-                            lib_27 := ScoreMenuRow{text: ""}
-                            lib_28 := ScoreMenuRow{text: ""}
-                            lib_29 := ScoreMenuRow{text: ""}
-                            lib_30 := ScoreMenuRow{text: ""}
-                            lib_31 := ScoreMenuRow{text: ""}
-                            lib_32 := ScoreMenuRow{text: ""}
-                            lib_33 := ScoreMenuRow{text: ""}
-                            lib_34 := ScoreMenuRow{text: ""}
-                            lib_35 := ScoreMenuRow{text: ""}
-                            lib_36 := ScoreMenuRow{text: ""}
-                            lib_37 := ScoreMenuRow{text: ""}
-                            lib_38 := ScoreMenuRow{text: ""}
-                            lib_39 := ScoreMenuRow{text: ""}
-                        }
+                        library_summary := ScoreLabelMuted{text: ""}
                     }
 
                     dialog_text := View{
@@ -1144,16 +1120,20 @@ impl ScoreShell {
         self.view
             .label(cx, ids!(library_summary))
             .set_text(cx, &state.library.summary());
-        // An empty folder gets a sentence, not a tall empty box.
+        // An empty shelf gets a sentence, not a tall empty box.
         let listed = !state.library.entries().is_empty();
-        self.view.view(cx, ids!(library_list)).set_visible(cx, listed);
+        self.view.view(cx, ids!(music_list)).set_visible(cx, listed);
         match state.library.empty_state() {
             Some(explanation) => {
-                self.view.label(cx, ids!(library_empty)).set_visible(cx, true);
-                self.view.label(cx, ids!(library_empty)).set_text(cx, explanation);
+                self.view.label(cx, ids!(music_empty)).set_visible(cx, true);
+                self.view.label(cx, ids!(music_empty)).set_text(cx, explanation);
             }
-            None => self.view.label(cx, ids!(library_empty)).set_visible(cx, false),
+            None => self.view.label(cx, ids!(music_empty)).set_visible(cx, false),
         }
+        self.view.label(cx, ids!(music_credit)).set_text(
+            cx,
+            state.performance_credit.unwrap_or_default(),
+        );
         let open_path = state.document.path();
         let visible = state.library_visible();
         for (row, path) in LIBRARY_ROWS.iter().enumerate() {
@@ -1185,25 +1165,6 @@ impl ScoreShell {
                 None => self.view.button(cx, path).set_visible(cx, false),
             }
         }
-        let pages = state.library_last_page() + 1;
-        let paged = pages > 1;
-        for path in [ids!(library_prev), ids!(library_next)] {
-            self.view.button(cx, path).set_visible(cx, paged);
-        }
-        self.view.label(cx, ids!(library_page_label)).set_text(
-            cx,
-            &if paged {
-                format!("page {} / {pages}", state.library_page + 1)
-            } else {
-                String::new()
-            },
-        );
-        self.view
-            .button(cx, ids!(library_prev))
-            .set_enabled(cx, state.library_page > 0);
-        self.view
-            .button(cx, ids!(library_next))
-            .set_enabled(cx, state.library_page + 1 < pages);
     }
 
     /// The whole sound panel: two instruments, brightness, and the room.
@@ -1414,7 +1375,10 @@ impl ScoreShell {
                 if state.parts.len() == 1 { "" } else { "s" }
             ),
             format!("Audio · {}", state.midi_status()),
-            "F1 shows the keyboard map. Escape closes any dialog.".to_string(),
+            state.performance_credit.map_or_else(
+                || "F1 shows the keyboard map. Escape closes any dialog.".to_string(),
+                |credit| credit.to_string(),
+            ),
         ];
         for (index, line) in lines.iter().enumerate() {
             self.view.label(cx, about_row(index)).set_text(cx, line);
@@ -1440,14 +1404,11 @@ const SOUND_SLIDERS: &[&[LiveId]] = ids_array!(sl_brightness, sl_reverb,);
 const SOUND_SLIDER_NAMES: &[&[LiveId]] = ids_array!(sl_brightness_name, sl_reverb_name,);
 const SOUND_SLIDER_VALUES: &[&[LiveId]] = ids_array!(sl_brightness_value, sl_reverb_value,);
 
-/// One row per listed library entry; the browser pages when a folder holds
-/// more than this.
+/// One row per listed piece, in the sidebar. The list pages when a chosen
+/// folder holds more than this; the shipped shelf never does.
 const LIBRARY_ROWS: &[&[LiveId]] = ids_array!(
-    lib_0, lib_1, lib_2, lib_3, lib_4, lib_5, lib_6, lib_7,
-    lib_8, lib_9, lib_10, lib_11, lib_12, lib_13, lib_14, lib_15,
-    lib_16, lib_17, lib_18, lib_19, lib_20, lib_21, lib_22, lib_23,
-    lib_24, lib_25, lib_26, lib_27, lib_28, lib_29, lib_30, lib_31,
-    lib_32, lib_33, lib_34, lib_35, lib_36, lib_37, lib_38, lib_39,
+    music_0, music_1, music_2, music_3, music_4, music_5, music_6, music_7,
+    music_8, music_9, music_10, music_11, music_12, music_13, music_14, music_15,
 );
 
 fn recent_row(index: usize) -> &'static [LiveId] {
@@ -1742,10 +1703,10 @@ impl Widget for ScoreShell {
             self.emit_button(cx, actions, path, ScoreAction::OpenLibraryEntry(row));
         }
         self.emit_button(cx, actions, ids!(library_rescan), ScoreAction::RescanLibrary);
-        self.emit_button(cx, actions, ids!(library_prev), ScoreAction::LibraryPage(-1));
-        self.emit_button(cx, actions, ids!(library_next), ScoreAction::LibraryPage(1));
-        if self.view.button(cx, ids!(library_browse)).clicked(actions) {
-            cx.action(ScoreAction::Browse(BrowseTarget::LibraryDirectory));
+        for path in [ids!(library_browse), ids!(music_folder)] {
+            if self.view.button(cx, path).clicked(actions) {
+                cx.action(ScoreAction::Browse(BrowseTarget::LibraryDirectory));
+            }
         }
         if self
             .view
@@ -1937,6 +1898,9 @@ impl Widget for ScoreShell {
             let editor = state.ui.mode == ProductMode::Editor && state.ui.chrome_visible;
             self.view.view(cx, ids!(editor_top)).set_visible(cx, editor);
             self.view.view(cx, ids!(left_panel)).set_visible(cx, editor);
+            // The music shelf lives in the sidebar, so it is drawn every frame
+            // rather than only while a dialog is open.
+            self.sync_library(cx, state);
             self.view.view(cx, ids!(right_panel)).set_visible(cx, editor);
             self.view.view(cx, ids!(editor_transport)).set_visible(cx, editor);
             self.view.view(cx, ids!(status_bar)).set_visible(cx, editor);
@@ -1993,6 +1957,12 @@ impl Widget for ScoreShell {
                 );
             }
             let (_, _, quarter) = state.playback_overlay();
+            // The bar spans THIS piece. A fixed range put the marker at a
+            // fraction of the wrong whole: bar 60 of a 60-bar prelude sat a
+            // fifth of the way along, disagreeing with the page.
+            let end = state.playback.end_quarter();
+            let mut scrub = self.view.slider(cx, ids!(transport_scrub));
+            script_apply_eval!(cx, scrub, { max: #(end) });
             self.view.slider(cx, ids!(transport_scrub)).set_value(cx, quarter);
             let bar = (quarter / 4.0).floor() as usize + 1;
             let beat = (quarter.rem_euclid(4.0)).floor() as usize + 1;

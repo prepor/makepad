@@ -29,7 +29,7 @@ script_mod! {
         color_accent: #xc86b4a
         color_accent_hover: #xda7d5a
         color_accent_dim: #x704331
-        color_selection: #x4b8fd8
+        color_selection: #xff8000
         color_annotation: #xd4913b
         color_ok: #x6da77b
         color_warning: #xd2a445

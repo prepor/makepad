@@ -18,13 +18,31 @@ use std::path::{Path, PathBuf};
 /// Extensions the app can actually open (see `document::ScoreLoader`).
 const PLAYABLE: [&str; 6] = ["mid", "midi", "musicxml", "mxl", "xml", "mpscore"];
 
-/// The development corpus, relative to a checkout root. Present only in a
-/// working tree; the library is perfectly useful without it.
-const CORPUS_RELATIVE: &str = "local/score-corpus/midi/classical";
+/// Where an entry's bytes come from.
+///
+/// The library is a folder of files, but the application also carries a few
+/// public-domain pieces inside the binary so a fresh install has real music to
+/// play before anyone has pointed it at a folder. Those have no path, so the
+/// browser cannot open them by one — the bytes travel with the entry instead.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntrySource {
+    /// A file on disk, at `LibraryEntry::path`.
+    File,
+    /// A piece compiled into the binary: its bytes and the extension that says
+    /// how to read them.
+    Bundled {
+        bytes: &'static [u8],
+        extension: &'static str,
+        credit: &'static str,
+        /// See [`BundledPiece::attribution`].
+        attribution: Option<&'static str>,
+    },
+}
 
 /// One playable file in the library folder.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LibraryEntry {
+    pub source: EntrySource,
     pub path: PathBuf,
     /// From the file name's leading token, when it has one.
     pub composer: String,
@@ -64,6 +82,9 @@ pub fn format_duration(seconds: f64) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct MusicLibrary {
     dir: Option<PathBuf>,
+    /// The pieces that ship inside the binary. They head every listing, so a
+    /// fresh install is never an empty shelf.
+    bundled: Vec<LibraryEntry>,
     entries: Vec<LibraryEntry>,
     /// Why the folder produced nothing, when that is worth saying.
     problem: Option<String>,
@@ -77,10 +98,21 @@ impl MusicLibrary {
     pub fn new(dir: Option<&Path>) -> Self {
         Self {
             dir: dir.map(Path::to_path_buf).or_else(default_library_dir),
+            bundled: Vec::new(),
             entries: Vec::new(),
             problem: None,
             scanned: false,
         }
+    }
+
+    /// Install the pieces the application carries. They are listed first and
+    /// survive every rescan, so pointing the library at a folder adds to the
+    /// shelf rather than replacing it.
+    pub fn set_bundled(&mut self, pieces: &[BundledPiece]) {
+        self.bundled = pieces.iter().map(BundledPiece::entry).collect();
+        // The shelf is visible from the first frame now that it lives in the
+        // sidebar, so it is filled here rather than on first open.
+        self.rescan();
     }
 
     /// Scan on first use. Never fails: an unreadable folder is an empty
@@ -114,6 +146,7 @@ impl MusicLibrary {
 
     pub fn rescan(&mut self) {
         self.entries.clear();
+        self.entries.extend(self.bundled.iter().cloned());
         self.problem = None;
         self.scanned = true;
         let Some(dir) = self.dir.clone() else {
@@ -136,9 +169,9 @@ impl MusicLibrary {
             .filter(|path| path.is_file() && is_playable(path))
             .collect();
         paths.sort();
-        self.entries = paths.into_iter().map(describe).collect();
+        self.entries.extend(paths.into_iter().map(describe));
         resolve_duplicate_titles(&mut self.entries);
-        if self.entries.is_empty() {
+        if self.entries.len() == self.bundled.len() {
             self.problem = Some(format!(
                 "No scores in {} — the browser lists .mid, .musicxml and .{} files.",
                 dir.display(),
@@ -185,6 +218,11 @@ impl MusicLibrary {
 /// line, or a recents entry), so a plain `==` misses the match that puts the
 /// "now playing" mark on the right row.
 pub fn same_file(a: &Path, b: &Path) -> bool {
+    // A bundled entry has no path at all, and two of those are not the same
+    // piece just because neither came from disk.
+    if a.as_os_str().is_empty() || b.as_os_str().is_empty() {
+        return false;
+    }
     if a == b {
         return true;
     }
@@ -201,22 +239,15 @@ pub fn is_playable(path: &Path) -> bool {
         .is_some_and(|value| PLAYABLE.contains(&value.as_str()))
 }
 
-/// The development corpus, if this build is being run from a checkout that has
-/// one. Absent everywhere else, which is the point of the preference.
+/// A folder named deliberately, and nothing else.
+///
+/// This used to hunt for a development corpus in the enclosing checkout, which
+/// meant the shelf silently filled with whatever happened to be lying around
+/// beside the binary. The shipped pieces are the shelf; anything else is a
+/// folder somebody chose.
 pub fn default_library_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("MAKEPAD_SCORE_LIBRARY").map(PathBuf::from) {
-        if dir.is_dir() {
-            return Some(dir);
-        }
-    }
-    let cwd = std::env::current_dir().ok()?;
-    for base in cwd.ancestors() {
-        let candidate = base.join(CORPUS_RELATIVE);
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-    }
-    None
+    let dir = std::env::var_os("MAKEPAD_SCORE_LIBRARY").map(PathBuf::from)?;
+    dir.is_dir().then_some(dir)
 }
 
 /// How long a title may be before the row starts to run off its own width.
@@ -239,11 +270,51 @@ fn describe(path: PathBuf) -> LibraryEntry {
         .map(|name| shorten(&drop_leading_composer(&name, &composer)))
         .unwrap_or_else(|| from_name.clone());
     LibraryEntry {
+        source: EntrySource::File,
         path,
         composer,
         title,
         from_name,
         seconds: meta.seconds,
+    }
+}
+
+/// A piece the application carries, as the browser lists it.
+///
+/// Every one of these is public domain at the source — score and MIDI
+/// rendering both — which is what lets them live inside a permissively
+/// licensed binary with no attribution or share-alike obligation attached.
+pub struct BundledPiece {
+    pub composer: &'static str,
+    pub title: &'static str,
+    pub credit: &'static str,
+    /// Who played it and under what licence, when the piece is somebody's
+    /// PERFORMANCE rather than an engraving. Carried with the piece so the
+    /// credit cannot drift away from the thing it credits: it is shown on the
+    /// status line when the piece opens, and listed in About.
+    pub attribution: Option<&'static str>,
+    pub extension: &'static str,
+    pub bytes: &'static [u8],
+}
+
+impl BundledPiece {
+    /// The entry the browser lists, with the playing time read from the MIDI
+    /// the same way a scanned file's is.
+    pub fn entry(&self) -> LibraryEntry {
+        let meta = midi_metadata(self.bytes);
+        LibraryEntry {
+            source: EntrySource::Bundled {
+                bytes: self.bytes,
+                extension: self.extension,
+                credit: self.credit,
+                attribution: self.attribution,
+            },
+            path: PathBuf::new(),
+            composer: self.composer.to_string(),
+            title: self.title.to_string(),
+            from_name: self.title.to_string(),
+            seconds: meta.seconds,
+        }
     }
 }
 
@@ -618,6 +689,7 @@ mod tests {
     #[test]
     fn a_title_two_files_share_falls_back_to_the_file_names() {
         let entry = |name: &str, title: &str| LibraryEntry {
+            source: EntrySource::File,
             path: PathBuf::from(format!("/music/{name}.mid")),
             composer: "Debussy".to_string(),
             title: title.to_string(),

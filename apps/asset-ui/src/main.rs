@@ -5023,7 +5023,17 @@ impl App {
             if let Some(job) = running {
                 let pct = (job.progress.unwrap_or(0.0) * 100.0).round() as u32;
                 let what = job.model.clone().unwrap_or_else(|| "job".to_string());
-                let stage = job.stage.clone().unwrap_or_else(|| job.state.clone());
+                let mut stage = job.stage.clone().unwrap_or_else(|| job.state.clone());
+                // A chat turn asks for "unlimited tokens" (u32::MAX) and the
+                // box's stage echoes it — "decode 48/4294967295" is noise.
+                // Show the count alone when the cap is plainly boundless.
+                if let Some(rest) = stage.strip_prefix("decode ") {
+                    if let Some((k, n)) = rest.split_once('/') {
+                        if n.trim().parse::<u64>().map_or(false, |n| n > 100_000_000) {
+                            stage = format!("decode {} tok", k.trim());
+                        }
+                    }
+                }
                 let more = pending.saturating_sub(1);
                 let tail = if more > 0 { format!(" +{more} queued") } else { String::new() };
                 return (format!("{what} · {stage} {pct}%{tail}"), BUSY);

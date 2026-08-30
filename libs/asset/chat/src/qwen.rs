@@ -772,6 +772,11 @@ fn job_status_note(status: &Value) -> Option<(String, u16)> {
         "running" if is_active_load(&stage_l, permille) => {
             format!("loading{what} {pct}%", pct = permille / 10)
         }
+        // The wait the user cannot otherwise attribute: the box reading the
+        // conversation back in. Named and percented, or it reads as a hang.
+        "running" if stage_l.starts_with("prefill") => {
+            format!("preloading the conversation {pct}%", pct = permille / 10)
+        }
         _ => return None,
     };
     Some((note, permille))

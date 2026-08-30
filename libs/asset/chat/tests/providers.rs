@@ -562,7 +562,17 @@ fn qwen_ignores_cached_download_and_token_stages() {
         .unwrap();
     assert!(p.poll().is_empty(), "cached download 100% must stay silent");
     assert!(p.poll().is_empty(), "load 0% must stay silent");
-    assert!(p.poll().is_empty(), "prefill must stay silent");
+    // Prefill SPEAKS now — the user asked for the preload percentage: the
+    // conversation being read back in was the one wait the meter could not
+    // explain, and it read as a hang.
+    let events = p.poll();
+    match events.as_slice() {
+        [ProviderEvent::Status { note, permille }] => {
+            assert_eq!(note, "preloading the conversation 2%");
+            assert_eq!(*permille, 20);
+        }
+        other => panic!("expected one preloading status: {other:?}"),
+    }
 }
 
 #[test]

@@ -4610,6 +4610,15 @@ extern "C" cudaError_t mkllm_fattn_mma_f16(
     if (gqa_ratio % 4 == 0) {
         return mkllm_fattn_mma_launch<16, 4>(MKLLM_FATTN_MMA_ARGS);
     }
+    if (gqa_ratio % 2 == 0) {
+        // The rung llama.cpp's switch_ncols2 ladder has and this port was
+        // missing: ncols2 = 2 serves every even ratio the bigger tiles
+        // cannot, and Qwen3.8-27B is 24 heads over 4 KV heads — ratio 6.
+        // Without it the caller's gate sent that model to the generic
+        // FlashDecode kernel: measured 11-20x slower past 8k context, flat
+        // 85-91 tok/s restored with the tile.
+        return mkllm_fattn_mma_launch<32, 2>(MKLLM_FATTN_MMA_ARGS);
+    }
     return cudaErrorInvalidValue;
 #undef MKLLM_FATTN_MMA_ARGS
 }

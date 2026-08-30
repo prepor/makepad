@@ -1357,7 +1357,7 @@ fn select_kernel(tensors: &[Tensor], t: &Tensor) -> Result<KernelSel> {
                     && !(gqa > 4 && k.ne[1] >= 8192)
                 {
                     KernelSel::FlashVec
-                } else if gqa % 4 == 0 {
+                } else if gqa % 2 == 0 {
                     // llama.cpp fattn.cu get_best_fattn_kernel: for D=256 on
                     // Turing+ everything that is not the n_q==1 VEC case goes
                     // to MMA_F16. The old `q.ne[1] >= 20` threshold sent two
@@ -1376,6 +1376,13 @@ fn select_kernel(tensors: &[Tensor], t: &Tensor) -> Result<KernelSel> {
                     // of exactly 4 gets MMA too. That is the whole of the
                     // Chandra 2 / Qwen3.5-9B prefill: 16 heads over 4 KV
                     // heads, 84% of it in the generic kernel at ~1.1 TFLOPS.
+                    //
+                    // And the 32x2 tile serves every remaining EVEN ratio —
+                    // `gqa % 4 == 0` here was the widening for 16/4 that
+                    // narrowed the gate away from Qwen3.8-27B (24 heads over
+                    // 4, ratio 6): its every prefill chunk and long-context
+                    // decode step fell to FlashDecode, measured 11-20x
+                    // slower past 8k tokens with word-identical output.
                     KernelSel::FlashMma
                 } else {
                     KernelSel::FlashDecode

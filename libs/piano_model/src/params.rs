@@ -126,6 +126,42 @@ design_params! {
     /// split table reaches; multipliers are raised to this power over the
     /// top ~2 octaves (1.0 = off)
     wein_top = 0.5058585298767448,
+    /// Bridge-coupling prompt loss (1/s): the extra decay of the unison
+    /// normal modes that actually PUMP the bridge, scaled per partial by
+    /// the bridge-admittance proxy (soundboard::bridge_admittance_proxy)
+    /// and per member by how bridge-coupled that member is (in-phase /
+    /// vertical: full; anti-phase / horizontal: bridge_couple_leak).
+    /// This is the structural piece the fixed Weinreich multipliers could
+    /// not express: two-exponential fits of the reference bass show a
+    /// prompt stage at sigma 8..50/s varying irregularly from partial to
+    /// partial over an aftersound at 0.3..0.9/s, where the model rendered
+    /// a smooth single decay at 0.6..1.9/s on nearly every bass partial —
+    /// the plucked-harp signature. Tapered (1-t)^bridge_couple_taper so
+    /// the approved mid/treble balance keeps riding the existing split.
+    /// Scale = the prompt sigma (1/s) a median-admittance bass partial's
+    /// coupled member gets; keys.rs squares and caps the proxy so
+    /// admittance peaks reach ~5x this (the Salamander fits show prompt
+    /// 6..34/s on the strongly coupled partials) while valleys drop to
+    /// the floor (many real bass partials show almost no prompt stage).
+    bridge_couple = 16.0,
+    /// admittance floor: even off-resonance partials couple somewhat
+    bridge_couple_floor = 0.06,
+    /// compass taper exponent on (1-t)
+    bridge_couple_taper = 1.5,
+    /// share of the coupling loss reaching the weakly coupled members
+    bridge_couple_leak = 0.015,
+    /// Energy migration into the weakly coupled members, as drive share:
+    /// in the real two-way coupled system the in-phase mode's energy
+    /// leaks into the aftersound modes during the prompt stage
+    /// (Weinreich); one-directional modal banks cannot transfer it, so
+    /// the drive that WOULD have migrated is handed to the slow members
+    /// at note-on. Share = min(0.55, bridge_mig * coupling sigma): the
+    /// harder a partial drains, the more of it survives as aftersound —
+    /// the Salamander fits show exactly that (the strongly draining
+    /// partials' amplitude is mostly in the slow stage, Af/As deeply
+    /// negative, while the model without this had Af/As positive
+    /// everywhere).
+    bridge_mig = 0.02,
     /// input-weight bias between unison normal modes: the hammer strikes
     /// the strings IN PHASE, so the fast in-phase normal mode receives
     /// nearly all the drive and the slow anti-phase modes only the

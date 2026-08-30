@@ -266,7 +266,18 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
     // Weinreich decay split between unison normal modes; the split collapses
     // toward the treble where short stiff unisons lock together and the
     // aftersound effect is weak.
-    let base_mult: [f64; 3] = if n_osc == 2 { [1.45, 0.62, 1.0] } else { [1.55, 0.85, 0.5] };
+    // Two POLARISATIONS of one string couple far more weakly than two
+    // strings through the bridge: the Salamander singles (A0..F#1) decay
+    // gently (~2-4 dB/s whole-band, no prompt knee) where its doubled
+    // keys show 5-10 dB knees. Singles get a mild polarisation split;
+    // real unison pairs keep the full Weinreich split.
+    let base_mult: [f64; 3] = if n_strings == 1 {
+        [1.18, 0.85, 1.0]
+    } else if n_osc == 2 {
+        [1.45, 0.62, 1.0]
+    } else {
+        [1.55, 0.85, 0.5]
+    };
     let spread = (1.0 - p.wein_treble * t) * p.wein;
     // Clamped: a large split scale must never drive a multiplier to zero or
     // negative (negative sigma = a growing mode). The contrast exponent
@@ -279,6 +290,24 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         (1.0 + (base_mult[2] - 1.0) * spread).max(0.05).powf(top_x),
     ];
     let osc_level = 1.0 / n_osc as f64;
+    // How bridge-coupled each unison/polarisation normal mode is: the
+    // in-phase (or vertical) member pumps the bridge and takes the full
+    // admittance-dependent coupling loss; the anti-phase / horizontal
+    // members barely move it and keep their energy as aftersound. Ordered
+    // to match base_mult's fast..slow members.
+    let couple_share: [f64; 3] = if n_osc == 2 {
+        [1.0, p.bridge_couple_leak, 0.0]
+    } else {
+        [1.0, 0.45, p.bridge_couple_leak]
+    };
+    // Two-string normal-mode splitting needs two strings: the Salamander
+    // staircase envelopes show the big prompt knee on the doubled wound
+    // keys (C2: -9.5 dB in the first half second, then ~1.6 dB/s) while
+    // the singles decay gently with no knee (A0: ~4 dB/s throughout).
+    // A single string only has the weaker polarisation version.
+    let couple_amt = p.bridge_couple
+        * (1.0 - t).powf(p.bridge_couple_taper)
+        * if n_strings == 1 { 0.03 } else { 1.0 };
     // in-phase-biased drive weights (see params.wein_inw)
     let mut in_w = [1.0f64; 3];
     if p.wein_inw != 0.0 {
@@ -333,12 +362,31 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
             // makes the wound loss itself member-dependent (heavy in the
             // fast in-phase mode, light in the aftersound modes).
             let wound = p.a1_wound * (1.0 - t).powi(3);
-            let sigma = ((sigma_fund
+            // Partial-dependent bridge-coupling prompt loss (see
+            // params::bridge_couple): the admittance proxy is squared and
+            // capped so partials landing on board resonances get ~5x the
+            // median coupling (measured prompt sigma 6..34/s in the
+            // Salamander bass) while off-resonance partials keep almost
+            // none — the irregular partial-to-partial double-decay
+            // structure a fixed member multiplier cannot express.
+            let (couple, mig) = if couple_amt > 0.0 {
+                let y = crate::soundboard::bridge_admittance_proxy(fn_hz, p);
+                let shape = p.bridge_couple_floor
+                    + (1.0 - p.bridge_couple_floor) * (y * y).min(5.0);
+                let c_fast = couple_amt * shape;
+                // drive share migrating to the slow members (see
+                // params::bridge_mig)
+                (c_fast * couple_share[osc], (p.bridge_mig * c_fast).min(0.55))
+            } else {
+                (0.0, 0.0)
+            };
+            let sigma = (((sigma_fund
                 + wound * (fk - f0k)
                 + a2 * (fk * fk - f0k * f0k)
                 + p.a4 * (fk.powi(4) - f0k.powi(4)))
             .max(0.15)
                 * smult)
+                + couple)
                 .min(400.0);
             let r = (-sigma * dt).exp();
             let theta = core::f64::consts::TAU * fn_hz * dt;
@@ -350,9 +398,34 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
             // comb dips have a floor: wide felt contact, wandering contact
             // point, non-rigid termination (sign kept; +1 at exact zeros)
             let filled = (s * s + p.comb_fill * p.comb_fill).sqrt();
-            gin[m] = (in_w[osc] * if s < 0.0 { -filled } else { filled }) as f32;
+            // migration rebalance (params::bridge_mig): the fast member
+            // hands `mig` of its drive AMPLITUDE to the slow members on
+            // strongly bridge-coupled partials
+            let w_mig = if osc == 0 {
+                in_w[osc] * (1.0 - mig)
+            } else {
+                in_w[osc] + mig * in_w[0] / (n_osc - 1).max(1) as f64
+            };
+            gin[m] = (w_mig * if s < 0.0 { -filled } else { filled }) as f32;
             let sign = if n % 2 == 1 { 1.0 } else { -1.0 };
-            gout[m] = (sign * osc_level * tension * n as f64 / (mu * length * length * fn_hz * sample_rate)) as f32;
+            // Radiated-fraction boost: the coupling loss IS energy leaving
+            // through the bridge — a mode with high bridge admittance
+            // radiates STRONGLY while it lasts, it does not merely die
+            // quickly (Woodhouse: the fast mode dominates the prompt
+            // sound). Without this the coupling only deleted energy and
+            // sustained level fell across the board. Amplitude-domain
+            // sqrt of the loss ratio, capped at 2x; the per-key voicing
+            // normalisation below re-levels the key, so this
+            // redistributes level toward the prompt stage rather than
+            // adding any.
+            let sig_intr = ((sigma - couple) / smult).max(0.15) * smult;
+            let rad_boost = ((sigma / sig_intr.max(1e-6)).sqrt()).min(2.0);
+            gout[m] = (sign
+                * rad_boost
+                * osc_level
+                * tension
+                * n as f64
+                / (mu * length * length * fn_hz * sample_rate)) as f32;
         }
     }
 

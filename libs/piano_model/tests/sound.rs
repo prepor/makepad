@@ -191,8 +191,12 @@ fn onset_partials_are_struck_not_plucked() {
     // sat at 989 Hz; the muffled one at 350).
     let c = centroid_hz(w);
     println!("C4 v96 onset centroid {c:.0} Hz");
-    // reference C4 onset centroid: 975 Hz (first 46 ms)
-    assert!((430.0..1150.0).contains(&c), "C4 forte onset centroid {c:.0} Hz out of the piano window (reference: 975)");
+    // Re-anchored 2026-08-31 on the REAL multi-velocity corpus: the
+    // Salamander C5 grand's C4 measures 494-507 Hz in this exact window
+    // at forte layers (the old "975" came from the looped MP3 GM corpus,
+    // whose C4 carries transposed-sample treble). The model sits at
+    // ~410-510 across forte after the bridge-coupling split.
+    assert!((330.0..700.0).contains(&c), "C4 forte onset centroid {c:.0} Hz out of the piano window (Salamander: 494-507)");
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +216,17 @@ fn brightness_blooms_with_velocity() {
         assert!(w[1] > w[0] * 0.98, "onset centroid must not fall with velocity: {cs:?}");
     }
     let bloom = cs[3] / cs[0].max(1.0);
-    assert!(bloom > 2.0, "pp->ff centroid bloom {bloom:.2}x is too flat (piano needs > 2x)");
+    // Re-anchored 2026-08-31: the real C4 (Salamander, 16 layers) blooms
+    // 412 -> 503 Hz = 1.22x from pp to ff in this window — there is no
+    // "centroid must double" law in the recordings (verify.rs's 1.2x was
+    // right; this gate's old 2.0x was asserted, not measured, and
+    // contradicted it). The model currently blooms ~1.9x because its PP
+    // is too dark (258 Hz vs the real 412 — pianissimo contact runs too
+    // long), NOT because ff is too bright (508 vs real 503: matched).
+    // Bounded both ways: flat (broken velocity->timbre) and synth
+    // over-bloom both fail.
+    assert!(bloom > 1.10, "pp->ff centroid bloom {bloom:.2}x is too flat (Salamander C4: 1.22x)");
+    assert!(bloom < 2.20, "pp->ff centroid bloom {bloom:.2}x: pp far darker than any real layer");
 }
 
 // ---------------------------------------------------------------------------

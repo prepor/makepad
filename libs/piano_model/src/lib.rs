@@ -43,7 +43,7 @@ pub mod simd;
 pub mod modal;
 pub mod params;
 mod hammer;
-mod keys;
+pub mod keys;
 mod voice;
 mod sympathetic;
 mod soundboard;
@@ -126,7 +126,15 @@ pub trait Instrument {
 /// just into the soft saturator (which then acts as the mastering limiter
 /// every commercial piano recording goes through), and a pp note stays
 /// ~20 dB under a ff one.
-const MASTER_GAIN: f32 = 0.25;
+/// 0.32, re-anchored 2026-08-31: the bridge-coupling split gave notes
+/// their real prompt/aftersound structure (the Salamander C4 falls 25 dB
+/// in the first second and then holds), which honestly lowered the
+/// sustained RMS of median material by ~3-4 dB; the median-performance
+/// operating point is a product calibration, so the master comes up to
+/// keep it, and the faster note drain means flat-forte material engages
+/// the limiter/knee LESS at equal master than the old sustained decay
+/// did.
+const MASTER_GAIN: f32 = 0.32;
 
 /// A voice whose 64-sample bridge-force energy stays below this for ~16 ms
 /// is put to sleep (and its state zeroed, keeping wake-ups deterministic).
@@ -775,6 +783,14 @@ impl Piano {
         let v = &mut self.voices[i];
         let eng = v.eng;
         v.rebuild(k, eng);
+    }
+
+    /// Read-only view of the per-key design tables (diagnostics/verification:
+    /// lets offline tooling compare the designed per-partial decay structure
+    /// with two-exponential fits of reference recordings).
+    #[doc(hidden)]
+    pub fn keys_debug(&self) -> &[keys::KeyDesign] {
+        &self.keys
     }
 
     /// Full state reset (voices, pedals, resonance, effects, clock).

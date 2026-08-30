@@ -278,6 +278,12 @@ fn shape_partials_hook_scales_gain_and_decay() {
     let xf = render_mono(&mut fast);
     let late = 20.0 * (dft(&xf, f0, 0.8) / dft(&xb, f0, 0.8)).log10();
     let onset = 20.0 * (dft(&xf, f0, 0.05) / dft(&xb, f0, 0.05)).log10();
-    assert!(late < -4.0, "doubled sigma only moved the 0.8 s level {late:.1} dB");
+    // -2.5, not -4: since the bridge-coupling split landed, the C4
+    // fundamental's 0.8 s level is carried almost entirely by the slow
+    // (aftersound) member at sigma ~0.3 — doubling every member's sigma
+    // therefore moves 0.8 s by ~8.7*0.3*0.8 ~ 2-3 dB, not the 4+ the old
+    // fast/slow mix gave. The hook still visibly scales decay, which is
+    // what this mechanism test pins.
+    assert!(late < -2.5, "doubled sigma only moved the 0.8 s level {late:.1} dB");
     assert!(onset > -3.0, "doubled sigma should barely touch the onset, moved {onset:.1} dB");
 }

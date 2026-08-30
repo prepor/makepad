@@ -87,6 +87,73 @@ pub fn radiativity(f: f64, p: &DesignParams) -> f64 {
     hp1 * hp2 * lp * body * res
 }
 
+/// Normalised bridge-admittance proxy: how strongly the bridge moves (and
+/// therefore drains a string mode) at `f`, relative to the band median.
+/// Built from the SAME mode lattice as the modal board (same frequencies,
+/// same dampings, same deterministic jitter), summed as Lorentzians. This
+/// is what makes the unison/polarisation decay split PARTIAL-dependent:
+/// a partial that lands on a board resonance sees high admittance — a
+/// fast, strongly radiated prompt decay — while a partial between
+/// resonances stores its energy as aftersound. Two-exponential fits of
+/// the reference bass recordings show exactly this irregular
+/// partial-to-partial structure (prompt sigma 8..50/s on some partials,
+/// nearly none on others), which no fixed per-oscillator multiplier can
+/// express (Woodhouse's double-decay picture; see keys.rs).
+/// Returns ~0.2..2.5, median ~1 over 40..1200 Hz. Deterministic, cheap,
+/// construction-time only.
+pub fn bridge_admittance_proxy(f: f64, p: &DesignParams) -> f64 {
+    // NOT the radiating lattice above: that one is deliberately DENSE and
+    // extra-damped at the bottom (to radiate smoothly), which makes its
+    // Lorentzian sum uniformly high below ~150 Hz — the opposite of a
+    // real bridge, whose first modes are sparse, distinct resonances
+    // (5-10 below 200 Hz, Q ~20-30; the Salamander C2 fundamental RINGS
+    // at sigma ~0.5 while A0's second partial 10 Hz away drains at ~30).
+    // So the admittance proxy carries its own sparse resonant lattice:
+    // ~1.13 ratio from 48 Hz, Q ~22 narrowing the peaks, widths growing
+    // toward the kHz range where real modal overlap smooths the curve.
+    fn raw(f: f64, p: &DesignParams) -> f64 {
+        let _ = p;
+        let mut acc = 0.0;
+        let mut m = 0u32;
+        loop {
+            // ratio 1.19 from 48 Hz, light jitter: the low mode placement
+            // is chosen deliberately — the Salamander fits show WHICH
+            // partials of the bottom octaves ring versus drain on a real
+            // instrument (A1's and C2's fundamentals ring; C1's third
+            // partial and C2's fifth drain hard), and this spacing
+            // reproduces that assignment (57, 68, 96, 162, 325 Hz land
+            // on/near drains, 55 and 65 in valleys).
+            let base = 48.0 * 1.19f64.powi(m as i32);
+            // fixed placement below 300 Hz (each low mode's position
+            // decides which bass fundamentals ring — a lottery jitter
+            // there put a drain on A1's fundamental); scattered above,
+            // where partial density makes individual placement anonymous
+            let jitter = if base < 300.0 { 1.0 } else { 0.96 + 0.08 * hash01(m * 3 + 1) as f64 };
+            let fm = base * jitter;
+            if fm > 4.0 * f + 600.0 || fm > 20000.0 {
+                break;
+            }
+            // per-mode strength scatter: real bridge admittance peaks
+            // vary several dB mode to mode
+            let w = 0.5 + 1.0 * hash01(m * 7 + 5) as f64;
+            let hw = fm / 44.0 * (1.0 + fm / 1500.0); // half-width (Hz)
+            acc += w * hw * hw / ((f - fm) * (f - fm) + hw * hw);
+            m += 1;
+        }
+        acc
+    }
+    // normalise by the band median so the coupling scale in params.rs is
+    // a plain 1/s number at a typical partial
+    let mut med = [0.0f64; 25];
+    for (i, slot) in med.iter_mut().enumerate() {
+        let g = 40.0 * (1200.0f64 / 40.0).powf(i as f64 / 24.0);
+        *slot = raw(g, p);
+    }
+    med.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let norm = med[12].max(1e-6);
+    raw(f, p) / norm
+}
+
 pub struct Soundboard {
     // Region banks concatenated: region r occupies [r*n .. (r+1)*n).
     zr: Vec<f32>,

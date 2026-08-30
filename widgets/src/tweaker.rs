@@ -612,10 +612,12 @@ pub fn window_intercept(
     window_view: &mut View,
     window_id: WindowId,
 ) -> bool {
-    // F12 toggles the mode — only while the remote bridge is live: the
-    // tweaker is a --remote feature and stays fully inert without it.
+    // F12 toggles the mode, bridge or no bridge: the design surface is
+    // in-process and owes the remote nothing. Only the HTTP endpoints and
+    // the AI vibecode loop need --remote; without it they simply are not
+    // there, and the panel still is.
     if let Event::KeyDown(key_event) = event {
-        if key_event.key_code == KeyCode::F12 && remote::is_active() {
+        if key_event.key_code == KeyCode::F12 {
             let flip = {
                 let mut s = session().lock().unwrap();
                 if s.toggle_event_id != cx.event_id() {

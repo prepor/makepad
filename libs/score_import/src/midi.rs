@@ -1908,6 +1908,11 @@ fn build_voice_events(
         };
         let note = Note {
             id: piece.note_id,
+            // How it was actually struck. Notation has nowhere to put a
+            // per-note velocity, so it rides hidden on the note and playback
+            // reads it back; without this every note of a performance is
+            // played at one manufactured dynamic.
+            performance: Some(NotePerformance { velocity: piece.velocity.max(1) }),
             written_pitch: Some(piece.pitch),
             unpitched_sound: None,
             display_staff: staff,
@@ -2284,6 +2289,30 @@ fn import_midi_maps(
                     },
                 });
                 report.imported("MIDI tempo changes");
+            }
+            // The sustain pedal. A performance without it is a performance
+            // with the dampers nailed down: the notes stop the instant the
+            // finger leaves, which is exactly what an engraving-derived
+            // playback sounds like. Notation has only a "Ped." span, so the
+            // controller's own positions ride in the map beside the tempo.
+            let mut pedal_moves = 0usize;
+            for track in &file.tracks {
+                for event in &track.events {
+                    let MidiEventKind::Channel(channel) = &event.kind else { continue };
+                    let makepad_midi_file::ChannelMessage::ControlChange { controller: 64, value } = channel.message
+                    else {
+                        continue;
+                    };
+                    score.maps.pedal.push(Change {
+                        at: tick_time(event.tick)?,
+                        scope: MapScope::Global,
+                        value: PedalLevel { value },
+                    });
+                    pedal_moves += 1;
+                }
+            }
+            if pedal_moves > 0 {
+                report.imported("MIDI sustain pedal");
             }
             for change in file.time_signature_map_for_sequence(sequence)?.changes {
                 if change.tick == 0 {

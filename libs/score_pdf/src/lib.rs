@@ -349,6 +349,7 @@ fn build_score(pages: &[RecognizedPage]) -> (Score, Vec<SemanticBinding>) {
                 );
                 score_note_ids.insert((page_index, note.id), note_id);
                 score_notes.push(Note {
+                    performance: None,
                     id: note_id,
                     written_pitch: note.pitch.as_ref().map(|pitch| pitch.value),
                     unpitched_sound: None,

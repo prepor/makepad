@@ -667,6 +667,7 @@ fn convert_note(
             };
             let (tab, notehead) = parse_note_details(note)?;
             model_note = Some(Note {
+                performance: None,
                 id: note_id,
                 written_pitch: Some(written),
                 unpitched_sound: None,
@@ -681,6 +682,7 @@ fn convert_note(
         Some(NoteKind::Unpitched(_)) => {
             let (tab, notehead) = parse_note_details(note)?;
             model_note = Some(Note {
+                performance: None,
                 id: note_id,
                 written_pitch: None,
                 unpitched_sound: note_ref

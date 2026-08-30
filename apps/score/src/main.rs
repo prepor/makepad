@@ -1,23 +1,115 @@
 //! Thin desktop frontend for `makepad-score-ui`.
 
+use score_ui::font::{set_embedded_music_font, EmbeddedFont};
+use score_ui::library::BundledPiece;
 use score_ui::{apply_score_action, key_action, ScoreAction, ScoreAppState};
 use makepad_widgets::*;
 use std::path::PathBuf;
 
 app_main!(App);
 
-/// The piece the application ships, so a fresh start has real music on the
-/// desk instead of a synthetic exercise: Mozart's Rondo alla Turca, the third
-/// movement of the Piano Sonata No. 11 in A major, K331.
+/// The performances the application carries.
 ///
-/// The engraving and this MIDI rendering of it are Mutopia's, published there
-/// as public domain — no attribution obligation and no share-alike, which is
-/// what makes it safe to carry inside a permissively licensed binary.
-const DEFAULT_SCORE: &[u8] = include_bytes!("../resources/mozart-k331-rondo-alla-turca.mid");
-const DEFAULT_SCORE_KIND: &str = "mid";
-const DEFAULT_SCORE_TITLE: &str = "Rondo alla Turca";
-const DEFAULT_SCORE_CREDIT: &str =
-    "Mozart · Rondo alla Turca · Piano Sonata No. 11 in A, K331, third movement";
+/// These are not engravings: they are somebody sitting down and playing, with
+/// their own dynamics, their own pedalling and their own rubato. That matters
+/// more than it sounds like it should — an engraving says which notes, and a
+/// modelled piano handed a page of identical velocities with the dampers
+/// nailed down plays it exactly as mechanically as that describes. The
+/// instrument only sounds like an instrument when it is given a performance.
+///
+/// Distributed unmodified under CC BY-SA 3.0; see
+/// `resources/performances/LICENSE-piano-midi-de.txt`. The ShareAlike term
+/// binds adaptations of these files and does not reach this application's own
+/// source. [`PERFORMER_CREDIT`] is shown whenever one of them is opened.
+/// The notation font the application carries.
+///
+/// Bravura, by Steinberg Media Technologies, under the SIL Open Font License
+/// 1.1 — see `resources/fonts/OFL.txt`, which travels with it. It is the
+/// reference SMuFL font, and it is embedded rather than looked up so that a
+/// fresh checkout draws real notation on its first run instead of falling back
+/// to the built-in outlines. `MAKEPAD_SCORE_MUSIC_FONT` still overrides it.
+fn embedded_music_font() -> EmbeddedFont {
+    EmbeddedFont {
+        name: "Bravura",
+        otf: include_bytes!("../resources/fonts/bravura.otf"),
+        metadata: Some(include_bytes!("../resources/fonts/bravura_metadata.json")),
+        glyphnames: Some(include_bytes!("../resources/fonts/glyphnames.json")),
+    }
+}
+
+const PERFORMER_CREDIT: &str = "Performed by Bernd Krueger · piano-midi.de · CC BY-SA 3.0";
+
+const PERFORMANCES: &[BundledPiece] = &[
+    BundledPiece {
+        composer: "Bach",
+        title: "Prelude No. 1 in C",
+        credit: "Bach · Prelude No. 1 in C, BWV 846 · The Well-Tempered Clavier, Book I",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/bach-wtc1-prelude1.mid"),
+    },
+    BundledPiece {
+        composer: "Beethoven",
+        title: "Moonlight Sonata",
+        credit: "Beethoven · Piano Sonata No. 14, Op. 27 No. 2 · first movement",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/beethoven-moonlight-1.mid"),
+    },
+    BundledPiece {
+        composer: "Beethoven",
+        title: "Für Elise",
+        credit: "Beethoven · Bagatelle in A minor, WoO 59",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/beethoven-fur-elise.mid"),
+    },
+    BundledPiece {
+        composer: "Debussy",
+        title: "Clair de lune",
+        credit: "Debussy · Clair de lune · Suite bergamasque, third movement",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/debussy-clair-de-lune.mid"),
+    },
+    BundledPiece {
+        composer: "Chopin",
+        title: "Nocturne in D flat",
+        credit: "Chopin · Nocturne in D flat major, Op. 27 No. 2",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/chopin-nocturne-op27-2.mid"),
+    },
+    BundledPiece {
+        composer: "Chopin",
+        title: "Raindrop Prelude",
+        credit: "Chopin · Prelude in D flat major, Op. 28 No. 15",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/chopin-raindrop-prelude.mid"),
+    },
+    BundledPiece {
+        composer: "Schumann",
+        title: "Träumerei",
+        credit: "Schumann · Träumerei · Kinderszenen, Op. 15 No. 7",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/schumann-traumerei.mid"),
+    },
+    BundledPiece {
+        composer: "Liszt",
+        title: "Liebestraum No. 3",
+        credit: "Liszt · Liebestraum No. 3 in A flat, S541",
+        attribution: Some(PERFORMER_CREDIT),
+        extension: "mid",
+        bytes: include_bytes!("../resources/performances/liszt-liebestraum.mid"),
+    },
+];
+
+/// Which piece is on the desk at launch: the Bach prelude, played. A performance
+/// is what introduces the instrument honestly.
+const DEFAULT_PIECE: usize = 0;
+
 
 script_mod! {
     use mod.prelude.score.*
@@ -74,13 +166,18 @@ impl App {
             self.dispatch(cx, &ScoreAction::OpenPath(path));
             return;
         }
+        let piece = &PERFORMANCES[DEFAULT_PIECE];
         self.state.open_bundled_score(
             cx,
-            DEFAULT_SCORE,
-            DEFAULT_SCORE_KIND,
-            DEFAULT_SCORE_TITLE,
-            DEFAULT_SCORE_CREDIT,
+            piece.bytes,
+            piece.extension,
+            piece.title,
+            piece.credit,
         );
+        self.state.performance_credit = piece.attribution;
+        if let Some(credit) = piece.attribution {
+            self.state.ui.status = format!("{}   ·   {credit}", piece.credit);
+        }
         self.ui.redraw(cx);
     }
 }
@@ -163,6 +260,11 @@ impl MatchEvent for App {
 
 impl AppMain for App {
     fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
+        // BEFORE anything engraves. The spacing pass asks for the music font
+        // the moment a document exists, and the application's own state builds
+        // one during construction — registering the built-in font in the first
+        // event would be a frame too late, and the font resolves exactly once.
+        set_embedded_music_font(embedded_music_font());
         makepad_widgets::script_mod(vm);
         score_ui::script_mod(vm);
         self::script_mod(vm)
@@ -172,6 +274,7 @@ impl AppMain for App {
         if !self.started && matches!(event, Event::Startup | Event::Draw(_)) {
             self.started = true;
             self.state.install_io(cx);
+            self.state.library.set_bundled(PERFORMANCES);
             self.open_initial_score(cx);
         }
         self.state.pump_midi();

@@ -180,6 +180,28 @@ pub fn music_font_summary() -> String {
     }
 }
 
+/// A music font compiled into the application, used when no file is found.
+///
+/// The search paths come first, so a reader who wants a different SMuFL font
+/// still gets one by pointing `MAKEPAD_SCORE_MUSIC_FONT` at it. This is the
+/// floor: an application that ships its notation font renders notation
+/// wherever it is run from, rather than only inside a checkout that happens to
+/// have the font lying beside it.
+static EMBEDDED: OnceLock<EmbeddedFont> = OnceLock::new();
+
+pub struct EmbeddedFont {
+    pub name: &'static str,
+    pub otf: &'static [u8],
+    pub metadata: Option<&'static [u8]>,
+    pub glyphnames: Option<&'static [u8]>,
+}
+
+/// Register the font the binary carries. Call before the first draw; later
+/// calls are ignored, because the font is resolved once.
+pub fn set_embedded_music_font(font: EmbeddedFont) {
+    let _ = EMBEDDED.set(font);
+}
+
 pub fn music_font() -> &'static MusicFont {
     static FONT: OnceLock<MusicFont> = OnceLock::new();
     FONT.get_or_init(|| {
@@ -243,22 +265,58 @@ fn load_music_font() -> MusicFont {
             }
         }
     }
+    if let Some(embedded) = EMBEDDED.get() {
+        match load_from_bytes(
+            embedded.otf,
+            embedded.metadata,
+            embedded.glyphnames,
+            &format!("{} (built in)", embedded.name),
+        ) {
+            Ok(font) => return font,
+            Err(reason) => println!("[score] built-in music font unusable: {reason}"),
+        }
+    }
     fallback_font()
 }
 
 fn load_from_file(path: &Path) -> Result<MusicFont, String> {
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    let face = ttf_parser::Face::parse(&bytes, 0).map_err(|error| error.to_string())?;
+    let registry = read_json(&metadata_candidates(path, "glyphnames.json"));
+    let metadata = read_json(&metadata_candidates(path, "metadata.json"));
+    load_font(
+        &bytes,
+        metadata.as_deref(),
+        registry.as_deref(),
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        &path.display().to_string(),
+    )
+}
+
+/// The same load, from bytes the binary carries rather than a file.
+fn load_from_bytes(
+    otf: &[u8],
+    metadata: Option<&[u8]>,
+    glyphnames: Option<&[u8]>,
+    source: &str,
+) -> Result<MusicFont, String> {
+    load_font(otf, metadata, glyphnames, Path::new("."), source)
+}
+
+fn load_font(
+    bytes: &[u8],
+    metadata_json: Option<&[u8]>,
+    glyphnames_json: Option<&[u8]>,
+    directory: &Path,
+    source: &str,
+) -> Result<MusicFont, String> {
+    let face = ttf_parser::Face::parse(bytes, 0).map_err(|error| error.to_string())?;
     let units_per_em = face.units_per_em();
     if units_per_em == 0 {
         return Err("font has a zero-sized em square".into());
     }
 
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let registry = read_json(&metadata_candidates(path, "glyphnames.json"))
-        .and_then(|bytes| GlyphRegistry::from_bytes(&bytes).ok());
-    let metadata = read_json(&metadata_candidates(path, "metadata.json"))
-        .and_then(|bytes| FontMetadata::from_bytes(&bytes).ok());
+    let registry = glyphnames_json.and_then(|bytes| GlyphRegistry::from_bytes(bytes).ok());
+    let metadata = metadata_json.and_then(|bytes| FontMetadata::from_bytes(bytes).ok());
 
     let mut outlines = BTreeMap::new();
     let mut metrics: BTreeMap<String, GlyphMetrics> = BTreeMap::new();
@@ -332,18 +390,12 @@ fn load_from_file(path: &Path) -> Result<MusicFont, String> {
     let font_name = metadata
         .as_ref()
         .and_then(|metadata| metadata.font_name.clone())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("music font")
-                .to_string()
-        });
+        .unwrap_or_else(|| "music font".to_string());
     let _ = directory;
     Ok(MusicFont {
         source: format!(
-            "{font_name} ({} glyphs, upem {units_per_em}) from {}{}",
+            "{font_name} ({} glyphs, upem {units_per_em}) from {source}{}",
             outlines.len(),
-            path.display(),
             if metadata.is_some() {
                 ""
             } else {

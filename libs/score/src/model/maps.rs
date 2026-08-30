@@ -94,6 +94,17 @@ pub struct GlobalMaps {
     pub tempo: Vec<Change<Tempo>>,
     pub time_signature: Vec<Change<Meter>>,
     pub key: Vec<Change<KeySignature>>,
+    /// The sustain pedal, as performed. Empty for an engraved score, which
+    /// says "Ped." over a span rather than giving the damper a position; a
+    /// score imported from a performance carries every pedal move here.
+    pub pedal: Vec<Change<PedalLevel>>,
+}
+
+/// Damper position, in the MIDI controller's own units: 0 is fully damped and
+/// 127 fully lifted, with everything between a half-pedal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, SerBin, DeBin)]
+pub struct PedalLevel {
+    pub value: u8,
 }
 
 impl GlobalMaps {
@@ -103,6 +114,7 @@ impl GlobalMaps {
         self.time_signature
             .sort_by_key(|change| (change.at, change.scope));
         self.key.sort_by_key(|change| (change.at, change.scope));
+        self.pedal.sort_by_key(|change| (change.at, change.scope));
     }
 
     pub fn meter_at(

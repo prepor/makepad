@@ -31,6 +31,7 @@ fn note_event(
         duration: Some(value),
         grace: None,
         kind: EventKind::Chord(vec![Note {
+            performance: None,
             id: id::<NoteTag>(note_counter),
             written_pitch: Some(written_pitch),
             unpitched_sound: None,

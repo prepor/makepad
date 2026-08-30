@@ -226,9 +226,26 @@ pub enum EventKind {
     FiguredBass(FiguredBass),
 }
 
+/// How a note was PLAYED, kept beside how it is written.
+///
+/// A score imported from a performance knows things the engraving cannot say:
+/// this note was struck at velocity 43 and that one at 96. Notation has no
+/// place to put that — a dynamic mark covers a phrase, not a note — so it
+/// rides here, hidden: nothing engraves it, nothing edits it, and a note that
+/// was typed rather than played simply has none. Playback reads it and gets
+/// the performance back; everything else ignores it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, SerBin, DeBin)]
+pub struct NotePerformance {
+    /// MIDI velocity as struck, 1..=127.
+    pub velocity: u8,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, SerBin, DeBin)]
 pub struct Note {
     pub id: NoteId,
+    /// The performance this note came from, when it came from one. See
+    /// [`NotePerformance`].
+    pub performance: Option<NotePerformance>,
     pub written_pitch: Option<Pitch>,
     pub unpitched_sound: Option<u16>,
     pub display_staff: StaffId,

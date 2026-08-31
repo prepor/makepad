@@ -28,6 +28,9 @@ use std::{
 };
 
 mod bookmarks;
+mod chat_agent;
+mod chat_panel;
+mod chat_tools;
 mod contents;
 mod demo;
 mod menu;
@@ -44,6 +47,9 @@ mod vfs;
 
 use crate::{
     bookmarks::Bookmarks,
+    chat_agent::{ChatAgent, ChatEvent},
+    chat_panel::{ChatState, ChatVoice},
+    chat_tools::{ToolJob, ToolRunner},
     contents::{FileContents, FileContentsAction, ViewMode, DEFAULT_ZOOM, ZOOM_LEVELS},
     model::{display_name, trash_dir, FileEntry},
     menu::{MenuAction, MenuRow},
@@ -580,6 +586,15 @@ script_mod! {
                                     }
                                 }
                             }
+                            chat_button := ToolButton{
+                                Icon{
+                                    icon_walk: Walk{width: 15 height: 15}
+                                    draw_icon +: {
+                                        svg: crate_resource("self://resources/icons/chat.svg")
+                                        color: mod.mpf.fg
+                                    }
+                                }
+                            }
                             menu_button := ToolButton{
                                 Icon{
                                     icon_walk: Walk{width: 15 height: 15}
@@ -754,6 +769,60 @@ script_mod! {
                                         text_style: theme.font_regular{font_size: 10.0}
                                     }
                                 }
+
+                                // The map's own tool strip. It only exists in
+                                // the Treemap view, and everything on it acts
+                                // on the rectangle that is picked — which is
+                                // what a right-click used to be for.
+                                map_tools := SolidView{
+                                    visible: false
+                                    width: Fill
+                                    height: 30
+                                    flow: Right
+                                    spacing: 2
+                                    padding: Inset{left: 16 right: 16}
+                                    align: Align{y: 0.5}
+                                    draw_bg +: {color: mod.mpf.bg_dark}
+                                    map_rescan := ToolButton{
+                                        map_rescan_icon := Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/reload.svg")
+                                                color: mod.mpf.fg
+                                            }
+                                        }
+                                    }
+                                    View{width: 10 height: 1}
+                                    map_trash := ToolButton{
+                                        map_trash_icon := Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/trash.svg")
+                                                color: mod.mpf.muted
+                                            }
+                                        }
+                                    }
+                                    map_erase := ToolButton{
+                                        map_erase_icon := Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/delete-forever.svg")
+                                                color: mod.mpf.muted
+                                            }
+                                        }
+                                    }
+                                    map_tools_hint := Label{
+                                        width: Fill
+                                        max_lines: 1
+                                        margin: Inset{left: 8}
+                                        text_overflow: TextOverflow.Ellipsis
+                                        text: "Click a rectangle to pick it"
+                                        draw_text +: {
+                                            color: mod.mpf.fg_dim
+                                            text_style: theme.font_regular{font_size: 8.5}
+                                        }
+                                    }
+                                }
                                 contents := mod.widgets.FileContents{}
 
                                 progress_row := SolidView{
@@ -875,6 +944,8 @@ script_mod! {
                                     prop_opens := PropRow{prop_key +: {text: "OPEN WITH"}}
                                 }
                             }
+
+                            chat_panel := mod.widgets.MpfChatPanel{}
                         }
                     }
 
@@ -1191,6 +1262,7 @@ enum FocusTarget {
     Path,
     Search,
     Batch,
+    Chat,
 }
 
 /// A finished recursive size measurement for the properties panel.
@@ -1447,6 +1519,49 @@ pub struct App {
     /// Warm-pool dormancy — see `Dormancy`.
     #[rust]
     dormancy: Dormancy,
+
+    // ---------------------------------------------------------------- chat
+    /// The ask-about-these-files panel. Everything below it stays `None` until
+    /// the panel is opened for the first time: a file browser must not load
+    /// nine billion parameters for a panel nobody asked for.
+    #[rust]
+    chat_open: bool,
+    #[rust]
+    chat: ChatState,
+    #[rust]
+    agent: Option<ChatAgent>,
+    #[rust]
+    tool_runner: Option<ToolRunner>,
+    /// True between sending a question and the answer being finished.
+    #[rust]
+    chat_busy: bool,
+    #[rust]
+    chat_ready: bool,
+    /// How many tool results the model is still owed for this turn, and the
+    /// ones that have come back so far — they go over in call order, together.
+    #[rust]
+    chat_awaiting_tools: usize,
+    #[rust]
+    chat_tool_replies: Vec<ToolReply>,
+    /// Tool rounds spent on the current question, so a model that decides to
+    /// keep looking forever is stopped rather than left running.
+    #[rust]
+    chat_tool_rounds: usize,
+    /// The status line under the panel header.
+    #[rust]
+    chat_status: String,
+    /// The last "about:" chip and map-strip hint that were pushed into the UI,
+    /// so the per-signal refresh only touches a widget when something changed.
+    #[rust]
+    chat_about: String,
+    #[rust]
+    map_tools_note: String,
+}
+
+/// One finished tool call, waiting for its turn-mates.
+pub struct ToolReply {
+    text: String,
+    is_error: bool,
 }
 
 /// One row of the Open With submenu: the app's id (empty = the desktop's own
@@ -1558,6 +1673,7 @@ impl App {
                 .ui
                 .view(cx, ids!(batch_find))
                 .text_input(cx, ids!(field_input)),
+            FocusTarget::Chat => self.ui.text_input(cx, ids!(chat_input)),
         };
         // `take_key_focus` focuses the field's *area*, and a field that has
         // not been drawn since it was revealed has none — focusing it would
@@ -1757,6 +1873,9 @@ impl App {
 
     /// The status line's resting state: where we are and how it is sorted.
     fn report(&mut self, cx: &mut Cx) {
+        // Whatever changed, the chat's "about:" chip and the map strip are
+        // about the same selection this line is — so they follow it here.
+        self.refresh_chat(cx);
         let mode = self.tabs[self.tab].mode;
         if mode == ViewMode::Treemap {
             let text = self
@@ -1873,6 +1992,14 @@ impl App {
                 .widget(cx, ids!(btn_sel))
                 .set_visible(cx, button_mode == mode);
         }
+        // The map's tool strip belongs to the map. The pick it acts on lives
+        // in the treemap widget and survives this, so coming back to the map
+        // finds the same rectangle still ringed.
+        self.ui
+            .widget(cx, ids!(map_tools))
+            .set_visible(cx, mode == ViewMode::Treemap);
+        self.map_tools_note.clear();
+        self.refresh_chat(cx);
     }
 
     fn zoom(&mut self, cx: &mut Cx, delta: isize) {
@@ -3112,6 +3239,9 @@ impl App {
     }
 
     fn describe(&mut self, cx: &mut Cx, entry: &FileEntry) {
+        // The listing's selection is what "this" means outside the map, so the
+        // ask panel's chip follows it here the same way it follows the pick.
+        self.refresh_chat(cx);
         let picked = self
             .with_contents(cx, |contents, _| contents.selection_count())
             .unwrap_or(1);
@@ -3150,6 +3280,11 @@ impl App {
         if event.key_code == KeyCode::Escape {
             if self.menu_open {
                 return self.close_menu(cx);
+            }
+            // Only while the caret is actually in the ask field: Escape on the
+            // map still means "zoom back out", panel or no panel.
+            if self.chat_open && self.chat_is_typing(cx) {
+                return self.toggle_chat(cx);
             }
             // A zoomed treemap is one of the things Escape is on top of: it
             // steps back out one folder before Escape means anything else.
@@ -3194,16 +3329,20 @@ impl App {
         }
 
         // Every text field in this window keeps key focus while it is hidden,
-        // so what is *open* decides whether a key is text or navigation.
+        // so what is *open* decides whether a key is text or navigation. The
+        // chat's field is the exception: the panel stays open while the user
+        // reads, so it is the keyboard that says whether they are typing in it.
         let editing = self.batch_open
             || self.path_edit_open
             || self.search_visible
+            || self.chat_is_typing(cx)
             || self
                 .with_contents(cx, |contents, _| contents.is_renaming())
                 .unwrap_or(false);
 
         if command {
             match event.key_code {
+                KeyCode::KeyK => return self.toggle_chat(cx),
                 KeyCode::KeyT if !shift => return self.new_tab(cx),
                 KeyCode::KeyW => return self.close_tab(cx),
                 KeyCode::LBracket if shift => return self.switch_tab(cx, -1),
@@ -3557,7 +3696,459 @@ impl App {
             self.enter_tab(cx);
         }
     }
+
+    // ------------------------------------------------------------------ chat
+
+    /// Open or close the ask panel. Opening it for the first time is what
+    /// starts the model loading — until then this app has no idea a language
+    /// model exists, which is the only way a file browser is allowed to have
+    /// one. Cmd+K, or the speech-bubble button in the toolbar.
+    fn toggle_chat(&mut self, cx: &mut Cx) {
+        let open = !self.chat_open;
+        self.chat_open = open;
+        self.ui.widget(cx, ids!(chat_panel)).set_visible(cx, open);
+        if !open {
+            return;
+        }
+        if self.agent.is_none() {
+            self.start_chat(cx);
+        }
+        self.refresh_chat(cx);
+        self.focus_soon(cx, FocusTarget::Chat);
+    }
+
+    /// Load the model, once. A machine without the weights on it says so and
+    /// carries on being a file browser.
+    fn start_chat(&mut self, cx: &mut Cx) {
+        let Some(model) = chat_agent::model_path() else {
+            self.chat.push(
+                ChatVoice::Info,
+                format!(
+                    "No local model on this machine. Put a Qwen GGUF at {} (or point {} at one) and reopen this panel.",
+                    chat_agent::MODEL_FILE,
+                    chat_agent::MODEL_ENV,
+                ),
+            );
+            self.set_chat_status(cx, "no model — the rest of the app is unaffected");
+            self.redraw_chat(cx);
+            return;
+        };
+        let prefix = chat_agent::build_prefix(CHAT_SYSTEM_PROMPT, chat_tools::TOOLS);
+        self.agent = Some(ChatAgent::start(&model, prefix));
+        self.tool_runner = Some(ToolRunner::new());
+        self.chat.push(
+            ChatVoice::Info,
+            format!("Loading {}…", display_name(&model)),
+        );
+        self.set_chat_status(cx, "loading the model…");
+        self.redraw_chat(cx);
+    }
+
+    fn set_chat_status(&mut self, cx: &mut Cx, text: &str) {
+        if self.chat_status == text {
+            return;
+        }
+        self.chat_status = text.to_string();
+        self.ui.label(cx, ids!(chat_status)).set_text(cx, text);
+    }
+
+    fn redraw_chat(&mut self, cx: &mut Cx) {
+        let list = self.ui.portal_list(cx, ids!(chat_list));
+        list.set_tail_range(true);
+        list.redraw(cx);
+    }
+
+    /// Where the user is, as the model reads it: the folder, the view, and
+    /// what is picked. This rides in front of every question and never appears
+    /// in the transcript — "what is this?" is the whole of what was asked.
+    fn chat_where(&mut self, cx: &mut Cx) -> String {
+        let mode = self.tabs[self.tab].mode;
+        let dir = self.current_dir();
+        let mut out = format!(
+            "[where the user is]\nhome: {}\nfolder: {}\nview: {}\n",
+            self.home.display(),
+            dir.display(),
+            mode.label(),
+        );
+        if mode == ViewMode::Treemap {
+            let map = self.with_contents(cx, |contents, cx| {
+                let map = contents.treemap(cx);
+                (map.selection(), map.status())
+            });
+            let (picked, status) = map.unwrap_or_default();
+            out.push_str(&format!("map: {status}\n"));
+            match picked {
+                Some(path) => out.push_str(&format!("selected: {}\n", describe_path(&path))),
+                None => out.push_str("selected: nothing on the map is picked\n"),
+            }
+            return out;
+        }
+        let selected = self
+            .with_contents(cx, |contents, _| contents.selected_entries())
+            .unwrap_or_default();
+        if selected.is_empty() {
+            out.push_str("selected: nothing — the question is about the folder itself\n");
+            return out;
+        }
+        out.push_str(&format!("selected: {} item(s)\n", selected.len()));
+        for entry in selected.iter().take(12) {
+            out.push_str(&format!(
+                "  {} — {}, {}\n",
+                entry.path.display(),
+                entry.kind_text(),
+                entry.size_text(),
+            ));
+        }
+        if selected.len() > 12 {
+            out.push_str(&format!("  …and {} more\n", selected.len() - 12));
+        }
+        out
+    }
+
+    /// The one-line "about:" chip over the input, and the map strip's hint and
+    /// button states. Called from `report`, so it follows every selection
+    /// change — and only touches a widget when its text actually changed.
+    fn refresh_chat(&mut self, cx: &mut Cx) {
+        let mode = self.tabs[self.tab].mode;
+        let picked = self.chat_subject(cx);
+        if self.chat_open {
+            let about = match &picked {
+                Some(path) => format!("about: {}", describe_path(path)),
+                None => format!("about: {} (this folder)", self.current_dir().display()),
+            };
+            if about != self.chat_about {
+                self.chat_about = about.clone();
+                self.ui
+                    .label(cx, ids!(chat_about_label))
+                    .set_text(cx, &about);
+            }
+        }
+        if mode != ViewMode::Treemap {
+            return;
+        }
+        let note = match &picked {
+            Some(path) => format!("Rescan · act on {}", display_name(path)),
+            None => "Rescan · click a rectangle to pick what to delete".to_string(),
+        };
+        if note == self.map_tools_note {
+            return;
+        }
+        self.map_tools_note = note.clone();
+        self.ui
+            .label(cx, ids!(map_tools_hint))
+            .set_text(cx, &note);
+        // The two delete buttons go out when there is nothing under them: a
+        // button that looks live and does nothing is worse than a dim one.
+        let palette = Palette::shared();
+        let live = Palette::vec4(&palette.fg);
+        let danger = Palette::vec4(&palette.danger);
+        let dead = Palette::vec4(&palette.muted);
+        let has_pick = picked.is_some();
+        for (id, lit) in [
+            (ids!(map_trash_icon), if has_pick { live } else { dead }),
+            (ids!(map_erase_icon), if has_pick { danger } else { dead }),
+        ] {
+            let mut icon = self.ui.widget(cx, id);
+            script_apply_eval!(cx, icon, {
+                draw_icon +: {color: #(lit)}
+            });
+        }
+    }
+
+    /// Is the caret in the ask field? The panel stays open while its answer is
+    /// read, so "open" cannot be what decides whether a key is text.
+    fn chat_is_typing(&mut self, cx: &mut Cx) -> bool {
+        if !self.chat_open {
+            return false;
+        }
+        let area = self.ui.text_input(cx, ids!(chat_input)).area();
+        !area.is_empty() && cx.has_key_focus(area)
+    }
+
+    /// What "this" means right now: the map's pick on the map, the listing's
+    /// selection anywhere else.
+    fn chat_subject(&mut self, cx: &mut Cx) -> Option<PathBuf> {
+        if self.tabs[self.tab].mode == ViewMode::Treemap {
+            return self
+                .with_contents(cx, |contents, cx| contents.treemap(cx).selection())
+                .flatten();
+        }
+        self.with_contents(cx, |contents, _| contents.selected_entry())
+            .flatten()
+            .map(|entry| entry.path)
+    }
+
+    fn send_chat(&mut self, cx: &mut Cx) {
+        let field = self.ui.text_input(cx, ids!(chat_input));
+        let text = field.text().trim().to_string();
+        drop(field);
+        if text.is_empty() {
+            return;
+        }
+        if self.agent.is_none() {
+            self.start_chat(cx);
+            if self.agent.is_none() {
+                return;
+            }
+        }
+        if !self.chat_ready {
+            self.chat
+                .push(ChatVoice::Info, "The model is still loading — one moment.");
+            self.redraw_chat(cx);
+            return;
+        }
+        if self.chat_busy {
+            // A second question while the first is running is an override, not
+            // a queue: stop the old one and ask the new one.
+            self.stop_chat(cx);
+        }
+        self.ui.text_input(cx, ids!(chat_input)).set_text(cx, "");
+        self.chat.push(ChatVoice::User, text.clone());
+        let prompt = format!("{}\n[question]\n{text}", self.chat_where(cx));
+        if let Some(agent) = &self.agent {
+            agent.send_user_turn(prompt);
+        }
+        self.chat_busy = true;
+        self.chat_tool_rounds = 0;
+        self.chat_awaiting_tools = 0;
+        self.chat_tool_replies.clear();
+        self.set_chat_status(cx, "thinking…");
+        self.set_chat_running(cx, true);
+        self.redraw_chat(cx);
+    }
+
+    fn stop_chat(&mut self, cx: &mut Cx) {
+        if !self.chat_busy {
+            return;
+        }
+        if let Some(agent) = &self.agent {
+            agent.cancel();
+        }
+        self.chat.commit_pending();
+        self.chat.push(ChatVoice::Info, "stopped");
+        self.chat_busy = false;
+        self.chat_awaiting_tools = 0;
+        self.chat_tool_replies.clear();
+        self.set_chat_status(cx, "ready");
+        self.set_chat_running(cx, false);
+        self.redraw_chat(cx);
+    }
+
+    /// Swap the Ask button for Stop while a turn is running.
+    fn set_chat_running(&mut self, cx: &mut Cx, running: bool) {
+        self.ui
+            .widget(cx, ids!(chat_send))
+            .set_visible(cx, !running);
+        self.ui.widget(cx, ids!(chat_stop)).set_visible(cx, running);
+    }
+
+    /// Everything the model and the tool worker have said since the last frame.
+    fn drain_chat(&mut self, cx: &mut Cx) {
+        let events = match &self.agent {
+            Some(agent) => agent.poll(),
+            None => Vec::new(),
+        };
+        for event in events {
+            self.on_chat_event(cx, event);
+        }
+        let replies = match &self.tool_runner {
+            Some(runner) => runner.drain(),
+            None => Vec::new(),
+        };
+        for reply in replies {
+            self.chat.push(
+                ChatVoice::Tool,
+                if reply.is_error {
+                    format!("⚠ {}", reply.note)
+                } else {
+                    reply.note.clone()
+                },
+            );
+            self.chat_tool_replies.push(ToolReply {
+                text: reply.text,
+                is_error: reply.is_error,
+            });
+            if self.chat_tool_replies.len() >= self.chat_awaiting_tools.max(1) {
+                let results: Vec<(String, bool)> = self
+                    .chat_tool_replies
+                    .drain(..)
+                    .map(|reply| (reply.text, reply.is_error))
+                    .collect();
+                self.chat_awaiting_tools = 0;
+                if let Some(agent) = &self.agent {
+                    agent.send_tool_results(results);
+                }
+                self.set_chat_status(cx, "reading…");
+            }
+            self.redraw_chat(cx);
+        }
+    }
+
+    fn on_chat_event(&mut self, cx: &mut Cx, event: ChatEvent) {
+        match event {
+            ChatEvent::Loading { phase, fraction } => {
+                let text = format!("loading — {phase} {:.0}%", fraction * 100.0);
+                self.set_chat_status(cx, &text);
+            }
+            ChatEvent::Ready {
+                prefill_tokens,
+                secs,
+            } => {
+                self.chat_ready = true;
+                self.chat.push(
+                    ChatVoice::Info,
+                    format!("Ready — {prefill_tokens} tokens of prompt in {secs:.1}s."),
+                );
+                self.set_chat_status(cx, "ready — ask about the folder or the selection");
+                self.redraw_chat(cx);
+            }
+            ChatEvent::Failed(error) => {
+                self.chat_ready = false;
+                self.chat_busy = false;
+                self.agent = None;
+                self.chat.push(ChatVoice::Info, format!("⚠ {error}"));
+                self.set_chat_status(cx, "the model could not be loaded");
+                self.set_chat_running(cx, false);
+                self.redraw_chat(cx);
+            }
+            ChatEvent::Delta(text) => {
+                self.chat.pending.push_str(&text);
+                self.redraw_chat(cx);
+            }
+            ChatEvent::ToolCall { name, args } => {
+                self.chat.commit_pending();
+                self.chat_awaiting_tools += 1;
+                let job = ToolJob {
+                    name,
+                    args,
+                    cwd: self.current_dir(),
+                    home: self.home.clone(),
+                };
+                match (&self.tool_runner, self.chat_tool_rounds < MAX_TOOL_ROUNDS) {
+                    (Some(runner), true) => runner.submit(job),
+                    // Enough. The turn ends with the truth rather than with
+                    // another lap of the same three folders.
+                    _ => {
+                        self.chat_awaiting_tools = self.chat_awaiting_tools.saturating_sub(1);
+                        if let Some(agent) = &self.agent {
+                            agent.send_tool_results(vec![(
+                                "that is enough looking around — answer from what you already have"
+                                    .to_string(),
+                                true,
+                            )]);
+                        }
+                    }
+                }
+                self.redraw_chat(cx);
+            }
+            ChatEvent::TurnDone {
+                tool_calls,
+                tokens,
+                secs,
+                context_used,
+                context_max,
+            } => {
+                if tool_calls > 0 {
+                    // The tools drive the next round; the turn is not over.
+                    self.chat_tool_rounds += 1;
+                    self.set_chat_status(cx, "looking…");
+                    return;
+                }
+                self.chat.commit_pending();
+                self.chat_busy = false;
+                self.set_chat_running(cx, false);
+                let rate = tokens as f64 / secs.max(0.001);
+                self.set_chat_status(
+                    cx,
+                    &format!(
+                        "{tokens} tokens in {secs:.1}s ({rate:.1} tok/s) · context {context_used}/{context_max}"
+                    ),
+                );
+                self.redraw_chat(cx);
+            }
+            ChatEvent::ContextFull => {
+                self.chat.commit_pending();
+                self.chat_busy = false;
+                self.set_chat_running(cx, false);
+                self.chat.push(
+                    ChatVoice::Info,
+                    "⚠ this conversation has filled the model's context — reopen the app to start a fresh one",
+                );
+                self.set_chat_status(cx, "context full");
+                self.redraw_chat(cx);
+            }
+        }
+    }
+
+    // ------------------------------------------------------- the map's tools
+
+    /// The map strip's buttons. They act on the picked rectangle through
+    /// exactly the paths the keyboard and the context menu already use — the
+    /// permanent delete included, which still asks once and acts on the second
+    /// press.
+    fn handle_map_tool_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if self.tabs[self.tab].mode != ViewMode::Treemap {
+            return;
+        }
+        if self.ui.view(cx, ids!(map_rescan)).finger_down(actions).is_some() {
+            return self.rescan_map(cx);
+        }
+        let trash = self.ui.view(cx, ids!(map_trash)).finger_down(actions).is_some();
+        let erase = self.ui.view(cx, ids!(map_erase)).finger_down(actions).is_some();
+        if !trash && !erase {
+            return;
+        }
+        if self.chat_subject(cx).is_none() {
+            self.status(cx, "Click a rectangle on the map first");
+            return;
+        }
+        if trash {
+            self.trash_selection(cx);
+        } else {
+            self.delete_forever(cx);
+        }
+    }
 }
+
+/// How many times the model may go round the look-then-think loop for one
+/// question before it has to answer with what it has.
+const MAX_TOOL_ROUNDS: usize = 6;
+
+/// One path, as a sentence: what it is and how big. Reads off the disk, so it
+/// is the truth at the moment it is asked rather than whatever a listing
+/// remembered.
+fn describe_path(path: &Path) -> String {
+    match model::entry_at(path) {
+        Some(entry) => format!(
+            "{} — {}, {}",
+            path.display(),
+            entry.kind_text(),
+            entry.size_text()
+        ),
+        None => path.display().to_string(),
+    }
+}
+
+/// What the model is told it is, once, in front of everything else.
+const CHAT_SYSTEM_PROMPT: &str = "\
+You are the assistant inside mpfiles, a file browser. You answer questions \
+about the files the person is looking at right now.
+
+Every question arrives behind a [where the user is] block: the folder they \
+have open and what they have selected. \"this\", \"it\", \"here\" and \"that\" \
+mean whatever is selected — and the folder itself when nothing is.
+
+You can only look. list_dir, read_file, stat and treemap_summary are all you \
+have. There is nothing that writes, moves, renames or deletes, so if you are \
+asked to change something, say plainly that you cannot and tell them what to \
+click instead.
+
+Look before you answer. Never guess what a folder holds or how big it is: \
+call a tool and say what it said. One or two calls is usually enough, and \
+treemap_summary is the one that answers \"what is taking up the space\".
+
+Answer in a couple of short sentences, or a short list. Sizes in human units. \
+No markdown headings and no preamble — say the thing.";
 
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
@@ -3666,6 +4257,29 @@ impl MatchEvent for App {
         if self.ui.view(cx, ids!(props_close)).finger_down(actions).is_some() {
             self.set_props(cx, false);
         }
+
+        // ---- the ask panel
+        if self.ui.view(cx, ids!(chat_button)).finger_down(actions).is_some() {
+            self.toggle_chat(cx);
+        }
+        if self.chat_open {
+            if self.ui.view(cx, ids!(chat_close)).finger_down(actions).is_some() {
+                self.toggle_chat(cx);
+                return;
+            }
+            if self.ui.view(cx, ids!(chat_stop)).finger_down(actions).is_some() {
+                self.stop_chat(cx);
+                return;
+            }
+            let field = self.ui.text_input(cx, ids!(chat_input));
+            let returned = field.returned(actions).is_some();
+            drop(field);
+            if returned || self.ui.view(cx, ids!(chat_send)).finger_down(actions).is_some() {
+                self.send_chat(cx);
+                return;
+            }
+        }
+        self.handle_map_tool_actions(cx, actions);
         for (id, mode) in MODE_BUTTONS {
             if self.ui.view(cx, id).finger_down(actions).is_some() {
                 self.set_mode(cx, mode);
@@ -3873,6 +4487,7 @@ impl AppMain for App {
         crate::thumbs::script_mod(vm);
         crate::treemap_view::script_mod(vm);
         crate::contents::script_mod(vm);
+        crate::chat_panel::script_mod(vm);
         self::script_mod(vm)
     }
 
@@ -3894,6 +4509,7 @@ impl AppMain for App {
             if self.tabs.get(self.tab).map(|t| t.mode) == Some(ViewMode::Treemap) {
                 self.report(cx);
             }
+            self.drain_chat(cx);
             self.preview.poll();
         }
         if let Event::Custom(json) = event {
@@ -3907,7 +4523,10 @@ impl AppMain for App {
         if let Event::KeyDown(key) = event {
             self.handle_key(cx, key);
         }
-        self.ui.handle_event(cx, event, &mut Scope::empty());
+        // The transcript draws from the chat state, so it rides down the tree
+        // as the scope — every other widget in this window ignores it.
+        self.ui
+            .handle_event(cx, event, &mut Scope::with_data(&mut self.chat));
     }
 }
 

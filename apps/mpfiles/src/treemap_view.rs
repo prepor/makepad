@@ -1149,11 +1149,24 @@ impl TreemapView {
     /// bought. Spent means: zoomed in past what the layout resolves
     /// ([`DETAIL_SLACK`]), or looking at ground outside the laid cull.
     fn layout_spent(&self) -> bool {
-        let body = self.laid_out;
-        if body.size.x <= 0.0 || self.laid_cull.w <= 0.0 {
+        // Spent cuts both ways: zoomed IN past the layout's detail floor,
+        // or zoomed OUT so far the layout in hand is a microscopic patch —
+        // a one-sided test here is how a zoom-out once froze the old
+        // zoomed-in layout on screen forever as wrong-scale ghost plates.
+        let ratio = self.cam_scale.max(1.0) / self.layout_scale.max(1.0);
+        if ratio > DETAIL_SLACK || ratio < 1.0 / DETAIL_SLACK {
             return true;
         }
-        if self.cam_scale.max(1.0) / self.layout_scale.max(1.0) > DETAIL_SLACK {
+        self.view_escaped_cull()
+    }
+
+    /// The hard half of [`Self::layout_spent`]: the live view is showing
+    /// ground the layout never laid. Spent-for-detail can wait for the
+    /// motion cadence — the picture is merely coarse; escaped cannot wait
+    /// for anything, because what it shows is *bare background*.
+    fn view_escaped_cull(&self) -> bool {
+        let body = self.laid_out;
+        if body.size.x <= 0.0 || self.laid_cull.w <= 0.0 {
             return true;
         }
         // What the live camera can see, in the layout's own ground space.
@@ -1177,9 +1190,17 @@ impl TreemapView {
                 }
             }
             _ => {
+                // The draw path is screen = Cam(remap(ground)): undoing the
+                // projection alone leaves the point in the LIVE camera's
+                // frame, and the cull lives in the LAYOUT's. Skipping the
+                // second inverse is how a raised-mode zoom-out once compared
+                // a body-sized live footprint against a giant stale cull,
+                // never noticed the escape, and froze ghosts on screen.
                 let cam = self.cam_at(body);
+                let (k, b) = self.cam_remap();
                 for corner in corners {
-                    let g = cam.unproject_ground(corner);
+                    let live = cam.unproject_ground(corner);
+                    let g = dvec2((live.x - b.x) / k, (live.y - b.y) / k);
                     min.x = min.x.min(g.x);
                     min.y = min.y.min(g.y);
                     max.x = max.x.max(g.x);
@@ -1691,6 +1712,44 @@ impl TreemapView {
             w: rect.size.x * scale,
             h: rect.size.y * scale,
         };
+        // A glide in flight knows where it will land. The cull covers the
+        // destination's footprint too, so the glide itself can never outrun
+        // the layout: a violent out-zoom lays out the whole ride's ground
+        // now, in this one relayout, instead of flashing bare background and
+        // chasing it frame by frame. The destination offset is the glide's
+        // own anchor arithmetic run to its target, under set_camera's
+        // clamps. Per axis the destination view maps into this layout's
+        // ground frame affinely (same yaw and pitch all glide long).
+        let dest = self.zoom_glide.map(|glide| {
+            let scale_c = self.cam_scale.max(1.0);
+            let scale_t = glide.target.clamp(1.0, 512.0);
+            let anchor = glide.anchor - rect.pos;
+            let factor = scale_t / scale_c;
+            let off_t = dvec2(
+                ((self.cam_off.x + anchor.x) * factor - anchor.x)
+                    .clamp(0.0, (rect.size.x * (scale_t - 1.0)).max(0.0)),
+                ((self.cam_off.y + anchor.y) * factor - anchor.y)
+                    .clamp(0.0, (rect.size.y * (scale_t - 1.0)).max(0.0)),
+            );
+            // ground = rect.pos - off_now + (screen - rect.pos + off_dest)
+            //          * (scale_now / scale_dest), per axis.
+            let r = scale_c / scale_t;
+            (
+                dvec2(
+                    rect.pos.x - self.cam_off.x + (off_t.x) * r,
+                    rect.pos.y - self.cam_off.y + (off_t.y) * r,
+                ),
+                r,
+            )
+        });
+        // Map a point of the live view into where the glide's destination
+        // camera will show that screen spot, in this layout's ground frame.
+        let to_dest = |q: DVec2, dest: &(DVec2, f64)| {
+            dvec2(
+                dest.0.x + (q.x - rect.pos.x) * dest.1,
+                dest.0.y + (q.y - rect.pos.y) * dest.1,
+            )
+        };
         // What the camera can see, on the ground plane: the panel's corners
         // un-projected, boxed, and grown by the tallest possible lean — the
         // cull has to keep whatever could spin or lean into view.
@@ -1704,11 +1763,27 @@ impl TreemapView {
                     rect.size.x * MOTION_CULL_PAD,
                     rect.size.y * MOTION_CULL_PAD,
                 );
+                let mut min = dvec2(rect.pos.x - pad.x, rect.pos.y - pad.y);
+                let mut max = dvec2(
+                    rect.pos.x + rect.size.x + pad.x,
+                    rect.pos.y + rect.size.y + pad.y,
+                );
+                if let Some(dest) = &dest {
+                    let a = to_dest(rect.pos, dest);
+                    let b = to_dest(
+                        dvec2(rect.pos.x + rect.size.x, rect.pos.y + rect.size.y),
+                        dest,
+                    );
+                    min.x = min.x.min(a.x);
+                    min.y = min.y.min(a.y);
+                    max.x = max.x.max(b.x);
+                    max.y = max.y.max(b.y);
+                }
                 MapRect {
-                    x: rect.pos.x - pad.x,
-                    y: rect.pos.y - pad.y,
-                    w: rect.size.x + pad.x * 2.0,
-                    h: rect.size.y + pad.y * 2.0,
+                    x: min.x,
+                    y: min.y,
+                    w: max.x - min.x,
+                    h: max.y - min.y,
                 }
             }
             _ => {
@@ -1727,6 +1802,17 @@ impl TreemapView {
                     min.y = min.y.min(g.y);
                     max.x = max.x.max(g.x);
                     max.y = max.y.max(g.y);
+                    if let Some(dest) = &dest {
+                        // The glide's destination sees this screen corner at
+                        // a different ground spot; the cull keeps both. Yaw
+                        // and pitch hold still during a zoom glide, so the
+                        // scale/offset affine is the whole difference.
+                        let d = to_dest(g, dest);
+                        min.x = min.x.min(d.x);
+                        min.y = min.y.min(d.y);
+                        max.x = max.x.max(d.x);
+                        max.y = max.y.max(d.y);
+                    }
                 }
                 let reach = self.elev(24) + 40.0;
                 // Rotation-proof: a mid-drag orbit swings the visible
@@ -2824,8 +2910,12 @@ impl Widget for TreemapView {
                 // A camera gesture owns the picture: it rides the remap,
                 // visually rigid, and the layout underneath only refreshes
                 // on a coarse cadence — each refresh a morph that brings in
-                // new detail and cull, never a per-frame reshuffle.
-                if self.motion_refresh_due() {
+                // new detail and cull, never a per-frame reshuffle. One
+                // thing outranks the cadence: the view escaping the laid
+                // cull. A coarse picture can wait 150ms; bare background
+                // cannot wait one frame — the relayout runs here, before
+                // this same frame paints, so unlaid ground is never shown.
+                if self.view_escaped_cull() || self.motion_refresh_due() {
                     if self.tween_capture.is_none() {
                         self.tween_calm = !self.stale;
                         self.tween_capture = Some(self.visual_snapshot());

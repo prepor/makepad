@@ -32,9 +32,19 @@ macro_rules! design_params {
 
 design_params! {
     // --- radiativity curve R(f) (soundboard.rs) -------------------------
-    /// lower -3 dB knee pair: f/(f+rad_hp1) * f/(f+rad_hp2)
-    rad_hp1 = 40.0,
-    rad_hp2 = 16.0,
+    /// Low-frequency knee: second-order below rad_hp1 (the board's first
+    /// resonance — below it the panel is smaller than the wavelength and
+    /// radiation efficiency collapses) times a first-order at rad_hp2.
+    /// Re-pinned 2026-08-31 against the real multi-velocity corpus: the
+    /// fundamental-to-cluster balance of the bottom six measured keys
+    /// (A0..C2, three layers each) demands a knee near 90 Hz — with the
+    /// old 40/16 Hz corners the model's C2 FUNDAMENTAL was its strongest
+    /// partial (real: -26 dB below the cluster) and A1's sat +17-21 dB
+    /// hot: the bass-guitar balance, bought partly by a 50-88 Hz
+    /// radiation step that had been calibrated against the falsified MP3
+    /// C2 row and is now deleted.
+    rad_hp1 = 90.0,
+    rad_hp2 = 40.0,
     /// top roll-off corner (Hz)
     rad_lp = 5292.031102101306,
     /// top roll-off order: amplitude (1/(1+(f/lp)^2))^(rad_lp_pow/2); 1.0 = -6 dB/oct
@@ -51,20 +61,6 @@ design_params! {
     rad_vel_hz = 153.24610995333614,
     rad_body = 2.2,
     rad_body_hz = 150.0,
-    /// first-board-resonance radiation step (see soundboard::radiativity):
-    /// amplitude gain rad_res on a steep (4th-order) band between
-    /// rad_res_lo and rad_res_hi. A concert grand's first board modes sit
-    /// at ~50-90 Hz and radiate the A1-C2 fundamentals strongly; the body
-    /// shelf above alone left those fundamentals 10-20 dB under the
-    /// reference recordings' balance and the bottom octaves read as a
-    /// plucked wire ("guitar"): all partial cluster, no weight under it.
-    /// Steep on BOTH sides: below rad_res_lo the board stops radiating
-    /// (C1's fundamental stays -35 dB in the reference), above rad_res_hi
-    /// the ordinary body shelf takes over — a broad bump here would lift
-    /// C2's second partial as much as its first and change nothing.
-    rad_res = 3.2,
-    rad_res_lo = 50.0,
-    rad_res_hi = 88.0,
     // --- string losses (keys.rs) ---------------------------------------
     /// fundamental T60 at A0 (s): t60 = t60_base*(1-t)^t60_pow + t60_min
     t60_base = 26.333895237530335,
@@ -133,7 +129,7 @@ design_params! {
     /// per-partial double decay is what the old fixed Weinreich
     /// multipliers (sigma ratio 4.3 on every partial of every key)
     /// provably could not express — the plucked-harp signature.
-    bridge_couple = 9.0,
+    bridge_couple = 20.0,
     /// admittance floor: even off-resonance partials couple somewhat
     bridge_couple_floor = 0.03,
     /// compass taper exponent on (1-t). NOTE the honest discrepancy: the
@@ -145,7 +141,7 @@ design_params! {
     /// Reconciling needs per-position bridge admittance data we do not
     /// have; the calibrated curve reproduces the measured per-note
     /// knees, so it stands.
-    bridge_couple_taper = 1.5,
+    bridge_couple_taper = 2.6,
     // --- per-partial normal-mode reduction (keys.rs mode tables) --------
     /// Horizontal-polarisation drive share: the hammer imparts mostly
     /// vertical motion; termination asymmetry leaks this fraction
@@ -331,11 +327,21 @@ design_params! {
     // --- phantom partials / longitudinal modes (0 = off) ----------------
     /// output gain of the per-voice longitudinal/phantom bank
     ph_gain = 0.25,
-    /// broadband high-passed squared-signal leak gain
-    /// Kept at 0: a design search once raised it for cheap high-band score,
-    /// but the leak is broadband noise-shaped and reads as rasp — the same
-    /// class of spray the listener rejected twice.
-    ph_direct = 0.0,
+    /// FORCED-response phantom path: the high-passed quadratic signal
+    /// itself, fed to the bridge alongside the free-mode bank. Bank &
+    /// Sujbert (JASA 2005) measured exactly this split on a recorded F1:
+    /// the FREE longitudinal mode died in ~0.15 s while the FORCED
+    /// phantoms — sum/difference products of transverse partials — persist
+    /// with decay comparable to the partials themselves: sustaining tonal
+    /// energy through the bass cluster, resupplied as long as the strings
+    /// ring (a mechanism a plucked rendering lacks by definition). A
+    /// design search once raised this for cheap high-band score when it
+    /// was un-gated and driven by the un-weighted square of everything —
+    /// that read as rasp and was zeroed. It is now wound-gated in keys.rs
+    /// (full on the bass, gone by C4) and the drive is slope-weighted per
+    /// the published equation (see voice.rs), which makes it discrete
+    /// partial products, not spray.
+    ph_direct = 0.35,
     /// high-pass corner on the squared drive (Hz)
     ph_hp = 1876.8296431768078,
     /// longitudinal mode damping sigma base (1/s) and per-kHz slope

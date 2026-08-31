@@ -122,6 +122,7 @@ pub struct KeyDesign {
     pub ph_direct: f32,
     pub ph_hp_c: f32,
     pub ph_pre_c: f32,
+    pub ph_diff_c: f32,
     pub ph_drive: f32,
     // Sympathetic bank tables (small, first partials of this string group):
     pub sym_modes: usize,            // padded to 8
@@ -402,7 +403,7 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
         .max(0.15);
         // complex bridge admittance at this partial
         let (y_re, y_im) = crate::soundboard::bridge_admittance_c(fn_hz, p);
-        let shape = p.bridge_couple_floor + (1.0 - p.bridge_couple_floor) * (y_re * y_re).min(3.0);
+        let shape = p.bridge_couple_floor + (1.0 - p.bridge_couple_floor) * (y_re * y_re).min(2.0);
         let g_v = couple_amt * shape; // vertical coupling loss (1/s)
         // reactive part: the bridge pulls a coupled partial's frequency.
         // Clamped to +-4 cents so the dispersion law stays recognisably a
@@ -698,9 +699,21 @@ pub fn build_key(key: u8, sample_rate: f64, p: &DesignParams) -> KeyDesign {
             * ph_wound
             * (0.29 + 0.67 * (1.0 - t).powf(2.4))
             * ((1.0 - t) + 0.05).powf(p.ph_taper)) as f32,
-        ph_direct: p.ph_direct as f32,
+        // forced-response path shares the wound gate: phantom audibility
+        // is a wound-bass phenomenon (see ph_gain above)
+        ph_direct: (p.ph_direct * ph_wound) as f32,
         ph_hp_c: (1.0 - (-core::f64::consts::TAU * p.ph_hp / sample_rate).exp()) as f32,
-        ph_pre_c: (1.0 - (-core::f64::consts::TAU * 5200.0 / sample_rate).exp()) as f32,
+        // parents band-limited to ~2.4 kHz: phantom products above that
+        // are inaudible against the direct partials, and the tighter band
+        // keeps attack-edge content out of the quadratic
+        ph_pre_c: (1.0 - (-core::f64::consts::TAU * 2400.0 / sample_rate).exp()) as f32,
+        // slope-weighting differentiator, unity near 700 Hz: the
+        // tension-modulation drive is quadratic in the string SLOPE
+        // (mu xi_tt = ES xi_xx + 1/2 ES d/dx[(y_x)^2], Bank & Sujbert),
+        // and the bridge-force bus under-weights partial n's slope by
+        // 1/f_n; differentiating restores the published weighting so the
+        // quadratic drive is built from slope-weighted modal products.
+        ph_diff_c: (sample_rate / (core::f64::consts::TAU * 700.0)) as f32,
         ph_drive: (p.ph_norm / (0.29 + 0.67 * (1.0 - t).powf(2.4))) as f32,
         sym_modes,
         sym_cr,

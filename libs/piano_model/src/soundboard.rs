@@ -52,7 +52,10 @@ const AZ_ITD_S: f64 = 0.00045;
 /// - broad plateau ~150 Hz .. ~2 kHz with a low-mid body emphasis
 /// - gentle roll-off above the top corner
 pub fn radiativity(f: f64, p: &DesignParams) -> f64 {
-    let hp1 = f / (f + p.rad_hp1);
+    // second-order collapse below the first board resonance (see
+    // params::rad_hp1): the real bottom octave speaks through its partial
+    // cluster, not its fundamental
+    let hp1 = f * f / (f * f + p.rad_hp1 * p.rad_hp1);
     let hp2 = f / (f + p.rad_hp2);
     let x = (f / p.rad_lp) * (f / p.rad_lp);
     let lp = (1.0 / (1.0 + x)).powf(0.5 * p.rad_lp_pow);
@@ -70,21 +73,13 @@ pub fn radiativity(f: f64, p: &DesignParams) -> f64 {
     let b = f / p.rad_body_hz;
     let b4 = b * b * b * b;
     let body = 1.0 + p.rad_body * (1.0 / (1.0 + b4)) * (f * f / (f * f + 85.0 * 85.0));
-    // First-board-resonance step (see params::rad_res): the ~50-90 Hz
-    // region where a concert grand's first board modes radiate the
-    // A1-C2 fundamentals. Fourth-order on both skirts: steep below so the
-    // bottom octave's near-inaudible fundamentals stay put (C1's is
-    // -35 dB in the reference), steep above so C2's SECOND partial
-    // (130 Hz) does not ride the same lift — a broad bump here moves the
-    // fundamental-to-partial balance by nothing. Without this term the
-    // bottom octaves measured 10-20 dB light on their fundamentals
-    // against the reference recordings and read as a plucked wire.
-    let rl = f / p.rad_res_lo;
-    let rl4 = rl * rl * rl * rl;
-    let rh = f / p.rad_res_hi;
-    let rh4 = rh * rh * rh * rh;
-    let res = 1.0 + p.rad_res * (rl4 / (1.0 + rl4)) * (1.0 / (1.0 + rh4));
-    hp1 * hp2 * lp * body * res
+    // (A 50-88 Hz "first-resonance step" used to lift the A1/C2
+    // fundamentals here. It was calibrated against the MP3 GM corpus's
+    // C2 row, which claimed the fundamental strongest; the real
+    // multi-velocity corpus measures the real C2 fundamental 26 dB BELOW
+    // its cluster at every layer, and the listener heard the lifted
+    // version as a bass guitar. Deleted 2026-08-31.)
+    hp1 * hp2 * lp * body
 }
 
 /// Normalised bridge-admittance proxy (real part only); see
@@ -138,13 +133,23 @@ pub fn bridge_admittance_c(f: f64, p: &DesignParams) -> (f64, f64) {
         }
         (re, im)
     }
+    // Normalise by the 85th percentile, NOT the median: with sparse
+    // resonant peaks the median sits at the between-peak level, and
+    // dividing by it put half of all frequencies at y >= 1 — through the
+    // squared-shape coupling law that made nearly EVERY bass partial a
+    // drain (measured C2: five of its first eight partials at sigma
+    // 11-30/s where the real C2 drains one and its cluster RINGS at
+    // 1.9-2.8/s). A bass note whose cluster all drains reduces to its
+    // fundamental within 300 ms: the plucked bass-guitar signature.
+    // Near-peak normalisation keeps drains sparse (~a quarter of
+    // partials, like the measured corpus) and valleys genuinely quiet.
     let mut med = [0.0f64; 25];
     for (i, slot) in med.iter_mut().enumerate() {
         let g = 40.0 * (1200.0f64 / 40.0).powf(i as f64 / 24.0);
         *slot = raw_c(g).0;
     }
     med.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let norm = med[12].max(1e-6);
+    let norm = med[21].max(1e-6);
     let (re, im) = raw_c(f);
     (re / norm, im / norm)
 }

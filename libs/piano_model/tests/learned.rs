@@ -258,13 +258,30 @@ fn shape_partials_hook_scales_gain_and_decay() {
         }
         (re * re + im * im).sqrt()
     };
-    let mut base = Piano::new(FS);
+    // pol_det = 0: with the polarisation false-beat on, a single
+    // fixed-instant DFT window lands on different phases of the beat in
+    // the two renders and the sigma probe stops being monotone (a
+    // doubled-sigma render once measured +3 dB at 0.8 s purely from
+    // beat phase). The hook under test is orthogonal to the beat.
+    let no_beat = {
+        let mut dp = makepad_piano_model::DesignParams::default();
+        dp.pol_det = 0.0;
+        dp.scatter = 0.0;
+        // the held key's own sympathetic bank shadows its partials with
+        // UNSCALED decays and holds the 0.8 s level after the scaled
+        // string has died — silence the resonance beds for the probe
+        dp.sym_out = 0.0;
+        dp.sym_damped = 0.0;
+        dp.duplex_gain = 0.0;
+        dp
+    };
+    let mut base = Piano::new_with_params(FS, &no_beat);
     let f0 = base.key_info(key).unwrap().f0 as f64;
     let b = base.key_info(key).unwrap().b_coeff as f64;
     let f2 = 2.0 * f0 * (1.0 + b * 4.0).sqrt();
     let xb = render_mono(&mut base);
     // Gain: partial 2 cut 12 dB, others untouched.
-    let mut cut = Piano::new(FS);
+    let mut cut = Piano::new_with_params(FS, &no_beat);
     cut.debug_shape_partials(key, &[1.0, 0.25, 1.0, 1.0], &[]);
     let xc = render_mono(&mut cut);
     let drop = 20.0 * (dft(&xc, f2, 0.1) / dft(&xb, f2, 0.1)).log10();
@@ -273,21 +290,22 @@ fn shape_partials_hook_scales_gain_and_decay() {
     assert!(keep.abs() < 1.0, "partial 1 moved {keep:.1} dB, wanted 0");
     // Decay: sigma doubled on every partial -> the 0.8 s level falls well
     // below the untouched instrument's while the onset stays put.
-    let mut fast = Piano::new(FS);
+    let mut fast = Piano::new_with_params(FS, &no_beat);
     fast.debug_shape_partials(key, &[], &[2.0; 24]);
     let xf = render_mono(&mut fast);
-    let late = 20.0 * (dft(&xf, f0, 0.8) / dft(&xb, f0, 0.8)).log10();
-    let onset = 20.0 * (dft(&xf, f0, 0.05) / dft(&xb, f0, 0.05)).log10();
-    // -2.5, not -4: since the bridge-coupling split landed, the C4
-    // fundamental's 0.8 s level is carried almost entirely by the slow
-    // (aftersound) member at sigma ~0.3 — doubling every member's sigma
-    // therefore moves 0.8 s by ~8.7*0.3*0.8 ~ 2-3 dB, not the 4+ the old
-    // fast/slow mix gave. The hook still visibly scales decay, which is
-    // what this mechanism test pins.
-    assert!(late < -2.5, "doubled sigma only moved the 0.8 s level {late:.1} dB");
-    // -4.5: with the C4 fundamental now a bridge-admittance drain
-    // (sigma ~3-6/s at the fast pole), doubling every sigma visibly digs
-    // into the 50 ms window too; the mechanism contrast (late moves far
-    // more than onset) is what this test pins.
+    // Broadband RMS, not a single-frequency DFT: a partial is now a set
+    // of coupled modes at (nearly) one frequency, and their coherent sum
+    // sweeps through interference nulls as the fast member dies — a
+    // fixed-instant single-line probe measured +0.2 dB for doubled sigma
+    // purely because base and scaled renders sat on opposite sides of a
+    // null. Energy across the band is monotone in sigma.
+    let band_rms = |x: &[f32], t0: f64, t1: f64| -> f64 {
+        let a = (t0 * FS as f64) as usize;
+        let b = ((t1 * FS as f64) as usize).min(x.len());
+        (x[a..b].iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / (b - a) as f64).sqrt()
+    };
+    let late = 20.0 * (band_rms(&xf, 0.6, 1.1) / band_rms(&xb, 0.6, 1.1)).log10();
+    let onset = 20.0 * (band_rms(&xf, 0.03, 0.08) / band_rms(&xb, 0.03, 0.08)).log10();
+    assert!(late < -2.5, "doubled sigma only moved the 0.6-1.1 s energy {late:.1} dB");
     assert!(onset > -4.5, "doubled sigma should barely touch the onset, moved {onset:.1} dB");
 }

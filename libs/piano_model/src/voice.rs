@@ -213,6 +213,11 @@ pub struct Voice {
     ph_zr: [f32; PH_MODES],
     ph_zi: [f32; PH_MODES],
     ph_lp: f32,
+    /// previous drive sample for the slope-weighting differentiator
+    ph_x1: f32,
+    /// pre-filter chain for the un-differentiated factor of the drive
+    ph_pre1b: f32,
+    ph_pre2b: f32,
     /// two-pole band-limit on the drive BEFORE squaring: squaring doubles
     /// bandwidth, so anything above fs/4 in the drive folds. The phantom
     /// parents are partials below ~4 kHz; content above contributes only
@@ -263,6 +268,9 @@ impl Voice {
             ph_zr: [0.0; PH_MODES],
             ph_zi: [0.0; PH_MODES],
             ph_lp: 0.0,
+            ph_x1: 0.0,
+            ph_pre1b: 0.0,
+            ph_pre2b: 0.0,
             ph_pre1: 0.0,
             ph_pre2: 0.0,
             ph_buf: [0.0; MAX_CHUNK],
@@ -482,9 +490,25 @@ impl Voice {
             // added), so no loop exists anywhere.
             for k in 0..n {
                 let s = self.acc[k] * key.ph_drive;
-                self.ph_pre1 += key.ph_pre_c * (s - self.ph_pre1);
+                // Tension-modulation drive as a PRODUCT of two weighted
+                // sums (Bank & Sujbert's common-drive form), not one
+                // squared signal: one factor is slope-weighted via d/dt
+                // (partial n gains ~f_n, restoring the published n.m
+                // product weighting on one side), the other keeps the
+                // plain sine-onset bus. The product therefore starts at
+                // ZERO at the strike — squaring the differentiated bus
+                // alone put its cosine-onset jump through the quadratic
+                // and sprayed 3-9 kHz into the first 30 ms, where the
+                // real bass onsets measure -26..-37 dB (the phantom bed
+                // belongs to the note BODY: it builds and decays with
+                // the parents).
+                let d = (s - self.ph_x1) * key.ph_diff_c;
+                self.ph_x1 = s;
+                self.ph_pre1 += key.ph_pre_c * (d - self.ph_pre1);
                 self.ph_pre2 += key.ph_pre_c * (self.ph_pre1 - self.ph_pre2);
-                let sq = self.ph_pre2 * self.ph_pre2;
+                self.ph_pre1b += key.ph_pre_c * (s - self.ph_pre1b);
+                self.ph_pre2b += key.ph_pre_c * (self.ph_pre1b - self.ph_pre2b);
+                let sq = self.ph_pre2 * self.ph_pre2b;
                 self.ph_lp += key.ph_hp_c * (sq - self.ph_lp);
                 self.ph_buf[k] = sq - self.ph_lp;
             }
@@ -518,8 +542,11 @@ impl Voice {
         self.ph_zr.fill(0.0);
         self.ph_zi.fill(0.0);
         self.ph_lp = 0.0;
+        self.ph_x1 = 0.0;
         self.ph_pre1 = 0.0;
         self.ph_pre2 = 0.0;
+        self.ph_pre1b = 0.0;
+        self.ph_pre2b = 0.0;
         self.knock_lp = 0.0;
         self.power = 0.0;
         self.quiet_ticks = 0;

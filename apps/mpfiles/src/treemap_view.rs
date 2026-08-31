@@ -444,6 +444,13 @@ pub struct TreemapView {
     /// changes, consumed by the next relayout to aim the tween.
     #[rust]
     tween_capture: Option<Vec<(Cell, MapRect, f64)>>,
+    /// True when the pending capture was taken for a settle the *camera*
+    /// asked for. The picture on screen is already true then — the layout is
+    /// merely catching up — so detail the refresh brings in must simply be
+    /// there, not fade in at the user; a zoom is not data appearing. Filter
+    /// edits and scan changes keep the arrival ceremony.
+    #[rust]
+    tween_calm: bool,
 
     #[rust]
     generation: u64,
@@ -768,6 +775,7 @@ impl TreemapView {
         self.totals_dirty = true;
         self.tree_rev = self.tree_rev.wrapping_add(1);
         self.tween_capture = None;
+        self.tween_calm = false;
         self.tween_start = None;
         self.tween_from.clear();
         self.tween_leavers.clear();
@@ -1176,6 +1184,9 @@ impl TreemapView {
             return;
         }
         if self.tween_capture.is_none() {
+            // Calm unless the tree itself changed underneath the gesture —
+            // a camera settle re-derives the same picture at more detail.
+            self.tween_calm = !self.stale;
             self.tween_capture = Some(self.visual_snapshot());
         }
         self.stale = true;
@@ -1394,6 +1405,7 @@ impl TreemapView {
         // Aim the tween from wherever things visually are right now — a
         // slider mid-drag retargets smoothly instead of jumping.
         self.tween_capture = Some(self.visual_snapshot());
+        self.tween_calm = false;
         self.filter = filter;
         self.stale = true;
         self.last_layout = None;
@@ -1768,7 +1780,23 @@ impl TreemapView {
             // rects were remapped to the live camera, which the fresh
             // layout now rests under — so the old cull is compared in that
             // frame too, through the remap the snapshot itself used.
-            if old_cull.w > 0.0 {
+            let calm = std::mem::take(&mut self.tween_calm);
+            if calm {
+                // A camera-asked settle: everything the refresh brought in
+                // was always there — a plate dissolving into its items at a
+                // deeper zoom is the SAME bytes at more detail, not data
+                // arriving. It materialises in place, full alpha, no grow;
+                // survivors still morph from their remapped rects (which the
+                // invariant packing makes a near no-op).
+                for cell in &self.cells {
+                    if !self.tween_from.contains_key(&cell.path) {
+                        self.tween_from.insert(
+                            cell.path.clone(),
+                            TweenFrom { rect: cell.rect, depth: cell.depth as f64 },
+                        );
+                    }
+                }
+            } else if old_cull.w > 0.0 {
                 let (rk, rb) = old_remap;
                 let seen = remap_rect(&old_cull, rk, rb);
                 for cell in &self.cells {
@@ -1785,14 +1813,20 @@ impl TreemapView {
             // Symmetric on the way out: a cell the new layout culled away
             // is just going off-view — it vanishes with the frame, no
             // goodbye fade. Only a leaver still inside the laid region
-            // (absorbed, filtered out) earns one.
-            self.tween_leavers = snapshot
-                .into_iter()
-                .filter(|(cell, rect, _)| {
-                    !now_here.contains(cell.path.as_path())
-                        && rect.intersects(&self.laid_cull)
-                })
-                .collect();
+            // (absorbed, filtered out) earns one — and a calm settle owes
+            // nobody a goodbye at all: what left merely coarsened back
+            // into its plate.
+            self.tween_leavers = if calm {
+                Vec::new()
+            } else {
+                snapshot
+                    .into_iter()
+                    .filter(|(cell, rect, _)| {
+                        !now_here.contains(cell.path.as_path())
+                            && rect.intersects(&self.laid_cull)
+                    })
+                    .collect()
+            };
             self.tween_start = Some(Instant::now());
         }
         self.laid_out = rect;
@@ -2587,6 +2621,7 @@ impl Widget for TreemapView {
                 // new detail and cull, never a per-frame reshuffle.
                 if self.motion_refresh_due() {
                     if self.tween_capture.is_none() {
+                        self.tween_calm = !self.stale;
                         self.tween_capture = Some(self.visual_snapshot());
                     }
                     self.relayout(body);

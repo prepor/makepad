@@ -586,24 +586,6 @@ script_mod! {
                                     }
                                 }
                             }
-                            treemap25_button := ToolButton{
-                                Icon{
-                                    icon_walk: Walk{width: 15 height: 15}
-                                    draw_icon +: {
-                                        svg: crate_resource("self://resources/icons/treemap25.svg")
-                                        color: mod.mpf.fg
-                                    }
-                                }
-                            }
-                            treemap3d_button := ToolButton{
-                                Icon{
-                                    icon_walk: Walk{width: 15 height: 15}
-                                    draw_icon +: {
-                                        svg: crate_resource("self://resources/icons/treemap3d.svg")
-                                        color: mod.mpf.fg
-                                    }
-                                }
-                            }
 
                             View{width: 6 height: 1}
 
@@ -849,6 +831,36 @@ script_mod! {
                                     padding: Inset{left: 16 right: 16}
                                     align: Align{y: 0.5}
                                     draw_bg +: {color: mod.mpf.bg_dark}
+                                    // The render-mode switch: one block view,
+                                    // three ways of looking at it.
+                                    proj_flat := ToolButton{
+                                        Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/treemap.svg")
+                                                color: mod.mpf.fg
+                                            }
+                                        }
+                                    }
+                                    proj_ortho := ToolButton{
+                                        Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/treemap25.svg")
+                                                color: mod.mpf.fg
+                                            }
+                                        }
+                                    }
+                                    proj_persp := ToolButton{
+                                        Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/treemap3d.svg")
+                                                color: mod.mpf.fg
+                                            }
+                                        }
+                                    }
+                                    View{width: 10 height: 1}
                                     map_rescan := ToolButton{
                                         map_rescan_icon := Icon{
                                             icon_walk: Walk{width: 15 height: 15}
@@ -902,7 +914,101 @@ script_mod! {
                                         text: "ignore system"
                                     }
                                 }
-                                contents := mod.widgets.FileContents{}
+                                map_row := View{
+                                    width: Fill
+                                    height: Fill
+                                    flow: Right
+                                    contents := mod.widgets.FileContents{}
+                                    // The filter, docked: everything in it
+                                    // applies live, and the map tweens right
+                                    // beside it while you fiddle.
+                                    map_side := SolidView{
+                                        visible: false
+                                        width: 258
+                                        height: Fill
+                                        draw_bg +: {color: mod.mpf.bg_dark}
+                                        ScrollYView{
+                                            width: Fill
+                                            height: Fill
+                                            flow: Down
+                                            spacing: 6
+                                            padding: Inset{left: 10 right: 10 top: 10 bottom: 10}
+                                            Label{
+                                                text: "FILTER"
+                                                draw_text +: {
+                                                    color: mod.mpf.fg_dim
+                                                    text_style: theme.font_bold{font_size: 8.0}
+                                                }
+                                            }
+                                            filter_query := MpfInput{
+                                                width: Fill
+                                                height: 26
+                                                empty_text: "name, .ext, >100mb, <7d"
+                                            }
+                                            View{
+                                                width: Fill
+                                                height: Fit
+                                                flow: Right
+                                                spacing: 8
+                                                align: Align{y: 0.5}
+                                                filter_size_label := Label{
+                                                    width: 96
+                                                    text: "any size"
+                                                    draw_text +: {
+                                                        color: mod.mpf.fg_dim
+                                                        text_style: theme.font_regular{font_size: 9.0}
+                                                    }
+                                                }
+                                                filter_size := Slider{
+                                                    width: Fill
+                                                    height: 18
+                                                    text: ""
+                                                }
+                                            }
+                                            filter_age_row := View{
+                                                width: Fill
+                                                height: Fit
+                                                flow: Right
+                                                spacing: 2
+                                                filter_age_hint := Label{
+                                                    margin: Inset{right: 4}
+                                                    text: "new:"
+                                                    draw_text +: {
+                                                        color: mod.mpf.fg_dim
+                                                        text_style: theme.font_regular{font_size: 9.0}
+                                                    }
+                                                }
+                                                filter_age0 := AgeChip{chip_label +: {text: "any"}}
+                                                filter_age1 := AgeChip{chip_label +: {text: "1d"}}
+                                                filter_age2 := AgeChip{chip_label +: {text: "3d"}}
+                                                filter_age3 := AgeChip{chip_label +: {text: "1w"}}
+                                                filter_age4 := AgeChip{chip_label +: {text: "1mo"}}
+                                                filter_age5 := AgeChip{chip_label +: {text: "1y"}}
+                                            }
+                                            Hr{}
+                                            filter_kind0 := LegendRow{}
+                                            filter_kind1 := LegendRow{}
+                                            filter_kind2 := LegendRow{}
+                                            filter_kind3 := LegendRow{}
+                                            filter_kind4 := LegendRow{}
+                                            filter_kind5 := LegendRow{}
+                                            filter_kind6 := LegendRow{}
+                                            filter_clear := View{
+                                                width: Fill
+                                                height: 20
+                                                align: Align{x: 1.0 y: 0.5}
+                                                cursor: MouseCursor.Hand
+                                                clear_label := Label{
+                                                    text: "clear all"
+                                                    draw_text +: {
+                                                        color: mod.mpf.accent
+                                                        text_style: theme.font_regular{font_size: 9.0}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
 
                                 progress_row := SolidView{
                                     visible: false
@@ -1058,92 +1164,6 @@ script_mod! {
                             menu_modified := MenuRow{}
                             menu_created := MenuRow{}
                             menu_permissions := MenuRow{}
-                        }
-                    }
-
-                    filter_popup := View{
-                        visible: false
-                        width: Fill
-                        height: Fill
-                        align: Align{x: 0.0 y: 0.0}
-                        padding: Inset{left: 340 top: 96}
-                        filter_panel := RectView{
-                            width: 300
-                            height: Fit
-                            flow: Down
-                            spacing: 6
-                            padding: Inset{left: 10 right: 10 top: 10 bottom: 10}
-                            draw_bg +: {
-                                color: mod.mpf.bg_dark
-                                border_color: mod.mpf.muted
-                                border_size: 1.0
-                            }
-                            filter_query := MpfInput{
-                                width: Fill
-                                height: 26
-                                empty_text: "name, .ext, >100mb, <7d"
-                            }
-                            View{
-                                width: Fill
-                                height: Fit
-                                flow: Right
-                                spacing: 8
-                                align: Align{y: 0.5}
-                                filter_size_label := Label{
-                                    width: 118
-                                    text: "any size"
-                                    draw_text +: {
-                                        color: mod.mpf.fg_dim
-                                        text_style: theme.font_regular{font_size: 9.0}
-                                    }
-                                }
-                                filter_size := Slider{
-                                    width: Fill
-                                    height: 18
-                                    text: ""
-                                }
-                            }
-                            filter_age_row := View{
-                                width: Fill
-                                height: Fit
-                                flow: Right
-                                spacing: 2
-                                filter_age_hint := Label{
-                                    margin: Inset{right: 4}
-                                    text: "new:"
-                                    draw_text +: {
-                                        color: mod.mpf.fg_dim
-                                        text_style: theme.font_regular{font_size: 9.0}
-                                    }
-                                }
-                                filter_age0 := AgeChip{chip_label +: {text: "any"}}
-                                filter_age1 := AgeChip{chip_label +: {text: "1d"}}
-                                filter_age2 := AgeChip{chip_label +: {text: "3d"}}
-                                filter_age3 := AgeChip{chip_label +: {text: "1w"}}
-                                filter_age4 := AgeChip{chip_label +: {text: "1mo"}}
-                                filter_age5 := AgeChip{chip_label +: {text: "1y"}}
-                            }
-                            Hr{}
-                            filter_kind0 := LegendRow{}
-                            filter_kind1 := LegendRow{}
-                            filter_kind2 := LegendRow{}
-                            filter_kind3 := LegendRow{}
-                            filter_kind4 := LegendRow{}
-                            filter_kind5 := LegendRow{}
-                            filter_kind6 := LegendRow{}
-                            filter_clear := View{
-                                width: Fill
-                                height: 20
-                                align: Align{x: 1.0 y: 0.5}
-                                cursor: MouseCursor.Hand
-                                clear_label := Label{
-                                    text: "clear all"
-                                    draw_text +: {
-                                        color: mod.mpf.accent
-                                        text_style: theme.font_regular{font_size: 9.0}
-                                    }
-                                }
-                            }
                         }
                     }
 
@@ -1428,6 +1448,7 @@ enum FocusTarget {
     Search,
     Batch,
     Chat,
+    Filter,
 }
 
 /// A finished recursive size measurement for the properties panel.
@@ -1461,13 +1482,19 @@ const COLUMN_ROWS: [(&[LiveId], model::SortKey); 5] = [
     (ids!(menu_permissions), model::SortKey::Permissions),
 ];
 
-const MODE_BUTTONS: [(&[LiveId], ViewMode); 6] = [
+const MODE_BUTTONS: [(&[LiveId], ViewMode); 4] = [
     (ids!(icons_button), ViewMode::Icons),
     (ids!(list_button), ViewMode::List),
     (ids!(compact_button), ViewMode::Compact),
     (ids!(treemap_button), ViewMode::Treemap),
-    (ids!(treemap25_button), ViewMode::Treemap25),
-    (ids!(treemap3d_button), ViewMode::Treemap3d),
+];
+
+/// The projection switch on the map's own strip: how the block view renders,
+/// not which view is open.
+const PROJ_BUTTONS: [(&[LiveId], MapProjection); 3] = [
+    (ids!(proj_flat), MapProjection::Flat),
+    (ids!(proj_ortho), MapProjection::Ortho),
+    (ids!(proj_persp), MapProjection::Persp),
 ];
 
 /// The tab strip's slots. More tabs than this and the strip would be a
@@ -1614,8 +1641,14 @@ pub struct App {
     quick_look_open: bool,
     #[rust]
     column_menu_open: bool,
+    /// The filter sidebar, docked to the right of the map. The name kept its
+    /// popup days; the state is the same choice.
     #[rust]
     filter_popup_open: bool,
+    /// How the block view renders — flat, extruded, perspective. A property
+    /// of the view, not a view of its own; saved across launches.
+    #[rust]
+    projection: MapProjection,
     /// The "modified within" choice: an index into [`AGE_MINUTES`].
     #[rust]
     filter_age: usize,
@@ -1853,6 +1886,7 @@ impl App {
                 .view(cx, ids!(batch_find))
                 .text_input(cx, ids!(field_input)),
             FocusTarget::Chat => self.ui.text_input(cx, ids!(chat_input)),
+            FocusTarget::Filter => self.ui.text_input(cx, ids!(filter_query)),
         };
         // `take_key_focus` focuses the field's *area*, and a field that has
         // not been drawn since it was revealed has none — focusing it would
@@ -2152,6 +2186,7 @@ impl App {
     /// Push a mode into the body and the toolbar without touching history.
     fn apply_mode(&mut self, cx: &mut Cx, mode: ViewMode) {
         let dir = self.current_dir();
+        let projection = self.projection;
         self.with_contents(cx, |contents, cx| {
             contents.set_mode(cx, mode);
             let map = contents.treemap(cx);
@@ -2161,14 +2196,7 @@ impl App {
                 if map.root() != dir {
                     map.set_root(cx, &dir);
                 }
-                map.set_projection(
-                    cx,
-                    match mode {
-                        ViewMode::Treemap25 => MapProjection::Ortho,
-                        ViewMode::Treemap3d => MapProjection::Persp,
-                        _ => MapProjection::Flat,
-                    },
-                );
+                map.set_projection(cx, projection);
             } else {
                 map.stop(cx);
             }
@@ -2179,14 +2207,47 @@ impl App {
                 .widget(cx, ids!(btn_sel))
                 .set_visible(cx, button_mode == mode);
         }
-        // The map's tool strip belongs to the map. The pick it acts on lives
-        // in the treemap widget and survives this, so coming back to the map
-        // finds the same rectangle still ringed.
+        self.style_projection_buttons(cx);
+        // The map's tool strip and the filter sidebar belong to the map. The
+        // pick it acts on lives in the treemap widget and survives this, so
+        // coming back to the map finds the same rectangle still ringed.
         self.ui
             .widget(cx, ids!(map_tools))
             .set_visible(cx, mode.is_treemap());
+        self.ui
+            .widget(cx, ids!(map_side))
+            .set_visible(cx, mode.is_treemap() && self.filter_popup_open);
         self.map_tools_note.clear();
         self.refresh_chat(cx);
+    }
+
+    /// Choose how the block view renders, remember it, and light the right
+    /// button. Never changes which view is open.
+    fn set_projection_choice(&mut self, cx: &mut Cx, projection: MapProjection) {
+        self.projection = projection;
+        model::pref_set(
+            "projection",
+            match projection {
+                MapProjection::Flat => "flat",
+                MapProjection::Ortho => "ortho",
+                MapProjection::Persp => "persp",
+            },
+        );
+        self.with_contents(cx, |contents, cx| {
+            contents.treemap(cx).set_projection(cx, projection);
+        });
+        self.style_projection_buttons(cx);
+        self.report(cx);
+        self.ui.redraw(cx);
+    }
+
+    fn style_projection_buttons(&mut self, cx: &mut Cx) {
+        for (id, projection) in PROJ_BUTTONS {
+            self.ui
+                .widget(cx, id)
+                .widget(cx, ids!(btn_sel))
+                .set_visible(cx, projection == self.projection);
+        }
     }
 
     fn zoom(&mut self, cx: &mut Cx, delta: isize) {
@@ -3467,6 +3528,18 @@ impl App {
 
         // Escape unwinds whatever is on top, innermost first.
         if event.key_code == KeyCode::Escape {
+            // The caret in the filter's query field first: Escape clears what
+            // is typed there, and only an already-empty field lets Escape
+            // mean anything bigger. The sidebar itself is the funnel's to
+            // close, never Escape's — a surprise-closing panel loses work.
+            if self.filter_popup_open && self.filter_is_typing(cx) {
+                let field = self.ui.text_input(cx, ids!(filter_query));
+                if !field.text().is_empty() {
+                    field.set_text(cx, "");
+                    self.rebuild_filter(cx);
+                    return;
+                }
+            }
             if self.menu_open {
                 return self.close_menu(cx);
             }
@@ -3491,9 +3564,6 @@ impl App {
             }
             if self.batch_open {
                 return self.close_batch(cx);
-            }
-            if self.filter_popup_open {
-                return self.set_filter_popup(cx, false);
             }
             if self.column_menu_open {
                 return self.set_column_menu(cx, false);
@@ -3567,9 +3637,21 @@ impl App {
                 KeyCode::Key1 => return self.set_mode(cx, ViewMode::Icons),
                 KeyCode::Key2 => return self.set_mode(cx, ViewMode::List),
                 KeyCode::Key3 => return self.set_mode(cx, ViewMode::Compact),
-                KeyCode::Key4 => return self.set_mode(cx, ViewMode::Treemap),
-                KeyCode::Key5 => return self.set_mode(cx, ViewMode::Treemap25),
-                KeyCode::Key6 => return self.set_mode(cx, ViewMode::Treemap3d),
+                // The block view and its three renderings: Cmd+4 the flat
+                // map, Cmd+5 the extrusion, Cmd+6 the perspective — each
+                // enters the view if it is not already open.
+                KeyCode::Key4 => {
+                    self.set_projection_choice(cx, MapProjection::Flat);
+                    return self.set_mode(cx, ViewMode::Treemap);
+                }
+                KeyCode::Key5 => {
+                    self.set_projection_choice(cx, MapProjection::Ortho);
+                    return self.set_mode(cx, ViewMode::Treemap);
+                }
+                KeyCode::Key6 => {
+                    self.set_projection_choice(cx, MapProjection::Persp);
+                    return self.set_mode(cx, ViewMode::Treemap);
+                }
                 _ => {}
             }
         }
@@ -3619,6 +3701,20 @@ impl App {
                     {
                         return self.report(cx);
                     }
+                }
+                // Q and E step the orbit, the keyboard's version of the
+                // left-drag. A no-op on the flat map.
+                KeyCode::KeyQ => {
+                    self.with_contents(cx, |contents, cx| {
+                        contents.treemap(cx).orbit_by(cx, -0.26, 0.0);
+                    });
+                    return;
+                }
+                KeyCode::KeyE => {
+                    self.with_contents(cx, |contents, cx| {
+                        contents.treemap(cx).orbit_by(cx, 0.26, 0.0);
+                    });
+                    return;
                 }
                 _ => {}
             }
@@ -4044,6 +4140,12 @@ impl App {
         !area.is_empty() && cx.has_key_focus(area)
     }
 
+    /// Whether the caret is in the filter sidebar's query field.
+    fn filter_is_typing(&mut self, cx: &mut Cx) -> bool {
+        let area = self.ui.text_input(cx, ids!(filter_query)).area();
+        !area.is_empty() && cx.has_key_focus(area)
+    }
+
     /// What "this" means right now: the map's pick on the map, the listing's
     /// selection anywhere else.
     fn chat_subject(&mut self, cx: &mut Cx) -> Option<PathBuf> {
@@ -4269,6 +4371,11 @@ impl App {
         if !self.tabs[self.tab].mode.is_treemap() {
             return;
         }
+        for (id, projection) in PROJ_BUTTONS {
+            if self.ui.view(cx, id).finger_down(actions).is_some() {
+                return self.set_projection_choice(cx, projection);
+            }
+        }
         if self.ui.view(cx, ids!(map_rescan)).finger_down(actions).is_some() {
             return self.rescan_map(cx);
         }
@@ -4310,10 +4417,16 @@ impl App {
 
     fn set_filter_popup(&mut self, cx: &mut Cx, open: bool) {
         self.filter_popup_open = open;
-        self.ui.widget(cx, ids!(filter_popup)).set_visible(cx, open);
+        model::pref_set("filter_side", if open { "1" } else { "0" });
+        self.ui.widget(cx, ids!(map_side)).set_visible(
+            cx,
+            open && self.tabs[self.tab].mode.is_treemap(),
+        );
         if open {
             self.refresh_filter_popup(cx);
-            self.ui.text_input(cx, ids!(filter_query)).set_key_focus(cx);
+            // The field has no area until the sidebar's first frame; focus
+            // lands on the frame that gives it one.
+            self.focus_soon(cx, FocusTarget::Filter);
         }
         self.ui.redraw(cx);
     }
@@ -4609,6 +4722,15 @@ impl MatchEvent for App {
         self.ui
             .check_box(cx, ids!(map_scan_all))
             .set_active(cx, !crate::model::scan_all(), Animate::No);
+        // The block view's saved rendering and whether its filter sidebar
+        // was left open — both come back exactly as they were left.
+        self.projection = match model::pref_get("projection").as_deref() {
+            Some("ortho") => MapProjection::Ortho,
+            Some("persp") => MapProjection::Persp,
+            _ => MapProjection::Flat,
+        };
+        self.filter_popup_open = model::pref_get("filter_side").as_deref() == Some("1");
+        self.style_projection_buttons(cx);
         // `--demo` browses a home that does not exist, so a screen recording
         // can show every feature of this app without showing anybody's disk.
         // It is chosen before anything reads a path, and never afterwards.
@@ -4952,6 +5074,22 @@ impl AppMain for App {
         // visibly-adopted, actually-being-used instance dark and unscanned.
         if self.dormancy.is_dormant() && is_wake_input(event) {
             self.wake(cx);
+        }
+        // A press anywhere outside the context menu's cards closes it. The
+        // raw event, on purpose: the widgets underneath swallow presses
+        // differently in every view, and the full-window overlay the menu
+        // sits in has no background of its own, so it never hits — waiting
+        // for a bubbled press is how the menu got stuck open.
+        if let Event::MouseDown(press) = event {
+            if self.menu_open {
+                let card = self.ui.view(cx, ids!(ctx_panel)).area().rect(cx);
+                let sub = self.ui.view(cx, ids!(ctx_sub_panel)).area().rect(cx);
+                let inside = card.contains(press.abs)
+                    || (self.submenu_open && sub.contains(press.abs));
+                if !inside {
+                    self.close_menu(cx);
+                }
+            }
         }
         if let Event::Signal = event {
             self.drain_directory_results(cx);

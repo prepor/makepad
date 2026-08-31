@@ -71,12 +71,6 @@ impl Rect {
         }
     }
 
-    /// The shorter of the two edges — "how small is this rectangle" in the
-    /// only sense a map cares about.
-    pub fn short_side(&self) -> f64 {
-        self.w.min(self.h)
-    }
-
     /// Whether any part of this rect lies inside `other`. Zero-area rects
     /// intersect nothing, which is the right answer for a degenerate slice.
     pub fn intersects(&self, other: &Rect) -> bool {

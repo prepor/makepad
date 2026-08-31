@@ -68,9 +68,22 @@ const TWEEN: Duration = Duration::from_millis(200);
 /// whole meaning of the raised projections: height is depth. Big enough
 /// that a nested plate clears its parent's label line.
 const RISE: f64 = 11.0;
-/// The perspective eye's height over the base plane, in the same points.
-/// Large on purpose: the 3d mode is the ortho map breathing, not a flyover.
+/// The perspective eye's distance from the pivot along the view axis, in the
+/// same points. Large on purpose: the 3d mode is the ortho map breathing,
+/// not a flyover.
 const PERSP_EYE: f64 = 1500.0;
+/// Where the orbit starts and where Esc returns it: enough tilt that height
+/// reads immediately, nowhere near enough to hide the map behind itself.
+const DEFAULT_PITCH: f64 = 0.66;
+/// The grazing end of the tilt. Past this the plane degenerates into a
+/// horizon and a disk-use instrument stops being one.
+const MAX_PITCH: f64 = 1.15;
+/// Radians of yaw per point of leftward drag, and of pitch per point down.
+const ORBIT_PER_PT: f64 = 0.010;
+const PITCH_PER_PT: f64 = 0.008;
+/// A press that stays within this many points is a click; past it, the
+/// button's drag gesture — and never both.
+const DRAG_THRESHOLD: f64 = 4.0;
 /// The tile size at which the cushion is at full strength. A cushion lives in
 /// the tile's own 0..1 space, so left alone a huge rectangle gets a huge soft
 /// gradient that reads as a spotlight rather than as a surface. The shading is
@@ -82,10 +95,18 @@ script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
 
-    /** One rectangle of the map: a Van Wijk cushion — a shallow pillow lit
-     * from the upper left — inside a hard border. The cushion is what makes a
+    /** One face of the map: a Van Wijk cushion — a shallow pillow lit from
+     * the upper left — inside a hard border. The cushion is what makes a
      * dense map readable: adjacent tiles of the same hue are separated by
-     * their own shading even where there is no room for a border line. */
+     * their own shading even where there is no room for a border line.
+     *
+     * The geometry is a free QUAD, not a rect: the orbit camera hands four
+     * projected screen corners per instance (c0 top-left, c1 top-right, c2
+     * bottom-right, c3 bottom-left) and the vertex stage interpolates them
+     * bilinearly, so one shared instance batch draws the flat map, the tilted
+     * plates and the prism walls alike. Because the corners are free, the
+     * usual vertex-clamp scissor would deform the shape — clipping happens in
+     * the fragment against the same draw_clip instead. */
     set_type_default() do #(DrawMapTile::script_shader(vm)) {
         ..mod.draw.DrawQuad
         /** the tile's own colour */
@@ -96,9 +117,38 @@ script_mod! {
         cushion: 0.55
         /** border thickness in points 0..3 step 0.25 */
         border: 1.0
+        scr: varying(vec2f)
+        qsize: varying(vec2f)
+        vertex: fn() {
+            let p = mix(
+                mix(self.c0, self.c1, self.geom.pos.x)
+                mix(self.c3, self.c2, self.geom.pos.x)
+                self.geom.pos.y
+            )
+            self.pos = self.geom.pos
+            self.scr = p
+            self.qsize = vec2(
+                max(length(self.c1 - self.c0), 1.0)
+                max(length(self.c3 - self.c0), 1.0)
+            )
+            let ps = p + self.draw_list.view_shift
+            self.world = self.draw_list.view_transform * vec4(
+                ps.x
+                ps.y
+                self.draw_depth + self.draw_call.zbias
+                1.0
+            )
+            self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * self.world)
+        }
         pixel: fn() {
-            let p = self.pos * self.rect_size
-            let d = min(min(p.x, p.y), min(self.rect_size.x - p.x, self.rect_size.y - p.y))
+            // The fragment scissor the free-quad geometry needs: outside the
+            // clip the fragment simply is not there.
+            if self.scr.x < self.draw_clip.x || self.scr.y < self.draw_clip.y
+                || self.scr.x > self.draw_clip.z || self.scr.y > self.draw_clip.w {
+                return vec4(0.0, 0.0, 0.0, 0.0)
+            }
+            let p = self.pos * self.qsize
+            let d = min(min(p.x, p.y), min(self.qsize.x - p.x, self.qsize.y - p.y))
             // The pillow's surface normal. The height field is the classic
             // x(1-x)·y(1-y) parabola, so its slope is linear in the position
             // and costs two multiplies.
@@ -147,6 +197,17 @@ pub struct DrawMapTile {
     cushion: f32,
     #[live]
     border: f32,
+    /// The projected screen corners of this face, clockwise from top-left.
+    /// Every face the map draws — flat tile, tilted plate, prism wall — is
+    /// these four points; `rect_pos`/`rect_size` only carry the bounding box.
+    #[live]
+    c0: Vec2f,
+    #[live]
+    c1: Vec2f,
+    #[live]
+    c2: Vec2f,
+    #[live]
+    c3: Vec2f,
 }
 
 /// What a press on the map means to the folder view around it.
@@ -160,6 +221,10 @@ pub enum TreemapAction {
     /// The ✕ on the filter chip: the map is unfiltered again, and whoever
     /// owns the filter controls should show them cleared.
     FilterCleared,
+    /// A secondary press released without dragging: the context menu's
+    /// moment, at this window point. A secondary press that dragged was a
+    /// pan and asks for nothing.
+    Context(DVec2),
     #[default]
     None,
 }
@@ -278,14 +343,20 @@ pub struct TreemapView {
     cam_scale: f64,
     #[rust]
     cam_off: DVec2,
-    /// A primary press that may become a pan: where it went down, where the
-    /// camera was when it did, and the tap count it arrived with. The click
-    /// itself is decided on release — a press that moved is a pan and picks
-    /// nothing, so dragging across the map never changes the selection.
+    /// The orbit half of the camera, raised projections only: `yaw` spins
+    /// the map plane about the panel's centre, `pitch` tilts the eye from
+    /// straight down (0) toward grazing. The flat map ignores both.
+    #[rust]
+    yaw: f64,
+    #[rust]
+    pitch: f64,
+    /// A press of either button waiting to learn whether it is a click or
+    /// that button's drag gesture. The click itself is decided on release —
+    /// a press that moved is a gesture and picks nothing, opens nothing, so
+    /// dragging across the map never changes the selection and never opens
+    /// the menu.
     #[rust]
     drag: Option<Drag>,
-    #[rust]
-    panning: bool,
 
     /// How the map is drawn: flat, extruded, or in perspective.
     #[rust]
@@ -370,12 +441,123 @@ struct CrumbHit {
     depth: usize,
 }
 
-/// A primary press waiting to learn whether it is a click or a pan.
+/// A press waiting to learn whether it is a click or its button's drag
+/// gesture: primary orbits (pans, on the flat map), secondary pans.
 #[derive(Clone, Copy)]
 struct Drag {
     from: DVec2,
     cam_off: DVec2,
+    yaw: f64,
+    pitch: f64,
     taps: u32,
+    secondary: bool,
+    /// Crossed the threshold: this press is a gesture now and will never be
+    /// a click, however close to `from` it releases.
+    moved: bool,
+}
+
+/// The frozen trigonometry of the orbit camera for one frame: the map plane
+/// spun by yaw about `pivot`, tilted by pitch, and — in perspective — pushed
+/// through an eye [`PERSP_EYE`] points up the view axis. The flat map is the
+/// same camera at yaw 0, pitch 0, which projects to the identity.
+#[derive(Clone, Copy)]
+struct Cam {
+    pivot: DVec2,
+    sin_yaw: f64,
+    cos_yaw: f64,
+    sin_pitch: f64,
+    cos_pitch: f64,
+    persp: bool,
+}
+
+impl Cam {
+    /// The layout point `p` at elevation `z`, on screen.
+    fn project(&self, p: DVec2, z: f64) -> DVec2 {
+        let dx = p.x - self.pivot.x;
+        let dy = p.y - self.pivot.y;
+        let xr = dx * self.cos_yaw - dy * self.sin_yaw;
+        let yr = dx * self.sin_yaw + dy * self.cos_yaw;
+        let vx = xr;
+        let vy = yr * self.cos_pitch - z * self.sin_pitch;
+        if !self.persp {
+            return dvec2(self.pivot.x + vx, self.pivot.y + vy);
+        }
+        let depth = yr * self.sin_pitch + z * self.cos_pitch;
+        let s = (PERSP_EYE / (PERSP_EYE - depth)).clamp(0.5, 2.5);
+        dvec2(self.pivot.x + vx * s, self.pivot.y + vy * s)
+    }
+
+    /// The ground point (z = 0) that projects to screen point `s` — the
+    /// exact inverse of [`Cam::project`], for both projections.
+    fn unproject_ground(&self, s: DVec2) -> DVec2 {
+        let sx = s.x - self.pivot.x;
+        let sy = s.y - self.pivot.y;
+        let (xr, yr);
+        if !self.persp {
+            yr = if self.cos_pitch.abs() < 1e-4 { 0.0 } else { sy / self.cos_pitch };
+            xr = sx;
+        } else {
+            // vy·s = sy with s = E/(E − yr·sinφ) and vy = yr·cosφ is linear
+            // in yr once multiplied out.
+            let denom = PERSP_EYE * self.cos_pitch + sy * self.sin_pitch;
+            yr = if denom.abs() < 1e-6 { 0.0 } else { sy * PERSP_EYE / denom };
+            let sc = (PERSP_EYE / (PERSP_EYE - yr * self.sin_pitch)).clamp(0.5, 2.5);
+            xr = sx / sc;
+        }
+        let dx = xr * self.cos_yaw + yr * self.sin_yaw;
+        let dy = -xr * self.sin_yaw + yr * self.cos_yaw;
+        dvec2(self.pivot.x + dx, self.pivot.y + dy)
+    }
+}
+
+/// One projected face: four screen corners, top-left first, clockwise.
+#[derive(Clone, Copy)]
+struct Quad {
+    p: [DVec2; 4],
+}
+
+impl Quad {
+    fn of_rect(cam: &Cam, r: &MapRect, z: f64) -> Quad {
+        Quad {
+            p: [
+                cam.project(dvec2(r.x, r.y), z),
+                cam.project(dvec2(r.x + r.w, r.y), z),
+                cam.project(dvec2(r.x + r.w, r.y + r.h), z),
+                cam.project(dvec2(r.x, r.y + r.h), z),
+            ],
+        }
+    }
+
+    fn bounds(&self) -> Rect {
+        let mut min = self.p[0];
+        let mut max = self.p[0];
+        for p in &self.p[1..] {
+            min.x = min.x.min(p.x);
+            min.y = min.y.min(p.y);
+            max.x = max.x.max(p.x);
+            max.y = max.y.max(p.y);
+        }
+        Rect { pos: min, size: max - min }
+    }
+
+    /// Whether `at` is inside this (convex) face, either winding.
+    fn contains(&self, at: DVec2) -> bool {
+        let mut sign = 0.0f64;
+        for i in 0..4 {
+            let a = self.p[i];
+            let b = self.p[(i + 1) % 4];
+            let cross = (b.x - a.x) * (at.y - a.y) - (b.y - a.y) * (at.x - a.x);
+            if cross.abs() < 1e-9 {
+                continue;
+            }
+            if sign == 0.0 {
+                sign = cross.signum();
+            } else if cross.signum() != sign {
+                return false;
+            }
+        }
+        sign != 0.0
+    }
 }
 
 /// How the map is projected onto the panel.
@@ -492,8 +674,9 @@ impl TreemapView {
         self.scanning = true;
         self.cam_scale = 1.0;
         self.cam_off = DVec2::default();
+        self.yaw = 0.0;
+        self.pitch = DEFAULT_PITCH;
         self.drag = None;
-        self.panning = false;
         self.filtered = None;
         self.totals_dirty = true;
         self.tween_capture = None;
@@ -726,10 +909,16 @@ impl TreemapView {
         self.pick.as_ref().map(|p| p.path.clone())
     }
 
-    /// Step the view back out. The camera first — Esc un-zooms what the eye
-    /// did before it re-roots what a reveal did. False when there is nowhere
-    /// left to go.
+    /// Step the view back out. The camera first — Esc un-orbits and un-zooms
+    /// what the eye did before it re-roots what a reveal did. False when
+    /// there is nowhere left to go.
     pub fn zoom_out(&mut self, cx: &mut Cx) -> bool {
+        if self.projection != MapProjection::Flat
+            && (self.yaw.abs() > 0.01 || (self.pitch - DEFAULT_PITCH).abs() > 0.01)
+        {
+            self.set_orbit(cx, 0.0, DEFAULT_PITCH);
+            return true;
+        }
         if self.cam_scale > 1.001 {
             self.set_camera(cx, 1.0, DVec2::default());
             return true;
@@ -783,6 +972,8 @@ impl TreemapView {
         // A re-root is a new picture; the camera starts over on it.
         self.cam_scale = 1.0;
         self.cam_off = DVec2::default();
+        self.yaw = 0.0;
+        self.pitch = DEFAULT_PITCH;
         self.redraw(cx);
     }
 
@@ -853,29 +1044,57 @@ impl TreemapView {
         depth.min(24.0) * self.rise()
     }
 
-    /// `rect` as drawn at elevation `z` under the current projection.
-    fn project_rect(&self, rect: &MapRect, z: f64) -> MapRect {
-        match self.projection {
-            MapProjection::Flat => *rect,
-            MapProjection::Ortho => MapRect {
-                x: rect.x,
-                y: rect.y - z,
-                w: rect.w,
-                h: rect.h,
-            },
-            MapProjection::Persp => {
-                let body = self.laid_out;
-                let cx = body.pos.x + body.size.x * 0.5;
-                let cy = body.pos.y + body.size.y * 0.5;
-                let s = (PERSP_EYE / (PERSP_EYE - z)).clamp(1.0, 1.6);
-                MapRect {
-                    x: cx + (rect.x - cx) * s,
-                    y: cy + (rect.y - cy) * s,
-                    w: rect.w * s,
-                    h: rect.h * s,
-                }
-            }
+    /// The orbit camera for a map drawn into `body`. The flat projection is
+    /// the same camera pinned straight down and un-spun, which makes it the
+    /// identity — one code path for all three.
+    fn cam_at(&self, body: Rect) -> Cam {
+        let (yaw, pitch) = match self.projection {
+            MapProjection::Flat => (0.0, 0.0),
+            _ => (self.yaw, self.pitch),
+        };
+        Cam {
+            pivot: dvec2(
+                body.pos.x + body.size.x * 0.5,
+                body.pos.y + body.size.y * 0.5,
+            ),
+            sin_yaw: yaw.sin(),
+            cos_yaw: yaw.cos(),
+            sin_pitch: pitch.sin(),
+            cos_pitch: pitch.cos(),
+            persp: self.projection == MapProjection::Persp,
         }
+    }
+
+    /// The layout-space direction a raised prism drifts in as it gains
+    /// elevation — where towers lean, and therefore what the painter's
+    /// order must follow. Screen-up, un-spun by the yaw.
+    fn lean(&self) -> DVec2 {
+        dvec2(-self.yaw.sin(), -self.yaw.cos())
+    }
+
+    /// Point the orbit somewhere. Everything downstream — projection, paint
+    /// order, culling — follows the camera, so this is a relayout like any
+    /// other camera move.
+    fn set_orbit(&mut self, cx: &mut Cx, yaw: f64, pitch: f64) {
+        let yaw = wrap_angle(yaw);
+        let pitch = pitch.clamp(0.0, MAX_PITCH);
+        if (yaw - self.yaw).abs() < 1e-9 && (pitch - self.pitch).abs() < 1e-9 {
+            return;
+        }
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.stale = true;
+        self.last_layout = None;
+        self.hover = None;
+        self.redraw(cx);
+    }
+
+    /// Nudge the orbit — the keyboard's Q/E.
+    pub fn orbit_by(&mut self, cx: &mut Cx, dyaw: f64, dpitch: f64) {
+        if self.projection == MapProjection::Flat {
+            return;
+        }
+        self.set_orbit(cx, self.yaw + dyaw, self.pitch + dpitch);
     }
 
     /// Change how the map projects. The layout itself never changes — only
@@ -885,6 +1104,9 @@ impl TreemapView {
             return;
         }
         self.projection = projection;
+        if self.pitch <= 0.0 {
+            self.pitch = DEFAULT_PITCH;
+        }
         self.hover = None;
         self.stale = true;
         self.last_layout = None;
@@ -1151,21 +1373,41 @@ impl TreemapView {
             w: rect.size.x * scale,
             h: rect.size.y * scale,
         };
-        let viewport = MapRect {
-            x: rect.pos.x,
-            y: rect.pos.y,
-            w: rect.size.x,
-            h: rect.size.y,
-        };
-        // The raised projections lift plates up the screen, so give the
-        // layout a little extra world below the window — otherwise a tower
-        // whose footprint sits just south of the panel could never lean in.
+        // What the camera can see, on the ground plane: the panel's corners
+        // un-projected, boxed, and grown by the tallest possible lean — the
+        // cull has to keep whatever could spin or lean into view.
         let viewport = match self.projection {
-            MapProjection::Flat => viewport,
-            _ => MapRect {
-                h: viewport.h + self.elev(24),
-                ..viewport
+            MapProjection::Flat => MapRect {
+                x: rect.pos.x,
+                y: rect.pos.y,
+                w: rect.size.x,
+                h: rect.size.y,
             },
+            _ => {
+                let cam = self.cam_at(rect);
+                let corners = [
+                    rect.pos,
+                    dvec2(rect.pos.x + rect.size.x, rect.pos.y),
+                    dvec2(rect.pos.x + rect.size.x, rect.pos.y + rect.size.y),
+                    dvec2(rect.pos.x, rect.pos.y + rect.size.y),
+                ];
+                let mut min = dvec2(f64::MAX, f64::MAX);
+                let mut max = dvec2(f64::MIN, f64::MIN);
+                for corner in corners {
+                    let g = cam.unproject_ground(corner);
+                    min.x = min.x.min(g.x);
+                    min.y = min.y.min(g.y);
+                    max.x = max.x.max(g.x);
+                    max.y = max.y.max(g.y);
+                }
+                let reach = self.elev(24) + 40.0;
+                MapRect {
+                    x: min.x - reach,
+                    y: min.y - reach,
+                    w: (max.x - min.x) + reach * 2.0,
+                    h: (max.y - min.y) + reach * 2.0,
+                }
+            }
         };
         self.cells = treemap::layout(
             self.focused(),
@@ -1181,8 +1423,7 @@ impl TreemapView {
         });
         self.paint_order = match self.projection {
             MapProjection::Flat => Vec::new(),
-            MapProjection::Ortho => cascade_order(&self.cells),
-            MapProjection::Persp => raise_order(&self.cells),
+            _ => view_order(&self.cells, self.lean()),
         };
         // A filter change captured the map as it looked; aim the tween from
         // there to the layout just built.
@@ -1220,21 +1461,27 @@ impl TreemapView {
     }
 
     /// The cell under a window point, if any. In the raised projections the
-    /// test happens on the top faces (plus the riser it stands on), front-most
-    /// first — the reverse of paint order, which is what "front" means.
+    /// test happens on the projected faces — top plate first, then the walls
+    /// it stands on — front-most first: the reverse of paint order, which is
+    /// what "front" means.
     fn hit_cell(&self, pos: DVec2) -> Option<usize> {
         if self.projection == MapProjection::Flat || self.paint_order.len() != self.cells.len() {
             return treemap::hit(&self.cells, pos.x, pos.y);
         }
+        let cam = self.cam_at(self.laid_out);
         let rise = self.rise();
         for &index in self.paint_order.iter().rev() {
             let cell = &self.cells[index];
-            let mut top = self.project_rect(&cell.rect, self.elev(cell.depth));
-            if self.projection == MapProjection::Ortho {
-                top.h += rise;
-            }
-            if top.contains(pos.x, pos.y) {
+            let z = self.elev(cell.depth);
+            if Quad::of_rect(&cam, &cell.rect, z).contains(pos) {
                 return Some(index);
+            }
+            if z > 0.0 {
+                for wall in wall_quads(&cam, &cell.rect, z, rise.min(z)).into_iter().flatten() {
+                    if wall.quad.contains(pos) {
+                        return Some(index);
+                    }
+                }
             }
         }
         None
@@ -1299,6 +1546,7 @@ impl TreemapView {
         let t = self.tween_t();
         let raised = self.projection != MapProjection::Flat;
         let rise = self.rise();
+        let cam = self.cam_at(self.laid_out);
 
         cx.push_clip_rect(clip);
         self.draw_tile.begin_many_instances(cx);
@@ -1317,18 +1565,12 @@ impl TreemapView {
                     self.tile_colors(cell, palette)
                 };
                 let z = if raised { self.elev_f(depth) } else { 0.0 };
-                let top = self.project_rect(&rect, z);
+                let quad = Quad::of_rect(&cam, &rect, z);
                 self.draw_tile.color = fade(fill, ghost);
                 self.draw_tile.edge = fade(border_ink, ghost);
                 self.draw_tile.cushion = 0.0;
                 self.draw_tile.border = 0.5;
-                self.draw_tile.draw_abs(
-                    cx,
-                    Rect {
-                        pos: dvec2(top.x, top.y),
-                        size: dvec2(top.w, top.h),
-                    },
-                );
+                face(&mut self.draw_tile, cx, &quad);
             }
         }
 
@@ -1345,58 +1587,26 @@ impl TreemapView {
                 continue;
             }
             let z = if raised { self.elev_f(vdepth) } else { 0.0 };
-            let top = self.project_rect(&vrect, z);
-            let rect = Rect {
-                pos: dvec2(top.x, top.y),
-                size: dvec2(top.w, top.h),
-            };
+            let quad = Quad::of_rect(&cam, &vrect, z);
+            let rect = quad.bounds();
             let cell = &self.cells[index];
             let (fill, cushion) = self.tile_colors(cell, palette);
             let is_hover = Some(index) == hovered;
             let is_pick = picked.as_deref() == Some(cell.path.as_path()) && !cell.is_bundle();
 
-            // The prism's body, under its own plate but over everything
-            // already painted — which is exactly what one shared instance
-            // batch in paint order gives.
-            match self.projection {
-                MapProjection::Flat => {}
-                MapProjection::Ortho if z > 0.0 => {
-                    // The riser: the face between this plate and the plateau
-                    // it stands on. This is where "height means depth" is
-                    // actually visible.
-                    self.draw_tile.color = fade(scale_rgb(fill, 0.42), alpha);
+            // The prism's walls: the faces between this plate and the
+            // plateau it stands on, on whichever sides the camera can see.
+            // This is where "height means depth" is actually visible — and
+            // they paint under their own plate but over everything already
+            // painted, which is exactly what one shared instance batch in
+            // paint order gives.
+            if raised && z > 0.0 {
+                for wall in wall_quads(&cam, &vrect, z, rise.min(z)).into_iter().flatten() {
+                    self.draw_tile.color = fade(scale_rgb(fill, wall.shade), alpha);
                     self.draw_tile.edge = fade(border_ink, alpha);
                     self.draw_tile.cushion = 0.0;
                     self.draw_tile.border = 0.0;
-                    self.draw_tile.draw_abs(
-                        cx,
-                        Rect {
-                            pos: dvec2(top.x, top.y + top.h),
-                            size: dvec2(top.w, rise),
-                        },
-                    );
-                }
-                MapProjection::Ortho => {}
-                MapProjection::Persp => {
-                    // A soft drop shadow sells the altitude the parallax
-                    // implies; it grows with elevation.
-                    let lift = 1.5 + z * 0.05;
-                    self.draw_tile.color = Vec4f {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                        w: 0.32 * alpha,
-                    };
-                    self.draw_tile.edge = Vec4f::default();
-                    self.draw_tile.cushion = 0.0;
-                    self.draw_tile.border = 0.0;
-                    self.draw_tile.draw_abs(
-                        cx,
-                        Rect {
-                            pos: dvec2(top.x + lift * 0.6, top.y + lift),
-                            size: dvec2(top.w, top.h),
-                        },
-                    );
+                    face(&mut self.draw_tile, cx, &wall.quad);
                 }
             }
 
@@ -1408,7 +1618,7 @@ impl TreemapView {
             // with a one-point border on every side is all border. So it
             // scales with the tile and simply stops existing on the small
             // ones, where the cushion's own shading does the separating.
-            let short = top.short_side();
+            let short = rect.size.x.min(rect.size.y);
             let border = if is_pick || is_hover {
                 1.5
             } else {
@@ -1428,7 +1638,7 @@ impl TreemapView {
             );
             self.draw_tile.cushion = cushion;
             self.draw_tile.border = border as f32;
-            self.draw_tile.draw_abs(cx, rect);
+            face(&mut self.draw_tile, cx, &quad);
 
             if labels.len() >= LABEL_BUDGET {
                 continue;
@@ -1496,18 +1706,12 @@ impl TreemapView {
                 let cell = &self.cells[index];
                 let (vrect, vdepth, _) = self.tweened(cell, t);
                 let z = if raised { self.elev_f(vdepth) } else { 0.0 };
-                let top = self.project_rect(&vrect, z);
+                let quad = Quad::of_rect(&cam, &vrect, z);
                 self.draw_tile.color = Vec4f { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
                 self.draw_tile.edge = accent;
                 self.draw_tile.cushion = 0.0;
                 self.draw_tile.border = 2.0;
-                self.draw_tile.draw_abs(
-                    cx,
-                    Rect {
-                        pos: dvec2(top.x, top.y),
-                        size: dvec2(top.w, top.h),
-                    },
-                );
+                face(&mut self.draw_tile, cx, &quad);
             }
         }
         cx.pop_clip_rect();
@@ -1679,9 +1883,14 @@ impl TreemapView {
             ),
             None => (
                 String::new(),
-                "Click picks · scroll zooms · drag pans · double-click fills the view · Esc backs \
-                 out · right-click for the file menu"
-                    .to_string(),
+                if self.projection == MapProjection::Flat {
+                    "Click picks · scroll zooms · drag pans · double-click fills the view · Esc \
+                     backs out · right-click for the file menu"
+                } else {
+                    "Click picks · left-drag orbits · right-drag pans · scroll zooms · \
+                     double-click fills the view · Esc backs out · right-click for the file menu"
+                }
+                .to_string(),
                 Palette::vec4(&palette.fg_dim),
             ),
         };
@@ -1729,15 +1938,14 @@ impl TreemapView {
             },
             if cell.pending { " · still scanning" } else { "" },
         );
-        let top = self.project_rect(
-            &cell.rect,
-            match self.projection {
-                MapProjection::Flat => 0.0,
-                _ => self.elev(cell.depth),
-            },
-        );
-        let anchor = dvec2(top.x, top.y);
-        let cell_h = top.h;
+        let cam = self.cam_at(self.laid_out);
+        let z = match self.projection {
+            MapProjection::Flat => 0.0,
+            _ => self.elev(cell.depth),
+        };
+        let top = Quad::of_rect(&cam, &cell.rect, z).bounds();
+        let anchor = top.pos;
+        let cell_h = top.size.y;
 
         let width = text_width(&self.draw_bold, cx, &head)
             .max(text_width(&self.draw_text, cx, &foot))
@@ -1768,7 +1976,14 @@ impl TreemapView {
         self.draw_tile.edge = Palette::vec4(&palette.accent);
         self.draw_tile.cushion = 0.0;
         self.draw_tile.border = 1.0;
-        self.draw_tile.draw_abs(cx, Rect { pos, size });
+        face(&mut self.draw_tile, cx, &Quad {
+            p: [
+                pos,
+                dvec2(pos.x + size.x, pos.y),
+                pos + size,
+                dvec2(pos.x, pos.y + size.y),
+            ],
+        });
 
         cx.push_clip_rect(Rect { pos, size });
         self.draw_bold.new_draw_call(cx);
@@ -1957,48 +2172,76 @@ impl Widget for TreemapView {
                 }
             }
             Hit::FingerDown(e) => {
-                let primary = e.device.is_primary_hit() && !e.modifiers.control;
-                if primary {
-                    // Click or pan — decided on release.
-                    self.drag = Some(Drag {
-                        from: e.abs,
-                        cam_off: self.cam_off,
-                        taps: e.tap_count,
-                    });
-                    self.panning = false;
-                } else {
-                    // A secondary press acts at once: the context menu it is
-                    // about to open needs its target picked now.
-                    self.press(cx, e.abs, e.tap_count, false);
-                }
+                // Either button: click or that button's drag gesture, decided
+                // on release — so a click never nudges the camera and a drag
+                // never changes the selection or opens the menu.
+                let secondary = !e.device.is_primary_hit() || e.modifiers.control;
+                self.drag = Some(Drag {
+                    from: e.abs,
+                    cam_off: self.cam_off,
+                    yaw: self.yaw,
+                    pitch: self.pitch,
+                    taps: e.tap_count,
+                    secondary,
+                    moved: false,
+                });
             }
             Hit::FingerMove(e) => {
-                if let Some(drag) = self.drag {
+                if let Some(mut drag) = self.drag {
                     let delta = e.abs - drag.from;
-                    if !self.panning && delta.length() > 4.0 {
-                        self.panning = true;
+                    if !drag.moved && delta.length() > DRAG_THRESHOLD {
+                        drag.moved = true;
                     }
-                    if self.panning && self.cam_scale > 1.001 {
-                        // The map follows the finger — dragging is how a
-                        // zoomed view gets around.
-                        self.set_camera(cx, self.cam_scale, drag.cam_off - delta);
+                    if drag.moved {
+                        let raised = self.projection != MapProjection::Flat;
+                        if !drag.secondary && raised {
+                            // Left-drag orbits: yaw with the hand, pitch with
+                            // the reach, both measured from the press point.
+                            self.set_orbit(
+                                cx,
+                                drag.yaw - delta.x * ORBIT_PER_PT,
+                                drag.pitch + delta.y * PITCH_PER_PT,
+                            );
+                        } else if self.cam_scale > 1.001 {
+                            // Right-drag pans (and so does left-drag on the
+                            // flat map): the map follows the finger, the
+                            // screen delta un-spun into layout space.
+                            let shift = if raised {
+                                let squash = self.pitch.cos().max(0.25);
+                                let dy = delta.y / squash;
+                                dvec2(
+                                    delta.x * self.yaw.cos() + dy * self.yaw.sin(),
+                                    -delta.x * self.yaw.sin() + dy * self.yaw.cos(),
+                                )
+                            } else {
+                                delta
+                            };
+                            self.set_camera(cx, self.cam_scale, drag.cam_off - shift);
+                        }
                     }
+                    self.drag = Some(drag);
                 }
             }
             Hit::FingerUp(_) => {
                 if let Some(drag) = self.drag.take() {
-                    if !self.panning {
-                        self.press(cx, drag.from, drag.taps, true);
+                    if !drag.moved {
+                        self.press(cx, drag.from, drag.taps, !drag.secondary);
+                        if drag.secondary {
+                            // A clean secondary click: the context menu's
+                            // moment — the pick above has already landed.
+                            cx.widget_action(self.uid, TreemapAction::Context(drag.from));
+                        }
                     }
                 }
-                self.panning = false;
             }
             Hit::FingerScroll(e) => {
                 // Wheel/two fingers zoom about the pointer. The exponent
                 // makes equal wheel travel worth equal zoom *ratio*, which
                 // is the only way in and out feel like the same control.
                 let factor = (-e.scroll.y * 0.011).exp();
-                self.zoom_at(cx, e.abs, factor);
+                let cam = self.cam_at(self.laid_out);
+                let anchor = cam.unproject_ground(e.abs);
+                self.zoom_at(cx, anchor, factor);
             }
             _ => {}
         }
@@ -2062,6 +2305,14 @@ impl TreemapViewRef {
     pub fn set_projection(&self, cx: &mut Cx, projection: MapProjection) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_projection(cx, projection);
+        }
+    }
+
+    /// Nudge the orbit camera — the keyboard's turn keys. A no-op on the
+    /// flat map.
+    pub fn orbit_by(&self, cx: &mut Cx, dyaw: f64, dpitch: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.orbit_by(cx, dyaw, dpitch);
         }
     }
 
@@ -2138,13 +2389,117 @@ fn lerp_rect(a: &MapRect, b: &MapRect, t: f64) -> MapRect {
     }
 }
 
-/// The paint order for the vertically-extruded map: everything only ever
-/// leans *north* (up the screen), so a cell may only cover cells above it —
-/// paint north before south. Nesting still means "parent under child", so
-/// the sort happens among siblings and each subtree stays together. The
-/// input is the layout's pre-order, which keeps every subtree contiguous.
-fn cascade_order(cells: &[Cell]) -> Vec<usize> {
-    fn emit(cells: &[Cell], start: usize, end: usize, depth: usize, out: &mut Vec<usize>) {
+/// Emit one face: the four projected corners into the instance, the
+/// bounding box into the rect the area system tracks.
+fn face(draw: &mut DrawMapTile, cx: &mut Cx2d, quad: &Quad) {
+    draw.c0 = v2f(quad.p[0]);
+    draw.c1 = v2f(quad.p[1]);
+    draw.c2 = v2f(quad.p[2]);
+    draw.c3 = v2f(quad.p[3]);
+    draw.draw_abs(cx, quad.bounds());
+}
+
+fn v2f(v: DVec2) -> Vec2f {
+    Vec2f {
+        x: v.x as f32,
+        y: v.y as f32,
+    }
+}
+
+/// `a`, wrapped into (-π, π] so a long orbit never accumulates.
+fn wrap_angle(a: f64) -> f64 {
+    let mut a = a % std::f64::consts::TAU;
+    if a > std::f64::consts::PI {
+        a -= std::f64::consts::TAU;
+    } else if a <= -std::f64::consts::PI {
+        a += std::f64::consts::TAU;
+    }
+    a
+}
+
+/// One visible vertical face of a prism, and how brightly it is lit.
+struct Wall {
+    quad: Quad,
+    shade: f32,
+}
+
+/// The walls of the prism standing on `r` between elevations `z - band` and
+/// `z` that face the camera — the sides whose outward normal has a
+/// screen-downward component under the current yaw. Never more than two.
+fn wall_quads(cam: &Cam, r: &MapRect, z: f64, band: f64) -> [Option<Wall>; 2] {
+    let edges: [(DVec2, DVec2, DVec2); 4] = [
+        // (a, b, outward normal), each edge in layout space.
+        (dvec2(r.x, r.y), dvec2(r.x + r.w, r.y), dvec2(0.0, -1.0)),
+        (dvec2(r.x + r.w, r.y + r.h), dvec2(r.x, r.y + r.h), dvec2(0.0, 1.0)),
+        (dvec2(r.x, r.y + r.h), dvec2(r.x, r.y), dvec2(-1.0, 0.0)),
+        (dvec2(r.x + r.w, r.y), dvec2(r.x + r.w, r.y + r.h), dvec2(1.0, 0.0)),
+    ];
+    let mut out = [None, None];
+    let mut slot = 0;
+    for (a, b, n) in edges {
+        // The normal's screen-down component after the yaw spin.
+        let down = n.x * cam.sin_yaw + n.y * cam.cos_yaw;
+        if down <= 0.02 || slot >= 2 {
+            continue;
+        }
+        out[slot] = Some(Wall {
+            quad: Quad {
+                p: [
+                    cam.project(a, z),
+                    cam.project(b, z),
+                    cam.project(b, z - band),
+                    cam.project(a, z - band),
+                ],
+            },
+            // Faces turned toward the camera catch more of the light.
+            shade: 0.30 + 0.20 * down as f32,
+        });
+        slot += 1;
+    }
+    out
+}
+
+/// Whether a prism standing on `a` can lean out over `b`: the swept region
+/// `a + t·d, t > 0` meets `b`. Exact for axis-aligned rects — the sweep is a
+/// t-interval per axis and the intervals either meet in t > 0 or never.
+fn leans_over(a: &MapRect, b: &MapRect, d: DVec2) -> bool {
+    let mut lo = f64::MIN;
+    let mut hi = f64::MAX;
+    for (dir, a_min, a_max, b_min, b_max) in [
+        (d.x, a.x, a.x + a.w, b.x, b.x + b.w),
+        (d.y, a.y, a.y + a.h, b.y, b.y + b.h),
+    ] {
+        if dir.abs() < 1e-9 {
+            if a_max <= b_min || b_max <= a_min {
+                return false;
+            }
+            continue;
+        }
+        let t0 = (b_min - a_max) / dir;
+        let t1 = (b_max - a_min) / dir;
+        let (t0, t1) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+        lo = lo.max(t0);
+        hi = hi.min(t1);
+    }
+    lo < hi && hi > 1e-6
+}
+
+/// Past this many sibling subtrees the exact pairwise ordering costs more
+/// than its correctness is worth; the scalar sort is right for everything
+/// but pathologically elongated neighbours.
+const EXACT_ORDER_MAX: usize = 400;
+
+/// The paint order for the raised projections under an orbiting camera:
+/// towers lean along `lean` (the layout direction that reads as screen-up),
+/// so a subtree may only cover subtrees whose footprints lie along that
+/// lean from its own. Per sibling level, blocks are ordered so that
+/// whatever can be leaned over paints first — an exact pairwise sweep
+/// test folded into a cycle-safe depth-first emit. Nesting still means
+/// "parent under child", so the ordering happens among siblings and each
+/// subtree stays together; the input is the layout's pre-order, which
+/// keeps every subtree contiguous.
+fn view_order(cells: &[Cell], lean: DVec2) -> Vec<usize> {
+    fn emit(cells: &[Cell], start: usize, end: usize, depth: usize, lean: DVec2, out: &mut Vec<usize>) {
         let mut blocks: Vec<(usize, usize)> = Vec::new();
         let mut i = start;
         while i < end {
@@ -2155,30 +2510,70 @@ fn cascade_order(cells: &[Cell]) -> Vec<usize> {
             }
             blocks.push((s, i));
         }
-        blocks.sort_by(|a, b| {
-            cells[a.0]
-                .rect
-                .y
-                .partial_cmp(&cells[b.0].rect.y)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        // Farthest along the lean first: at yaw 0 that is exactly the old
+        // "north before south". This scalar order is the seed (and the
+        // whole answer when the level is too wide for the exact pass).
+        let mut order: Vec<usize> = (0..blocks.len()).collect();
+        let along = |bi: usize| {
+            let r = &cells[blocks[bi].0].rect;
+            (r.x + r.w * 0.5) * lean.x + (r.y + r.h * 0.5) * lean.y
+        };
+        order.sort_by(|&a, &b| {
+            along(b).partial_cmp(&along(a)).unwrap_or(std::cmp::Ordering::Equal)
         });
-        for (s, e) in blocks {
+        if blocks.len() > 1 && blocks.len() <= EXACT_ORDER_MAX {
+            // The exact pass: block `a` must wait for every block it can
+            // lean over. Depth-first over "who must paint before me", with
+            // an in-progress mark so a (theoretical) cycle degrades to a
+            // local misordering instead of a hang.
+            let n = blocks.len();
+            let mut state = vec![0u8; n]; // 0 fresh, 1 visiting, 2 emitted
+            let mut ordered: Vec<usize> = Vec::with_capacity(n);
+            // Iterative DFS: (block, next seed-order candidate to examine).
+            let mut stack: Vec<(usize, usize)> = Vec::new();
+            for seed in 0..n {
+                let root = order[seed];
+                if state[root] != 0 {
+                    continue;
+                }
+                state[root] = 1;
+                stack.push((root, 0));
+                while let Some(top) = stack.pop() {
+                    let (node, mut cursor) = top;
+                    let a = cells[blocks[node].0].rect;
+                    let mut descend = None;
+                    while cursor < n {
+                        let j = order[cursor];
+                        cursor += 1;
+                        if state[j] == 0 && leans_over(&a, &cells[blocks[j].0].rect, lean) {
+                            descend = Some(j);
+                            break;
+                        }
+                    }
+                    match descend {
+                        Some(j) => {
+                            stack.push((node, cursor));
+                            state[j] = 1;
+                            stack.push((j, 0));
+                        }
+                        None => {
+                            state[node] = 2;
+                            ordered.push(node);
+                        }
+                    }
+                }
+            }
+            order = ordered;
+        }
+        for bi in order {
+            let (s, e) = blocks[bi];
             out.push(s);
-            emit(cells, s + 1, e, depth + 1, out);
+            emit(cells, s + 1, e, depth + 1, lean, out);
         }
     }
     let mut out = Vec::with_capacity(cells.len());
-    emit(cells, 0, cells.len(), 0, &mut out);
+    emit(cells, 0, cells.len(), 0, lean, &mut out);
     out
-}
-
-/// The paint order for the perspective map: nothing at a lower elevation can
-/// ever be in front of something higher under a straight-down eye, so floor
-/// to sky is correct. Stable, so the layout's order settles equal depths.
-fn raise_order(cells: &[Cell]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..cells.len()).collect();
-    order.sort_by_key(|&i| cells[i].depth);
-    order
 }
 
 /// `a` over `b` at `t`, in premultiplication-free straight colour.
@@ -2343,11 +2738,28 @@ mod tests {
         }
     }
 
-    // The rule that makes the extruded map paint correctly: everything only
-    // ever leans north, so north paints first — among siblings, with each
-    // subtree kept together and parents under their children.
+    fn cell_at(name: &str, depth: usize, x: f64, y: f64) -> Cell {
+        let mut c = cell(name, depth, y);
+        c.rect.x = x;
+        c
+    }
+
+    fn names(cells: &[Cell], order: &[usize]) -> Vec<String> {
+        order.iter().map(|&i| cells[i].name.clone()).collect()
+    }
+
+    /// The lean direction the camera at `yaw` produces — the same formula
+    /// the view uses.
+    fn lean_of(yaw: f64) -> DVec2 {
+        dvec2(-yaw.sin(), -yaw.cos())
+    }
+
+    // The rule that makes the extruded map paint correctly, at every yaw:
+    // towers lean along the camera's lean direction, so whatever can be
+    // leaned over paints first — among siblings, with each subtree kept
+    // together and parents under their children.
     #[test]
-    fn the_cascade_paints_north_before_south_and_parents_before_children() {
+    fn the_view_order_follows_the_lean_at_yaw_zero() {
         // Pre-order: P(y=50) with children c1(y=90), c2(y=60); then Q(y=0).
         let cells = vec![
             cell("p", 0, 50.0),
@@ -2355,17 +2767,88 @@ mod tests {
             cell("c2", 1, 60.0),
             cell("q", 0, 0.0),
         ];
-        let order = cascade_order(&cells);
-        let names: Vec<&str> = order.iter().map(|&i| cells[i].name.as_str()).collect();
-        assert_eq!(names, vec!["q", "p", "c2", "c1"]);
+        // Yaw 0 leans north: north paints first.
+        let order = view_order(&cells, lean_of(0.0));
+        assert_eq!(names(&cells, &order), vec!["q", "p", "c2", "c1"]);
     }
 
     #[test]
-    fn the_perspective_paints_floor_to_sky() {
-        let cells = vec![cell("deep", 3, 0.0), cell("shallow", 0, 50.0), cell("mid", 1, 9.0)];
-        let order = raise_order(&cells);
-        let depths: Vec<usize> = order.iter().map(|&i| cells[i].depth).collect();
-        assert_eq!(depths, vec![0, 1, 3]);
+    fn a_half_turn_reverses_the_order_a_quarter_turn_orders_by_x() {
+        let cells = vec![
+            cell("p", 0, 50.0),
+            cell("c1", 1, 90.0),
+            cell("c2", 1, 60.0),
+            cell("q", 0, 0.0),
+        ];
+        // 180°: everything leans south now, so south paints first.
+        let order = view_order(&cells, lean_of(std::f64::consts::PI));
+        assert_eq!(names(&cells, &order), vec!["p", "c1", "c2", "q"]);
+
+        // 90°: the lean is westward — order follows x, subtrees intact.
+        let cells = vec![
+            cell_at("east", 0, 100.0, 0.0),
+            cell_at("kid", 1, 110.0, 0.0),
+            cell_at("west", 0, 0.0, 0.0),
+        ];
+        let order = view_order(&cells, lean_of(std::f64::consts::FRAC_PI_2));
+        assert_eq!(names(&cells, &order), vec!["west", "east", "kid"]);
+    }
+
+    // The case a scalar sort gets wrong and the sweep test does not: a tall
+    // thin tower diagonally behind a long flat neighbour. The sweep of the
+    // tower's footprint along the lean reaches the slab, so the slab must
+    // paint first — wherever their centres happen to sit.
+    #[test]
+    fn the_sweep_test_orders_elongated_neighbours_correctly() {
+        let tower = MapRect { x: 0.0, y: 0.0, w: 10.0, h: 100.0 };
+        let slab = MapRect { x: 10.0, y: -200.0, w: 10.0, h: 245.0 };
+        let d = dvec2(std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2);
+        assert!(leans_over(&tower, &slab, d));
+        // And never both ways along one direction.
+        assert!(!leans_over(&slab, &tower, d));
+
+        let mut a = cell_at("tower", 0, 0.0, 0.0);
+        a.rect = tower;
+        let mut b = cell_at("slab", 0, 10.0, -200.0);
+        b.rect = slab;
+        let cells = vec![a, b];
+        let order = view_order(&cells, d);
+        assert_eq!(names(&cells, &order), vec!["slab", "tower"]);
+    }
+
+    // The camera's projection and its inverse agree on the ground plane, at
+    // any spin and tilt, in both projections.
+    #[test]
+    fn the_camera_unprojects_its_own_ground() {
+        for persp in [false, true] {
+            for (yaw, pitch) in [(0.0, 0.0), (0.7, 0.66), (-2.1, 1.1), (3.0, 0.2)] {
+                let cam = Cam {
+                    pivot: dvec2(500.0, 380.0),
+                    sin_yaw: f64::sin(yaw),
+                    cos_yaw: f64::cos(yaw),
+                    sin_pitch: f64::sin(pitch),
+                    cos_pitch: f64::cos(pitch),
+                    persp,
+                };
+                for p in [dvec2(0.0, 0.0), dvec2(731.0, 12.0), dvec2(400.0, 900.0)] {
+                    let s = cam.project(p, 0.0);
+                    let back = cam.unproject_ground(s);
+                    assert!(
+                        (back - p).length() < 1e-6,
+                        "persp={persp} yaw={yaw} pitch={pitch}: {p:?} -> {s:?} -> {back:?}"
+                    );
+                }
+                // And under the ortho eye, elevation only ever moves things
+                // screen-up: the whole meaning of the raised map. (The
+                // perspective eye adds a radial swell on top, so the claim
+                // is ortho's alone.)
+                if !persp && pitch > 0.0 {
+                    let flat = cam.project(dvec2(600.0, 500.0), 0.0);
+                    let high = cam.project(dvec2(600.0, 500.0), 40.0);
+                    assert!(high.y < flat.y);
+                }
+            }
+        }
     }
 
     // The bundle rectangle carries a kind no palette class answers to, and it

@@ -421,11 +421,7 @@ pub fn scan_all() -> bool {
 /// Change the scope and remember it. The caller owns triggering the rescan.
 pub fn set_scan_all(on: bool) {
     *scan_all_flag().lock().unwrap_or_else(|e| e.into_inner()) = on;
-    let path = home_dir().join(".config").join("mpfiles").join("prefs");
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(&path, if on { "scan_all=1\n" } else { "scan_all=0\n" });
+    pref_set("scan_all", if on { "1" } else { "0" });
 }
 
 fn scan_all_flag() -> &'static std::sync::Mutex<bool> {
@@ -434,13 +430,62 @@ fn scan_all_flag() -> &'static std::sync::Mutex<bool> {
         if std::env::var_os("MPFILES_SCAN_ALL").is_some_and(|v| v != "0") {
             return std::sync::Mutex::new(true);
         }
-        let saved = std::fs::read_to_string(
-            home_dir().join(".config").join("mpfiles").join("prefs"),
-        )
-        .map(|text| text.lines().any(|l| l.trim() == "scan_all=1"))
-        .unwrap_or(false);
-        std::sync::Mutex::new(saved)
+        std::sync::Mutex::new(pref_get("scan_all").as_deref() == Some("1"))
     })
+}
+
+/// Where the little `key=value` preference file lives.
+fn prefs_path() -> PathBuf {
+    home_dir().join(".config").join("mpfiles").join("prefs")
+}
+
+/// One saved preference, by key. The file is `key=value` lines, nothing
+/// more; a missing file is simply no preferences.
+pub fn pref_get(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(prefs_path()).ok()?;
+    pref_find(&text, key)
+}
+
+/// Save one preference, leaving every other key exactly as it was — the
+/// file is shared by whatever small choices the app remembers.
+pub fn pref_set(key: &str, value: &str) {
+    let path = prefs_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::write(&path, pref_replace(&old, key, value));
+}
+
+fn pref_find(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (k, v) = line.trim().split_once('=')?;
+        (k == key).then(|| v.to_string())
+    })
+}
+
+fn pref_replace(old: &str, key: &str, value: &str) -> String {
+    let mut out = String::new();
+    let mut written = false;
+    for line in old.lines() {
+        match line.trim().split_once('=') {
+            Some((k, _)) if k == key => {
+                if !written {
+                    out.push_str(&format!("{key}={value}\n"));
+                    written = true;
+                }
+            }
+            _ if !line.trim().is_empty() => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    if !written {
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    out
 }
 
 /// True for a folder the size map must not enter.
@@ -760,6 +805,23 @@ pub fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The preference file is shared by every small choice the app keeps, so
+    // writing one key must never eat the others.
+    #[test]
+    fn setting_one_preference_keeps_the_rest() {
+        let text = "scan_all=1\nprojection=ortho\n";
+        assert_eq!(pref_find(text, "projection").as_deref(), Some("ortho"));
+        assert_eq!(pref_find(text, "missing"), None);
+        let replaced = pref_replace(text, "projection", "persp");
+        assert_eq!(pref_find(&replaced, "projection").as_deref(), Some("persp"));
+        assert_eq!(pref_find(&replaced, "scan_all").as_deref(), Some("1"));
+        // A new key appends; nothing else moves.
+        let grown = pref_replace(&replaced, "filter_side", "1");
+        assert_eq!(pref_find(&grown, "filter_side").as_deref(), Some("1"));
+        assert_eq!(pref_find(&grown, "scan_all").as_deref(), Some("1"));
+        assert_eq!(grown.lines().count(), 3);
+    }
 
     // The rule that keeps macOS from throwing a permission dialog per
     // protected folder: those folders are never entered at all.

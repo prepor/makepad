@@ -354,8 +354,6 @@ pub enum ViewMode {
     List,
     Compact,
     Treemap,
-    Treemap25,
-    Treemap3d,
 }
 
 impl ViewMode {
@@ -365,14 +363,12 @@ impl ViewMode {
             ViewMode::List => "List",
             ViewMode::Compact => "Compact",
             ViewMode::Treemap => "Treemap",
-            ViewMode::Treemap25 => "Treemap 2.5D",
-            ViewMode::Treemap3d => "Treemap 3D",
         }
     }
 
     /// Whether this mode shows the treemap page, whatever the projection.
     pub fn is_treemap(self) -> bool {
-        matches!(self, ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d)
+        matches!(self, ViewMode::Treemap)
     }
 }
 
@@ -923,7 +919,7 @@ impl FileContents {
             }
             // The grid scrolls itself from `sync_grid_selection`; the map has
             // no scroll at all.
-            ViewMode::List | ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => {}
+            ViewMode::List | ViewMode::Treemap => {}
         }
     }
 
@@ -990,7 +986,7 @@ impl FileContents {
                 let (_, item) = grid.get_item(position, 0)?;
                 Some(item.text_input(cx, ids!(cell_edit)))
             }
-            ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => None,
+            ViewMode::Treemap => None,
         }
     }
 
@@ -1372,9 +1368,19 @@ impl FileContents {
                     out.push(FileContentsAction::Sorted);
                 }
             }
-            ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => {
-                let map = self.treemap(cx);
-                match map.action(actions) {
+            ViewMode::Treemap => {
+                // Every action from the map, not just the first: a secondary
+                // click emits its pick *and* its context request in one
+                // batch, and dropping either would lose the menu or the
+                // selection.
+                let map_uid = self.treemap(cx).widget_uid();
+                let map_actions: Vec<TreemapAction> = actions
+                    .iter()
+                    .filter_map(|a| a.as_widget_action().filter(|wa| wa.widget_uid == map_uid))
+                    .map(|wa| wa.cast::<TreemapAction>())
+                    .collect();
+                for action in map_actions {
+                    match action {
                     // Picking is picking. The old rule — anything not in the
                     // current listing means "go there" — made a single click
                     // on any rectangle below the top level throw the whole
@@ -1410,7 +1416,14 @@ impl FileContents {
                     TreemapAction::FilterCleared => {
                         out.push(FileContentsAction::MapFilterCleared);
                     }
+                    // A secondary click that stayed a click: the menu opens
+                    // exactly as it would have on the press, only now it is
+                    // certain no pan was meant.
+                    TreemapAction::Context(at) => {
+                        self.open_context(cx, at);
+                    }
                     TreemapAction::None => {}
+                    }
                 }
             }
         }
@@ -1571,7 +1584,7 @@ impl Widget for FileContents {
                         self.draw_list(cx, &mut grid);
                     }
                 }
-                ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => {}
+                ViewMode::Treemap => {}
             }
         }
         DrawStep::done()
@@ -1586,7 +1599,10 @@ impl Widget for FileContents {
         if let Event::MouseDown(press) = event {
             let secondary = press.button.is_secondary()
                 || (press.button.is_primary() && press.modifiers.control);
-            if secondary && self.body_rect.contains(press.abs) {
+            // Not on the treemap: there a secondary press may be the start of
+            // a right-drag pan, so the map itself decides on release and
+            // reports a clean click as `TreemapAction::Context`.
+            if secondary && self.mode != ViewMode::Treemap && self.body_rect.contains(press.abs) {
                 self.open_context(cx, press.abs);
             }
         }

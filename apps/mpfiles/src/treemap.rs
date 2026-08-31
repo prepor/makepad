@@ -76,6 +76,15 @@ impl Rect {
     pub fn short_side(&self) -> f64 {
         self.w.min(self.h)
     }
+
+    /// Whether any part of this rect lies inside `other`. Zero-area rects
+    /// intersect nothing, which is the right answer for a degenerate slice.
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x < other.x + other.w
+            && self.x + self.w > other.x
+            && self.y < other.y + other.h
+            && self.y + self.h > other.y
+    }
 }
 
 /// One scanned entry. Folders carry their children; files are leaves.
@@ -1149,13 +1158,26 @@ impl Cell {
 /// from it and the names on the way down, which is why the tree itself does
 /// not carry paths.
 ///
+/// `viewport` is the part of `area` actually on screen. When a camera has
+/// zoomed the map, `area` is the whole map at its blown-up size and the
+/// viewport is the window into it: everything outside is skipped entirely —
+/// no cell, no recursion — which is what keeps a deep zoom costing what the
+/// pixels on screen cost rather than what the whole magnified map would.
+/// With no camera the two are the same rect.
+///
 /// The output is in painter's order: a group's own cell always comes before
 /// its children, so a caller drawing the vector front to back gets children
 /// on top of their group for free, with no separate z-ordering step.
-pub fn layout(node: &Node, root_path: &Path, area: Rect, style: &MapStyle) -> Vec<Cell> {
+pub fn layout(
+    node: &Node,
+    root_path: &Path,
+    area: Rect,
+    viewport: Rect,
+    style: &MapStyle,
+) -> Vec<Cell> {
     let mut out = Vec::new();
     let mut path = root_path.to_path_buf();
-    layout_children(&node.children, &mut path, area, 0, style, &mut out);
+    layout_children(&node.children, &mut path, area, viewport, 0, style, &mut out);
     out
 }
 
@@ -1170,11 +1192,15 @@ fn layout_children(
     children: &[Node],
     path: &mut PathBuf,
     area: Rect,
+    viewport: Rect,
     depth: usize,
     style: &MapStyle,
     out: &mut Vec<Cell>,
 ) {
     if children.is_empty() || area.w <= 0.0 || area.h <= 0.0 || out.len() >= style.max_cells {
+        return;
+    }
+    if !area.intersects(&viewport) {
         return;
     }
     let total: f64 = children.iter().map(|c| c.size as f64).sum();
@@ -1214,6 +1240,11 @@ fn layout_children(
         if rect.w < style.min_side || rect.h < style.min_side {
             // Invisible at this scale: drawing it would just be a sliver, and
             // if it is a folder its children would be smaller still.
+            continue;
+        }
+        if !rect.intersects(&viewport) {
+            // Off the edge of the window the camera is looking through, and
+            // so is everything inside it.
             continue;
         }
         let Some(&index) = keep.get(slot) else {
@@ -1271,7 +1302,7 @@ fn layout_children(
             extra: 0,
         });
         if is_group {
-            layout_children(&child.children, path, inner, depth + 1, style, out);
+            layout_children(&child.children, path, inner, viewport, depth + 1, style, out);
         }
         path.pop();
     }
@@ -1485,7 +1516,7 @@ mod tests {
             ],
         );
         let area = Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 };
-        let cells = layout(&tree, Path::new("/root"), area, &style());
+        let cells = layout(&tree, Path::new("/root"), area, area, &style());
 
         let sub_index = cells.iter().position(|c| c.name == "sub").unwrap();
         let a_index = cells.iter().position(|c| c.name == "a.txt").unwrap();
@@ -1511,7 +1542,7 @@ mod tests {
         }
         let tree = dir("root", vec![tree]);
         let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
-        let cells = layout(&tree, Path::new("/root"), area, &style());
+        let cells = layout(&tree, Path::new("/root"), area, area, &style());
         let buried = cells.iter().find(|c| c.name == "buried.bin").unwrap();
         assert_eq!(buried.depth, 10);
         assert_eq!(
@@ -1528,7 +1559,7 @@ mod tests {
         let mut style = style();
         style.min_side = 4.0;
         style.min_area = 16.0;
-        let cells = layout(&tree, Path::new("/root"), area, &style);
+        let cells = layout(&tree, Path::new("/root"), area, area, &style);
         assert!(cells.iter().any(|c| c.name == "big.bin"));
         assert!(!cells.iter().any(|c| c.name == "tiny.bin"));
     }
@@ -1541,7 +1572,7 @@ mod tests {
         children.extend((0..50_000).map(|i| leaf(&format!("t{i}.tmp"), 100)));
         let tree = dir("root", children);
         let area = Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 };
-        let cells = layout(&tree, Path::new("/root"), area, &MapStyle::default());
+        let cells = layout(&tree, Path::new("/root"), area, area, &MapStyle::default());
         // Two rectangles: the big file, and one that says how many were left.
         assert!(cells.len() < 8, "{} cells is a laid-out tail", cells.len());
         let bundle = cells.iter().find(|c| c.is_bundle()).unwrap();
@@ -1617,11 +1648,55 @@ mod tests {
         assert_eq!(tree.denied_paths(1).len(), 1);
     }
 
+    // The camera contract: blowing the map up N× and looking at it through a
+    // window must cost what the window costs, and must actually show more —
+    // the detail floor follows the magnified area, not the screen.
+    #[test]
+    fn a_zoomed_layout_culls_to_the_viewport_and_gains_detail() {
+        // 200 equal folders of 40 files each: at screen size a folder is a
+        // ~17pt tile, so its files land far below the visibility floor.
+        let children: Vec<Node> = (0..200)
+            .map(|i| {
+                dir(
+                    &format!("d{i}"),
+                    (0..40).map(|j| leaf(&format!("f{j}.bin"), 25_000)).collect(),
+                )
+            })
+            .collect();
+        let tree = dir("root", children);
+        let screen = Rect { x: 0.0, y: 0.0, w: 300.0, h: 200.0 };
+        let style = MapStyle::default();
+
+        // Unzoomed: the folders show, their files are bundled away.
+        let flat = layout(&tree, Path::new("/root"), screen, screen, &style);
+        assert!(flat.iter().any(|c| c.name == "d0"));
+        assert!(flat.iter().all(|c| !c.name.starts_with('f')));
+
+        // 8× camera, looking at the top-left corner of the blown-up map.
+        let area = Rect { x: 0.0, y: 0.0, w: 2400.0, h: 1600.0 };
+        let zoomed = layout(&tree, Path::new("/root"), area, screen, &style);
+
+        // Everything delivered is at least partly on screen…
+        for cell in &zoomed {
+            assert!(
+                cell.rect.intersects(&screen),
+                "{} at {:?} is entirely off screen",
+                cell.name,
+                cell.rect
+            );
+        }
+        // …the off-screen majority was skipped, not delivered…
+        let dirs = zoomed.iter().filter(|c| c.is_dir).count();
+        assert!(dirs < 60, "{dirs} of 200 folders for a 1/64 window");
+        // …and the zoom bought real detail: the files inside are visible now.
+        assert!(zoomed.iter().any(|c| c.name.starts_with('f')));
+    }
+
     #[test]
     fn hit_finds_the_deepest_cell() {
         let tree = dir("root", vec![dir("sub", vec![leaf("a.txt", 100)])]);
         let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = layout(&tree, Path::new("/root"), area, &style());
+        let cells = layout(&tree, Path::new("/root"), area, area, &style());
 
         let group = cells.iter().position(|c| c.name == "sub").unwrap();
         let child = cells.iter().position(|c| c.name == "a.txt").unwrap();

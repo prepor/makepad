@@ -258,6 +258,24 @@ pub struct TreemapView {
     #[rust]
     frame: NextFrame,
 
+    /// The visual camera over the map: 1.0 shows the whole focused folder
+    /// fitted to the panel; larger blows it up that many times, with
+    /// `cam_off` saying how far the window has slid into the blown-up map
+    /// (in points, from its top-left). Purely a way of *looking* — the
+    /// breadcrumb, the browser and the scan never move with it.
+    #[rust]
+    cam_scale: f64,
+    #[rust]
+    cam_off: DVec2,
+    /// A primary press that may become a pan: where it went down, where the
+    /// camera was when it did, and the tap count it arrived with. The click
+    /// itself is decided on release — a press that moved is a pan and picks
+    /// nothing, so dragging across the map never changes the selection.
+    #[rust]
+    drag: Option<Drag>,
+    #[rust]
+    panning: bool,
+
     #[rust]
     generation: u64,
     #[rust]
@@ -303,6 +321,14 @@ pub struct TreemapView {
 struct CrumbHit {
     rect: Rect,
     depth: usize,
+}
+
+/// A primary press waiting to learn whether it is a click or a pan.
+#[derive(Clone, Copy)]
+struct Drag {
+    from: DVec2,
+    cam_off: DVec2,
+    taps: u32,
 }
 
 impl TreemapView {
@@ -366,6 +392,11 @@ impl TreemapView {
             self.receiver = Some(receiver);
         }
         self.stop(cx);
+        // Re-measuring the folder already on screen is not a reason to lose
+        // what the user had picked: the selection is a path, and the path is
+        // as true after the rescan as before it. A different folder is a
+        // different picture, and there the old pick would be a lie.
+        let keep_pick = if path == self.root { self.pick.take() } else { None };
         self.root = path.to_path_buf();
         self.zoom.clear();
         self.tree = Node::dir(crate::model::display_name(path), FileKind::Folder as u8);
@@ -374,11 +405,15 @@ impl TreemapView {
         self.stale = true;
         self.last_layout = None;
         self.hover = None;
-        self.pick = None;
+        self.pick = keep_pick;
         self.error = None;
         self.folders_left = 0;
         self.scanned_at = 0;
         self.scanning = true;
+        self.cam_scale = 1.0;
+        self.cam_off = DVec2::default();
+        self.drag = None;
+        self.panning = false;
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
@@ -488,7 +523,7 @@ impl TreemapView {
             None => String::new(),
         };
         format!(
-            "{where_it_is} — {} in {} files · double-click a folder to zoom in, Esc to go back{picked}",
+            "{where_it_is} — {} in {} files · scroll zooms, drag pans, Esc backs out{picked}",
             treemap::format_bytes(node.size),
             node.files,
         )
@@ -604,8 +639,14 @@ impl TreemapView {
         self.pick.as_ref().map(|p| p.path.clone())
     }
 
-    /// Zoom out one level. False when the map is already at the top.
+    /// Step the view back out. The camera first — Esc un-zooms what the eye
+    /// did before it re-roots what a reveal did. False when there is nowhere
+    /// left to go.
     pub fn zoom_out(&mut self, cx: &mut Cx) -> bool {
+        if self.cam_scale > 1.001 {
+            self.set_camera(cx, 1.0, DVec2::default());
+            return true;
+        }
         if self.zoom.pop().is_none() {
             return false;
         }
@@ -652,7 +693,83 @@ impl TreemapView {
         self.stale = true;
         self.last_layout = None;
         self.laid_out = Rect::default();
+        // A re-root is a new picture; the camera starts over on it.
+        self.cam_scale = 1.0;
+        self.cam_off = DVec2::default();
         self.redraw(cx);
+    }
+
+    // ------------------------------------------------------------- camera
+
+    /// Move the camera: clamp so the window never leaves the map, then lay
+    /// the map out again at the new magnification. The re-layout is the whole
+    /// point of zooming here — the magnified map is laid out at its blown-up
+    /// size and culled to the window, so detail that was below the
+    /// visibility floor comes into existence instead of scaling up blurry,
+    /// and "N smaller items" plates dissolve into the things they stood for.
+    fn set_camera(&mut self, cx: &mut Cx, scale: f64, off: DVec2) {
+        let body = self.laid_out;
+        let scale = scale.clamp(1.0, 512.0);
+        let off = dvec2(
+            off.x.clamp(0.0, (body.size.x * (scale - 1.0)).max(0.0)),
+            off.y.clamp(0.0, (body.size.y * (scale - 1.0)).max(0.0)),
+        );
+        if (scale - self.cam_scale).abs() < 1e-9 && (off - self.cam_off).length() < 1e-9 {
+            return;
+        }
+        self.cam_scale = scale;
+        self.cam_off = off;
+        self.stale = true;
+        self.last_layout = None;
+        self.hover = None;
+        self.redraw(cx);
+    }
+
+    /// Zoom by `factor`, keeping the map point under `at` exactly where it
+    /// is — the anchor rule every map application follows.
+    fn zoom_at(&mut self, cx: &mut Cx, at: DVec2, factor: f64) {
+        let body = self.laid_out;
+        if body.size.x <= 0.0 || body.size.y <= 0.0 {
+            return;
+        }
+        let old = self.cam_scale.max(1.0);
+        let new = (old * factor).clamp(1.0, 512.0);
+        let factor = new / old;
+        let anchor = at - body.pos;
+        self.set_camera(
+            cx,
+            new,
+            dvec2(
+                (self.cam_off.x + anchor.x) * factor - anchor.x,
+                (self.cam_off.y + anchor.y) * factor - anchor.y,
+            ),
+        );
+    }
+
+    /// Fill the panel with `rect` — what a double-click means: go look at
+    /// this one, without re-rooting anything.
+    fn fit_rect(&mut self, cx: &mut Cx, rect: Rect) {
+        let body = self.laid_out;
+        if rect.size.x <= 1.0 || rect.size.y <= 1.0 || body.size.x <= 0.0 {
+            return;
+        }
+        let old = self.cam_scale.max(1.0);
+        let fit = (body.size.x / rect.size.x).min(body.size.y / rect.size.y) * 0.94;
+        let new = (old * fit).clamp(1.0, 512.0);
+        let factor = new / old;
+        let pos = dvec2(
+            (rect.pos.x - body.pos.x + self.cam_off.x) * factor,
+            (rect.pos.y - body.pos.y + self.cam_off.y) * factor,
+        );
+        let size = dvec2(rect.size.x * factor, rect.size.y * factor);
+        self.set_camera(
+            cx,
+            new,
+            dvec2(
+                pos.x - (body.size.x - size.x) * 0.5,
+                pos.y - (body.size.y - size.y) * 0.5,
+            ),
+        );
     }
 
     /// Write the finished tree out for next time. Encoding walks the whole
@@ -789,13 +906,23 @@ impl TreemapView {
 
     fn relayout(&mut self, rect: Rect) {
         let base = self.focus_path();
+        // The map is laid out at the camera's magnification and culled to
+        // the panel: zoomed in, the layout does the work of the pixels on
+        // screen, not of the whole magnified picture.
+        let scale = self.cam_scale.max(1.0);
         let area = MapRect {
+            x: rect.pos.x - self.cam_off.x,
+            y: rect.pos.y - self.cam_off.y,
+            w: rect.size.x * scale,
+            h: rect.size.y * scale,
+        };
+        let viewport = MapRect {
             x: rect.pos.x,
             y: rect.pos.y,
             w: rect.size.x,
             h: rect.size.y,
         };
-        self.cells = treemap::layout(self.focused(), &base, area, &self.style);
+        self.cells = treemap::layout(self.focused(), &base, area, viewport, &self.style);
         self.laid_out = rect;
         self.stale = false;
         self.last_layout = Some(Instant::now());
@@ -882,12 +1009,12 @@ impl TreemapView {
                 pos: dvec2(cell.rect.x, cell.rect.y),
                 size: dvec2(cell.rect.w, cell.rect.h),
             };
-            let (mut fill, cushion) = self.tile_colors(cell, palette);
+            let (fill, cushion) = self.tile_colors(cell, palette);
             let is_hover = Some(index) == hovered;
             let is_pick = picked.as_deref() == Some(cell.path.as_path()) && !cell.is_bundle();
-            if is_hover {
-                fill = blend(bright, fill, 0.24);
-            }
+            // Hover is the outline only — a bright border flash, never a
+            // relit tile: on a dense map a whole rectangle changing value
+            // under the pointer reads as the data changing.
             // The border is what separates siblings, and it can never be
             // allowed to eat the tile it surrounds — a three-point rectangle
             // with a one-point border on every side is all border. So it
@@ -915,13 +1042,25 @@ impl TreemapView {
             if labels.len() >= LABEL_BUDGET {
                 continue;
             }
+            // A zoomed camera slides tiles half off the panel; a name pinned
+            // to a corner nobody can see is a tile nobody can identify, so
+            // labels clamp to the visible part of their rectangle — unless
+            // almost none of it is visible, where a clamped name would just
+            // pile up on the panel edge with its neighbours'.
+            let at_x = (rect.pos.x + 4.0).max(clip.pos.x + 4.0);
+            let room = rect.pos.x + rect.size.x - at_x - 4.0;
+            let clamped = rect.pos.y < clip.pos.y;
+            if clamped && rect.pos.y + rect.size.y - clip.pos.y < 40.0 {
+                continue;
+            }
             if cell.is_group && cell.header > 0.0 {
                 // A group's name goes in the strip it reserved for it, which
                 // is the only place on a group that its children are not
-                // about to be drawn over.
+                // about to be drawn over — clamped on top of them when the
+                // strip itself has slid off.
                 labels.push(Label {
-                    at: dvec2(rect.pos.x + 4.0, rect.pos.y + 1.0),
-                    room: rect.size.x - 8.0,
+                    at: dvec2(at_x, (rect.pos.y + 1.0).max(clip.pos.y + 1.0)),
+                    room,
                     line: format!("{}  {}", cell.name, treemap::format_bytes(cell.size)),
                     below: None,
                     ink: bright,
@@ -932,8 +1071,8 @@ impl TreemapView {
             {
                 let two_lines = rect.size.y >= LABEL_TWO_LINE_H;
                 labels.push(Label {
-                    at: dvec2(rect.pos.x + 4.0, rect.pos.y + 3.0),
-                    room: rect.size.x - 8.0,
+                    at: dvec2(at_x, (rect.pos.y + 3.0).max(clip.pos.y + 3.0)),
+                    room,
                     line: cell.name.clone(),
                     below: two_lines.then(|| treemap::format_bytes(cell.size)),
                     ink: ink_dark,
@@ -1110,8 +1249,8 @@ impl TreemapView {
             ),
             None => (
                 String::new(),
-                "Click a rectangle to pick it · double-click a folder to zoom in · Esc goes back \
-                 · right-click for the file menu"
+                "Click picks · scroll zooms · drag pans · double-click fills the view · Esc backs \
+                 out · right-click for the file menu"
                     .to_string(),
                 Palette::vec4(&palette.fg_dim),
             ),
@@ -1233,9 +1372,17 @@ impl TreemapView {
         }
         self.pick = Some(pick_of(&cell));
         self.redraw(cx);
+        let rect = Rect {
+            pos: dvec2(cell.rect.x, cell.rect.y),
+            size: dvec2(cell.rect.w, cell.rect.h),
+        };
         if cell.is_bundle() {
-            // Nothing on disk is under there to act on; the footer says what
-            // it stands for and that is the whole of it.
+            // Nothing on disk is under there to act on — but zooming in on
+            // it is exactly the right move: at the higher magnification the
+            // re-layout dissolves the bundle into the things it stood for.
+            if primary && taps >= 2 {
+                self.fit_rect(cx, rect);
+            }
             return;
         }
         // A secondary press only picks: the context menu that follows it acts
@@ -1246,16 +1393,11 @@ impl TreemapView {
             return;
         }
         if taps >= 2 {
-            if cell.is_dir {
-                // Zooming re-roots the picture without re-reading the disk:
-                // the subtree is already in hand.
-                if self.zoom_into(cx, &cell.path.clone()) {
-                    return;
-                }
-            } else {
-                cx.widget_action(self.uid, TreemapAction::Reveal(cell.path));
-                return;
-            }
+            // The camera, not a re-root and not a navigation: the breadcrumb,
+            // the browser and the scan all stay where they are — the map just
+            // goes and looks at this one, and Esc backs straight out again.
+            // (Going *to* a file lives in the context menu, on purpose.)
+            self.fit_rect(cx, rect);
         }
         cx.widget_action(self.uid, TreemapAction::Selected(cell.path));
     }
@@ -1288,6 +1430,22 @@ impl Widget for TreemapView {
             ),
         };
 
+        // Layout before the chrome: the footer reads the pick's numbers and
+        // the relayout is what refreshes them, so a frame that did both in
+        // the other order would print a stale size and never come back for
+        // the right one.
+        if !self.tree.children.is_empty() {
+            if self.laid_out != body || (self.stale && self.layout_is_due()) {
+                self.relayout(body);
+            } else if self.stale {
+                // Drawn from a picture the scan has already moved past. The
+                // throttle says not yet, so come back for it — a skipped
+                // relayout that nothing ever comes back for is a map that
+                // stops updating and never says so.
+                self.frame = cx.new_next_frame();
+            }
+        }
+
         self.draw_crumbs(cx, crumb_strip, palette);
         self.draw_footer(cx, foot_strip, palette);
 
@@ -1304,16 +1462,6 @@ impl Widget for TreemapView {
                 .draw_abs(cx, body.pos + dvec2(16.0, 16.0), &text);
             cx.add_aligned_rect_area(&mut self.area, rect);
             return DrawStep::done();
-        }
-
-        if self.laid_out != body || (self.stale && self.layout_is_due()) {
-            self.relayout(body);
-        } else if self.stale {
-            // Drawn from a picture the scan has already moved past. The
-            // throttle says not yet, so come back for it — a skipped
-            // relayout that nothing ever comes back for is a map that stops
-            // updating and never says so.
-            self.frame = cx.new_next_frame();
         }
 
         let labels = self.draw_map(cx, palette, body);
@@ -1351,7 +1499,47 @@ impl Widget for TreemapView {
             }
             Hit::FingerDown(e) => {
                 let primary = e.device.is_primary_hit() && !e.modifiers.control;
-                self.press(cx, e.abs, e.tap_count, primary);
+                if primary {
+                    // Click or pan — decided on release.
+                    self.drag = Some(Drag {
+                        from: e.abs,
+                        cam_off: self.cam_off,
+                        taps: e.tap_count,
+                    });
+                    self.panning = false;
+                } else {
+                    // A secondary press acts at once: the context menu it is
+                    // about to open needs its target picked now.
+                    self.press(cx, e.abs, e.tap_count, false);
+                }
+            }
+            Hit::FingerMove(e) => {
+                if let Some(drag) = self.drag {
+                    let delta = e.abs - drag.from;
+                    if !self.panning && delta.length() > 4.0 {
+                        self.panning = true;
+                    }
+                    if self.panning && self.cam_scale > 1.001 {
+                        // The map follows the finger — dragging is how a
+                        // zoomed view gets around.
+                        self.set_camera(cx, self.cam_scale, drag.cam_off - delta);
+                    }
+                }
+            }
+            Hit::FingerUp(_) => {
+                if let Some(drag) = self.drag.take() {
+                    if !self.panning {
+                        self.press(cx, drag.from, drag.taps, true);
+                    }
+                }
+                self.panning = false;
+            }
+            Hit::FingerScroll(e) => {
+                // Wheel/two fingers zoom about the pointer. The exponent
+                // makes equal wheel travel worth equal zoom *ratio*, which
+                // is the only way in and out feel like the same control.
+                let factor = (-e.scroll.y * 0.011).exp();
+                self.zoom_at(cx, e.abs, factor);
             }
             _ => {}
         }

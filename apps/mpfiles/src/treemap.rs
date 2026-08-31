@@ -7,11 +7,12 @@
 //!
 //! Two things make this usable on a real, full disk rather than a toy folder.
 //!
-//! The scan **streams**: it announces a directory's listing the moment it has
-//! read it and hands finished subtrees back one at a time ([`ScanStep`]), so a
-//! map of a 1.8 TB home starts drawing in milliseconds and sharpens as the walk
-//! goes deeper, instead of showing nothing for several minutes and then
-//! everything at once.
+//! The scan **streams**: every directory, at every depth, announces its
+//! listing the moment it has been read ([`ScanStep`]), so a map of a 1.8 TB
+//! home starts drawing in milliseconds and sharpens as the walk goes deeper —
+//! the picture is never more than one `read_dir` behind the walk. A 500 GB
+//! folder four levels down fills in live like everything else, instead of
+//! sitting as one opaque growing block until its whole subtree is done.
 //!
 //! The layout is **pixel-bounded, not depth-bounded**: it recurses all the way
 //! down to individual files and stops only where a rectangle gets too small to
@@ -347,7 +348,9 @@ pub enum ScanStep {
         denied: bool,
     },
     /// The subtree at `at` is finished and replaces whatever stood there.
-    /// Sent for subtrees the walk scanned in one piece.
+    /// The walk itself no longer produces these — every directory streams its
+    /// own [`ScanStep::Opened`] — but installing a saved map is exactly this
+    /// step with `at` empty, so it stays.
     Closed { at: Vec<u32>, node: Node },
     /// Running totals for a directory that is still being walked, so a big
     /// folder's rectangle grows while it is being counted instead of sitting
@@ -360,11 +363,6 @@ pub enum ScanStep {
     Pace { folders_left: u32 },
 }
 
-/// How deep the walk announces structure before it starts handing back whole
-/// finished subtrees. Three levels is what makes a home directory's shape
-/// (`~/Library/Caches/Chromium`) visible within the first second; below that
-/// the per-subtree message is cheaper than the bookkeeping to split it.
-const STREAM_DEPTH: usize = 3;
 /// How often a still-running subtree reports its running total.
 const GROW_EVERY: Duration = Duration::from_millis(120);
 /// How many entries pass between progress reports in the blocking [`scan`].
@@ -671,10 +669,12 @@ const SCAN_THREADS: usize = 6;
 /// Walk `root`, streaming the tree back through `sink` as it is discovered.
 ///
 /// The root's own listing goes out first, so a caller has a drawable map
-/// within one `read_dir`. Every folder down to [`STREAM_DEPTH`] then becomes a
-/// work item: it announces its own listing and hands its subfolders back to
-/// the pool. Below that depth a folder is walked whole and delivered in one
-/// piece, because at that size the message costs more than the subtree.
+/// within one `read_dir`. Every folder — at any depth — then becomes a work
+/// item: it announces its own listing and hands its subfolders back to the
+/// pool. There is deliberately no depth cutoff: an earlier design walked deep
+/// subtrees whole and delivered them in one piece, and on a disk whose bytes
+/// sit in one enormous subtree that meant the map showed a single opaque
+/// growing block for minutes and then everything at once.
 ///
 /// Returns false when the walk was cancelled, so a caller never paints a
 /// half-built tree as if it were the finished picture.
@@ -755,8 +755,8 @@ fn finish(queue: &Mutex<Queue>, wake: &Condvar, children: Vec<Job>, open: &Atomi
     wake.notify_all();
 }
 
-/// Read one folder. Shallow folders announce their listing and hand their
-/// subfolders back; deep ones are walked whole and delivered in one piece.
+/// Read one folder: announce its listing, hand its subfolders back to the
+/// pool as work items of their own.
 fn run_job(
     job: Job,
     rules: &ScanRules,
@@ -768,23 +768,9 @@ fn run_job(
     if cancel.load(Ordering::Relaxed) {
         return Vec::new();
     }
-    if job.at.len() >= STREAM_DEPTH {
-        growth.start(&job.at);
-        let name = job
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let kind = (rules.classify)(&job.path, true);
-        if let Some(node) = walk_whole(&job.path, name, kind, rules, device, cancel, growth) {
-            sink(ScanStep::Closed { at: job.at, node });
-        }
-        growth.start(&[]);
-        return Vec::new();
-    }
-    // Shallow: the running total belongs to this folder while its own listing
-    // is being read, which on a folder with a quarter of a million files is
-    // most of the time this job takes.
+    // The running total belongs to this folder while its own listing is being
+    // read, which on a folder with a quarter of a million files is most of
+    // the time this job takes.
     growth.start(&job.at);
     let listing = read_listing(&job.path, rules, device, growth);
     growth.start(&[]);
@@ -807,51 +793,6 @@ fn run_job(
             }
         })
         .collect()
-}
-
-/// The whole subtree under `dir`, built in memory and returned in one piece.
-/// Reports its running total through `growth`, so the rectangle it belongs to
-/// keeps growing while this runs.
-fn walk_whole(
-    dir: &Path,
-    name: String,
-    kind: u8,
-    rules: &ScanRules,
-    device: Option<u64>,
-    cancel: &AtomicBool,
-    growth: &mut Growth,
-) -> Option<Node> {
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let listing = read_listing(dir, rules, device, growth);
-    let denied = listing.denied;
-    let mut children = Vec::with_capacity(listing.entries.len());
-    for entry in listing.entries {
-        if entry.is_dir {
-            children.push(walk_whole(
-                &entry.path,
-                entry.name,
-                entry.kind,
-                rules,
-                device,
-                cancel,
-                growth,
-            )?);
-        } else {
-            children.push(Node::file(entry.name, entry.kind, entry.size));
-        }
-    }
-    Some(Node {
-        size: children.iter().map(|c| c.size).sum(),
-        files: children.iter().map(|c| c.files).sum(),
-        kind: heaviest_kind(&children).unwrap_or(kind),
-        name,
-        is_dir: true,
-        done: true,
-        denied,
-        children,
-    })
 }
 
 /// Walk `root` recursively and hand back the whole tree at once. The simple
@@ -1798,8 +1739,8 @@ mod tests {
     fn the_streamed_scan_builds_the_same_tree_as_the_blocking_one() {
         let root = temp_root("stream");
         let expected = sample_tree(&root);
-        // Deep enough to cross STREAM_DEPTH, so both halves of the protocol
-        // (announced structure and whole handed-back subtrees) are exercised.
+        // Deep enough that an old depth-cutoff walker would have switched to
+        // handing back whole subtrees — this tree must stream all the way.
         fs::create_dir_all(root.join("deep/a/b/c/d")).unwrap();
         fs::write(root.join("deep/a/b/c/d/e.bin"), vec![0u8; 400]).unwrap();
 
@@ -1821,15 +1762,49 @@ mod tests {
             "the root's own listing never arrived"
         );
 
-        // Whole subtrees arrive already finished; the folders above them are
-        // announced a level at a time and are only known to be finished when
-        // the walk is, which is what `seal` says.
+        // Folders are announced a level at a time and are only known to be
+        // finished when the walk is, which is what `seal` says.
         fn all_done(node: &Node) -> bool {
             node.children.iter().all(|c| (!c.is_dir || c.done) && all_done(c))
         }
         assert!(!all_done(&tree), "nothing should be sealed before the walk ends");
         tree.seal();
         assert!(all_done(&tree));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // The reason the walk has no depth cutoff: a 500 GB folder four levels
+    // down must fill in live on the map, not sit as one opaque block until
+    // its whole subtree has been walked. Every directory at every depth
+    // announces its own listing; nothing is delivered as a finished subtree.
+    #[test]
+    fn every_directory_streams_its_own_listing_at_any_depth() {
+        let root = temp_root("stream-depth");
+        sample_tree(&root); // root, sub, sub/subsub
+        fs::create_dir_all(root.join("deep/a/b/c/d")).unwrap();
+        fs::write(root.join("deep/a/b/c/d/e.bin"), vec![0u8; 400]).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let steps = Mutex::new(Vec::new());
+        assert!(scan_stream(&root, &open_rules(), &cancel, &|step| {
+            steps.lock().unwrap().push(step);
+        }));
+
+        let mut opened_ats: Vec<Vec<u32>> = Vec::new();
+        for step in steps.into_inner().unwrap() {
+            match step {
+                ScanStep::Opened { at, .. } => opened_ats.push(at),
+                ScanStep::Closed { .. } => {
+                    panic!("the walk handed back a whole subtree instead of streaming it")
+                }
+                _ => {}
+            }
+        }
+        // One listing per directory: root, sub, subsub, deep, a, b, c, d.
+        assert_eq!(opened_ats.len(), 8, "opened: {opened_ats:?}");
+        let deepest = opened_ats.iter().map(|at| at.len()).max().unwrap();
+        assert_eq!(deepest, 5, "deep/a/b/c/d never announced its own listing");
 
         fs::remove_dir_all(&root).ok();
     }

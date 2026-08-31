@@ -1363,16 +1363,21 @@ pub struct MapStyle {
     /// This is also what bounds the cost of a folder to its pixels rather
     /// than to how many files it holds.
     pub min_area: f64,
-    /// The border a folder insets its children by — the visible gap that says
-    /// "these belong together". Widest at the top level and narrowing with
-    /// depth: the outermost frames are the ones carrying the shape of the
-    /// disk, and a fourth-level folder cannot afford three points of margin.
+    /// The border a folder insets its children by, as a *fraction of the
+    /// packing area's short side* — never a point size. A point-sized inset
+    /// made the children's share of their frame depend on the zoom, so the
+    /// whole map "breathed" as it scaled; a fractional one rides the zoom
+    /// exactly, which is what makes the geometry a pure function of map
+    /// space. Narrowing with depth falls out on its own: each level's inset
+    /// is a fraction of an area that is itself smaller.
     pub inset: f64,
-    /// The strip a folder reserves at its top for its own name, when it is
-    /// big enough to earn one.
+    /// How tall a group's floating name is drawn, in points. Purely a draw
+    /// hint — a name never reserves layout room, because a strip that
+    /// appears at some zoom is a strip that shoves children at that zoom.
     pub header: f64,
-    /// A folder needs to be at least this wide and tall before it gets a
-    /// header strip; below it, the name would cost more than it tells.
+    /// A folder needs to be at least this wide and tall on screen before its
+    /// floating name is worth drawing; below it, the name would cost more
+    /// than it tells. Gates drawing only — never geometry.
     pub header_min: (f64, f64),
     /// A folder whose inside comes out smaller than this on either edge is
     /// drawn as one plate instead of being opened up — nesting borders
@@ -1388,7 +1393,10 @@ impl Default for MapStyle {
         MapStyle {
             min_side: 2.0,
             min_area: 9.0,
-            inset: 1.0,
+            // ~3pt at the top level of a default-height window (≈735pt),
+            // matching the old point-sized look at zoom 1 exactly where it
+            // was calibrated, then scaling with whatever it frames.
+            inset: 0.004,
             header: 12.0,
             header_min: (58.0, 34.0),
             group_min: 6.0,
@@ -1467,13 +1475,6 @@ pub fn layout(
     // keeps it true (see `layout_children` on what canon is for).
     layout_children(&node.children, &mut path, area, area, viewport, 0, style, filter, &mut out);
     out
-}
-
-/// The frame a folder at `depth` puts around its children: three points at the
-/// top level, narrowing toward one. The outer frames carry the shape of the
-/// disk and can afford the pixels; a sixth-level folder cannot.
-pub fn inset_for(style: &MapStyle, depth: usize) -> f64 {
-    style.inset * (1.0 + 2.0 / (depth as f64 + 1.0))
 }
 
 /// `canon` is the packing space: a rect with the same area as `area` but a
@@ -1709,8 +1710,14 @@ fn layout_children(
             }
             let index = order[start + slot];
             let child = &children[index];
-            // A folder opens up when its inside is still worth looking at.
-            // The header is the first thing given up, then the nesting.
+            // The frame around a group's children is a fraction of THIS
+            // level's packing area, so every sibling wears the same border
+            // and the border scales exactly with the zoom: the children's
+            // share of their frame is the same at every magnification, which
+            // is the last thing that used to make the map breathe. Names
+            // reserve nothing — a group's name floats over its children at
+            // draw time (`header` below is only the hint that it earned one).
+            let inner = rect.shrink(style.inset * area.w.min(area.h), 0.0);
             let header = if child.is_dir
                 && rect.w >= style.header_min.0
                 && rect.h >= style.header_min.1
@@ -1719,7 +1726,6 @@ fn layout_children(
             } else {
                 0.0
             };
-            let inner = rect.shrink(inset_for(style, depth), header);
             let is_group = child.is_dir
                 && !child.children.is_empty()
                 && inner.w >= style.group_min
@@ -1855,14 +1861,12 @@ mod tests {
 
     // The zoom-invariance contract, mechanically: pack a rich tree at a
     // ladder of zooms over the same anchored viewport and demand that every
-    // cell present at two zooms sits in the same place in map space. The
-    // only tolerated motion is the few points of drift that point-sized
-    // insets cost nested cells, and the only tolerated exception is the
-    // subtree of a group whose header strip appeared or vanished between
-    // the two zooms — that shove is local by construction. Root-level cells
-    // have no inset above them and must not move at all. This is the test
-    // that fails when any zoom-dependent quantity leaks back into the
-    // packing.
+    // cell present at two zooms sits in EXACTLY the same place in map space,
+    // at every nesting level, with no exemptions. Insets are fractions of
+    // map space and names reserve no room, so there is nothing left that may
+    // lawfully move — the only tolerance is floating-point noise. This is
+    // the test that fails when any zoom-dependent quantity leaks back into
+    // the geometry.
     #[test]
     fn the_arrangement_is_zoom_invariant_by_construction() {
         // Mixed sizes, an equal-size run (the tie-swap trap), nesting, and
@@ -1921,8 +1925,9 @@ mod tests {
         check_invariant(first, *area_first, last, *area_last);
     }
 
-    /// Every real cell present in both layouts must occupy the same map-space
-    /// rect, up to the inset drift budget — except under a header flip.
+    /// Every real cell present in both layouts must occupy exactly the same
+    /// map-space rect — width and height as well as centre — at every depth.
+    /// No drift budget, no exemptions: only floating-point noise is forgiven.
     fn check_invariant(cells_a: &[Cell], area_a: Rect, cells_b: &[Cell], area_b: Rect) {
         use std::collections::HashMap;
         let by_path_a: HashMap<&Path, &Cell> = cells_a
@@ -1930,59 +1935,40 @@ mod tests {
             .filter(|c| !c.is_bundle())
             .map(|c| (c.path.as_path(), c))
             .collect();
-        // Groups whose header state differs between the two layouts: their
-        // subtrees are the one tolerated local exception.
-        let mut header_flips: Vec<PathBuf> = Vec::new();
-        for cell in cells_b.iter().filter(|c| c.is_group) {
-            if let Some(a) = by_path_a.get(cell.path.as_path()) {
-                if (a.header > 0.0) != (cell.header > 0.0) {
-                    header_flips.push(cell.path.clone());
-                }
-            }
-        }
-        let exempt = |path: &Path| header_flips.iter().any(|flip| path.starts_with(flip) && path != flip);
         let mut compared = 0usize;
         for cell in cells_b.iter().filter(|c| !c.is_bundle()) {
             let Some(a) = by_path_a.get(cell.path.as_path()) else {
                 continue;
             };
-            if exempt(&cell.path) {
-                continue;
-            }
-            // Map A's rect into B's screen space and compare centres.
+            // Map A's rect into B's screen space and compare all four numbers.
             let scale_w = area_b.w / area_a.w;
             let scale_h = area_b.h / area_a.h;
-            let expected_x = area_b.x + (a.rect.x - area_a.x) * scale_w + a.rect.w * scale_w * 0.5;
-            let expected_y = area_b.y + (a.rect.y - area_a.y) * scale_h + a.rect.h * scale_h * 0.5;
-            let actual_x = cell.rect.x + cell.rect.w * 0.5;
-            let actual_y = cell.rect.y + cell.rect.h * 0.5;
-            let dx = (expected_x - actual_x).abs();
-            let dy = (expected_y - actual_y).abs();
-            // Root-level cells have no inset above them: exact. Nested cells
-            // may drift by the point-sized chrome (insets + a header strip)
-            // of each level above them — and that drift, measured at the
-            // deeper zoom, scales with the zoom ratio, because a fixed-point
-            // shrink at the shallow zoom is a proportionally bigger bite of
-            // a smaller rect. A genuine row flip moves a tile by a whole
-            // row pitch and blows straight through this.
-            let ratio = area_b.w / area_a.w;
-            let budget = if cell.depth == 0 {
-                1e-6
-            } else {
-                16.0 * (1.0 + cell.depth as f64) * ratio.max(1.0)
+            let expected = Rect {
+                x: area_b.x + (a.rect.x - area_a.x) * scale_w,
+                y: area_b.y + (a.rect.y - area_a.y) * scale_h,
+                w: a.rect.w * scale_w,
+                h: a.rect.h * scale_h,
             };
-            assert!(
-                dx <= budget && dy <= budget,
-                "{} moved {:.1},{:.1}pt between zooms (depth {}, sizes {} vs {}, {:?} -> {:?})",
-                cell.path.display(),
-                dx,
-                dy,
-                cell.depth,
-                a.size,
-                cell.size,
-                a.rect,
-                cell.rect
-            );
+            let ratio = (area_b.w / area_a.w).max(1.0);
+            // Millipoints at zoom 1, ~0.03pt across the full 32× throw —
+            // orders of magnitude under a pixel, and a genuine geometry
+            // change moves a tile by whole points at least.
+            let noise = 1e-3 * ratio;
+            for (got, want) in [
+                (cell.rect.x, expected.x),
+                (cell.rect.y, expected.y),
+                (cell.rect.w, expected.w),
+                (cell.rect.h, expected.h),
+            ] {
+                assert!(
+                    (got - want).abs() <= noise,
+                    "{} moved between zooms (depth {}, {:?} vs expected {:?})",
+                    cell.path.display(),
+                    cell.depth,
+                    cell.rect,
+                    expected
+                );
+            }
             compared += 1;
         }
         assert!(compared > 20, "only {compared} cells survived both layouts — the test is not biting");
@@ -2037,7 +2023,10 @@ mod tests {
         MapStyle {
             min_side: 1.0,
             min_area: 1.0,
-            inset: 1.0,
+            // A fraction of the packing area's short side, like the default:
+            // 1% keeps a visible margin at the test geometries (a 100pt rect
+            // frames its children by a full point) without eating them.
+            inset: 0.01,
             header: 6.0,
             header_min: (30.0, 20.0),
             group_min: 3.0,

@@ -284,6 +284,10 @@ struct Label {
     line: String,
     below: Option<String>,
     ink: Vec4f,
+    /// True for a name that floats over other tiles (a group's) and brings
+    /// its own dim plate for contrast. A leaf's name sits on the leaf's own
+    /// cushion and needs none.
+    scrim: bool,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -1903,6 +1907,9 @@ impl TreemapView {
         let hovered = self.hover;
         let picked = self.pick.as_ref().map(|p| p.path.clone());
         let mut labels: Vec<Label> = Vec::new();
+        // The x-extent and row of every floating name placed so far, for the
+        // collision stagger — group names only, so this stays tens long.
+        let mut placed_names: Vec<(f64, f64, f64)> = Vec::new();
         let t = self.tween_t();
         let raised = self.projection != MapProjection::Flat;
         let rise = self.rise();
@@ -2039,19 +2046,50 @@ impl TreemapView {
                 continue;
             }
             if cell.is_group && cell.header > 0.0 {
-                // A group's name goes in the strip it reserved for it, which
-                // is the only place on a group that its children are not
-                // about to be drawn over — clamped on top of them when the
-                // strip itself has slid off, one line further down per
-                // nesting level so a stack of clamped ancestors reads as a
-                // breadcrumb instead of overprinting into garble. In the
-                // raised projections the children float up over that strip,
-                // so the name moves to the plate's *bottom* edge, which the
-                // lift exposes instead.
+                // A group's name reserves no layout room any more — a strip
+                // that appears at some zoom is a strip that shoves children
+                // at that zoom. The name floats over the children on a dim
+                // plate of its own, at the top edge in the flat map (where
+                // the strip used to sit, so the look barely changes),
+                // clamped one line further down per nesting level so a stack
+                // of clamped ancestors reads as a breadcrumb instead of
+                // garble. In the raised projections the lift exposes the
+                // plate's bottom edge; the name goes there.
                 let at_y = if raised {
                     (rect.pos.y + rect.size.y - 13.0).min(clip.pos.y + clip.size.y - 13.0)
                 } else {
-                    (rect.pos.y + 1.0).max(clip.pos.y + 1.0 + cell.depth as f64 * 12.0)
+                    // Names share the sheet now, so they must not share a
+                    // line: a name whose row collides with an already-placed
+                    // ancestor's or neighbour's steps down until it finds
+                    // air — nested groups at a common top edge read as a
+                    // breadcrumb, exactly like the old clamp stagger but
+                    // driven by actual collisions rather than depth.
+                    let mut at_y = (rect.pos.y + 1.0).max(clip.pos.y + 1.0);
+                    loop {
+                        let mut bumped = false;
+                        for &(x0, x1, y) in &placed_names {
+                            let next = y + 12.0;
+                            // Only a bump that actually descends counts —
+                            // rows born exactly one line apart re-trigger
+                            // the window through float dust, and a "bump"
+                            // to the same row would spin here forever.
+                            if at_x < x1 && at_x + room > x0 && (at_y - y).abs() < 12.0 && next > at_y
+                            {
+                                at_y = next;
+                                bumped = true;
+                            }
+                        }
+                        if !bumped {
+                            break;
+                        }
+                    }
+                    if at_y > rect.pos.y + rect.size.y - 12.0 {
+                        // No air left inside its own tile: the name stays on
+                        // the tooltip rather than bleeding onto a neighbour.
+                        continue;
+                    }
+                    placed_names.push((at_x, at_x + room, at_y));
+                    at_y
                 };
                 labels.push(Label {
                     at: dvec2(at_x, at_y),
@@ -2059,18 +2097,42 @@ impl TreemapView {
                     line: format!("{}  {}", cell.name, treemap::format_bytes(cell.size)),
                     below: None,
                     ink: fade(bright, alpha),
+                    scrim: true,
                 });
             } else if !cell.is_group
                 && rect.size.x >= LABEL_MIN.x
                 && rect.size.y >= LABEL_MIN.y
             {
-                let two_lines = rect.size.y >= LABEL_TWO_LINE_H;
+                // Leaves join the same collision ledger as the floating
+                // names: a file at the top of a group would otherwise print
+                // straight through its ancestors' scrims.
+                let mut at_y = (rect.pos.y + 3.0).max(clip.pos.y + 3.0);
+                loop {
+                    let mut bumped = false;
+                    for &(x0, x1, y) in &placed_names {
+                        let next = y + 12.0;
+                        if at_x < x1 && at_x + room > x0 && (at_y - y).abs() < 12.0 && next > at_y
+                        {
+                            at_y = next;
+                            bumped = true;
+                        }
+                    }
+                    if !bumped {
+                        break;
+                    }
+                }
+                if at_y > rect.pos.y + rect.size.y - 12.0 {
+                    continue;
+                }
+                placed_names.push((at_x, at_x + room, at_y));
+                let two_lines = rect.size.y + rect.pos.y - at_y >= LABEL_TWO_LINE_H;
                 labels.push(Label {
-                    at: dvec2(at_x, (rect.pos.y + 3.0).max(clip.pos.y + 3.0)),
+                    at: dvec2(at_x, at_y),
                     room,
                     line: cell.name.clone(),
                     below: two_lines.then(|| treemap::format_bytes(cell.size)),
                     ink: fade(ink_dark, alpha),
+                    scrim: false,
                 });
             }
         }
@@ -2101,11 +2163,45 @@ impl TreemapView {
         labels
     }
 
-    fn draw_labels(&mut self, cx: &mut Cx2d, labels: Vec<Label>, clip: Rect) {
+    fn draw_labels(&mut self, cx: &mut Cx2d, labels: Vec<Label>, clip: Rect, palette: &Palette) {
         cx.push_clip_rect(clip);
-        for label in labels {
+        // Fit everything first: the scrim plates need each line's real width,
+        // and every plate must land before any glyph so the text batch reads
+        // over all of them.
+        let fitted: Vec<String> = labels
+            .iter()
+            .map(|label| fit_text(&self.draw_text, cx, &label.line, label.room))
+            .collect();
+        if labels.iter().any(|l| l.scrim) {
+            // Floating names bring their own contrast: a dim plate behind
+            // the text, in a draw call of its own so it layers above the
+            // tile batch and below the glyphs.
+            let plate_ink = Palette::vec4(&palette.bg_dark);
+            self.draw_tile.new_draw_call(cx);
+            self.draw_tile.cushion = 0.0;
+            self.draw_tile.border = 0.0;
+            for (label, line) in labels.iter().zip(&fitted) {
+                if !label.scrim || line.is_empty() {
+                    continue;
+                }
+                let width = text_width(&self.draw_text, cx, line);
+                let pos = label.at - dvec2(3.0, 1.0);
+                let size = dvec2(width + 6.0, 13.0);
+                let plate = fade(plate_ink, 0.78 * label.ink.w);
+                self.draw_tile.color = plate;
+                self.draw_tile.edge = plate;
+                face(&mut self.draw_tile, cx, &Quad {
+                    p: [
+                        pos,
+                        dvec2(pos.x + size.x, pos.y),
+                        pos + size,
+                        dvec2(pos.x, pos.y + size.y),
+                    ],
+                });
+            }
+        }
+        for (label, line) in labels.into_iter().zip(fitted) {
             self.draw_text.color = label.ink;
-            let line = fit_text(&self.draw_text, cx, &label.line, label.room);
             self.draw_text.draw_abs(cx, label.at, &line);
             if let Some(below) = label.below {
                 self.draw_text.color = fade(label.ink, 0.72);
@@ -2527,7 +2623,7 @@ impl Widget for TreemapView {
         }
 
         let labels = self.draw_map(cx, palette, body);
-        self.draw_labels(cx, labels, body);
+        self.draw_labels(cx, labels, body, palette);
         self.draw_tooltip(cx, body, palette);
 
         // A running tween owns the frame clock; the frame after it ends

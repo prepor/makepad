@@ -923,11 +923,20 @@ fn scan_vnode(
             size += child_node.size;
             children.push(child_node);
         }
-        Node { name: node.name.clone(), path: path.to_path_buf(), is_dir: true, size, kind, children }
+        Node {
+            files: children.iter().map(|c| c.files).sum(),
+            name: node.name.clone(),
+            is_dir: true,
+            done: true,
+            denied: false,
+            size,
+            kind,
+            children,
+        }
     } else {
         total.files += 1;
         total.bytes += node.size;
-        Node { name: node.name.clone(), path: path.to_path_buf(), is_dir: false, size: node.size, kind, children: Vec::new() }
+        Node::file(node.name.clone(), kind, node.size)
     };
     // Reported at most once every `SCAN_PROGRESS_STRIDE` nodes (folders and
     // files both count), the same bounded-rate rule `treemap::scan` keeps —

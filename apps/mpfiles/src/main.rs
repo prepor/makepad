@@ -35,6 +35,7 @@ mod model;
 mod ops;
 mod preview;
 mod rename;
+mod sizecache;
 mod theme;
 mod thumbs;
 mod treemap;
@@ -46,7 +47,7 @@ use crate::{
     contents::{FileContents, FileContentsAction, ViewMode, DEFAULT_ZOOM, ZOOM_LEVELS},
     model::{display_name, trash_dir, FileEntry},
     menu::{MenuAction, MenuRow},
-    ops::{Journal, OpKind, OpRequest, OpUpdate, Ops},
+    ops::{Journal, OpKind, OpRequest, OpUpdate, Ops, Undo},
     preview::{Preview, PreviewHost},
     rename::BatchMode,
     theme::Palette,
@@ -1402,6 +1403,13 @@ pub struct App {
     /// The job the progress row is showing, so Cancel knows what to stop.
     #[rust]
     active_op: Option<u64>,
+    /// What each running job will mean for the size map once it lands. The
+    /// map is expensive to build and cheap to correct, so every operation the
+    /// app performs itself is folded straight into it — a scan of a full home
+    /// directory is minutes, and moving one file to the Trash should not cost
+    /// them.
+    #[rust]
+    map_jobs: Vec<MapJob>,
     /// A file to select, and maybe rename, once the folder is re-listed.
     #[rust]
     pending_select: Vec<PathBuf>,
@@ -2390,17 +2398,24 @@ impl App {
     /// Copy the selection into the folder it is already in — which the
     /// collision rule turns into "name (2)".
     fn duplicate(&mut self, cx: &mut Cx) {
-        let paths: Vec<PathBuf> = self
-            .with_contents(cx, |contents, _| contents.selected_entries())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
+        let paths = self.target_paths(cx);
         if paths.is_empty() {
             self.status(cx, "Nothing selected to duplicate");
             return;
         }
         self.submit(cx, OpKind::Copy, paths, None);
+    }
+
+    /// Measure the folder again and replace the map that was read back from
+    /// the cache. The one thing that makes a remembered map safe: it is never
+    /// more than a keystroke from being made true.
+    fn rescan_map(&mut self, cx: &mut Cx) {
+        if self.tabs[self.tab].mode != ViewMode::Treemap {
+            self.status(cx, "Rescanning is for the map — Cmd+4 shows it");
+            return;
+        }
+        self.with_contents(cx, |contents, cx| contents.treemap(cx).rescan(cx));
+        self.report(cx);
     }
 
     /// Show the entry on the map. The map is of the folder we are in, so this
@@ -2422,12 +2437,7 @@ impl App {
     /// the second press: there is no undo for this, so a single slip must not
     /// be enough.
     fn delete_forever(&mut self, cx: &mut Cx) {
-        let paths: Vec<PathBuf> = self
-            .with_contents(cx, |contents, _| contents.selected_entries())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
+        let paths = self.target_paths(cx);
         if paths.is_empty() {
             self.status(cx, "Nothing selected to delete");
             return;
@@ -2665,6 +2675,11 @@ impl App {
 
     fn submit(&mut self, cx: &mut Cx, kind: OpKind, sources: Vec<PathBuf>, new_name: Option<String>) {
         let id = self.next_op_id();
+        // Remembered now, applied when the job reports back: the size map can
+        // be corrected by arithmetic instead of another walk of the disk, but
+        // only if it knows what went where, and `OpUpdate::Done` says only
+        // where things landed.
+        self.remember_for_map(id, MapEffect::of(kind), sources.clone());
         let request = OpRequest {
             id,
             kind,
@@ -2773,6 +2788,7 @@ impl App {
                         self.active_op = None;
                     }
                     self.finish_op(cx);
+                    self.map_absorb(cx, id, &touched);
                     // What a job left behind is worth selecting only when it
                     // landed *here*: a trashed file's `touched` path is inside
                     // the Trash, and selecting it would select nothing.
@@ -2784,6 +2800,8 @@ impl App {
                     self.request_directory(cx);
                 }
                 OpUpdate::Failed { id, kind, message } => {
+                    // Nothing happened, so the map is still right.
+                    self.map_jobs.retain(|job| job.id != id);
                     if self.active_op == Some(id) {
                         self.active_op = None;
                     }
@@ -2798,12 +2816,7 @@ impl App {
     }
 
     fn copy_selection(&mut self, cx: &mut Cx, cut: bool) {
-        let paths: Vec<PathBuf> = self
-            .with_contents(cx, |contents, _| contents.selected_entries())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
+        let paths = self.target_paths(cx);
         if paths.is_empty() {
             self.status(cx, "Nothing selected to copy");
             return;
@@ -2842,13 +2855,31 @@ impl App {
         self.submit(cx, kind, sources, None);
     }
 
-    fn trash_selection(&mut self, cx: &mut Cx) {
+    /// The paths a file operation starts from.
+    ///
+    /// Normally that is the listing's selection. On the treemap it usually
+    /// cannot be: nearly everything the map draws lives below the folder being
+    /// listed, so the map's own pick is the answer instead. Telling somebody
+    /// mid-cleanup that nothing is selected while a 6 GB rectangle sits
+    /// outlined in front of them would be a lie.
+    fn target_paths(&mut self, cx: &mut Cx) -> Vec<PathBuf> {
         let paths: Vec<PathBuf> = self
             .with_contents(cx, |contents, _| contents.selected_entries())
             .unwrap_or_default()
             .into_iter()
             .map(|e| e.path)
             .collect();
+        if !paths.is_empty() || self.tabs[self.tab].mode != ViewMode::Treemap {
+            return paths;
+        }
+        self.with_contents(cx, |contents, cx| contents.treemap(cx).selection())
+            .flatten()
+            .map(|path| vec![path])
+            .unwrap_or_default()
+    }
+
+    fn trash_selection(&mut self, cx: &mut Cx) {
+        let paths = self.target_paths(cx);
         if paths.is_empty() {
             self.status(cx, "Nothing selected to move to the Trash");
             return;
@@ -2871,6 +2902,17 @@ impl App {
             return;
         };
         let id = self.next_op_id();
+        // An undo is a move backwards or a removal, and both sides of it are
+        // already known — so the map follows it without a rescan too.
+        match &undo {
+            Undo::Moved { pairs } => {
+                let sources: Vec<PathBuf> = pairs.iter().map(|(_, to)| to.clone()).collect();
+                self.remember_for_map(id, MapEffect::Move, sources);
+            }
+            Undo::Created { paths } => {
+                self.remember_for_map(id, MapEffect::Remove, paths.clone());
+            }
+        }
         let home = self.home.clone();
         let description = undo.describe();
         if vfs().is_instant() {
@@ -3109,6 +3151,15 @@ impl App {
             if self.menu_open {
                 return self.close_menu(cx);
             }
+            // A zoomed treemap is one of the things Escape is on top of: it
+            // steps back out one folder before Escape means anything else.
+            if self.tabs[self.tab].mode == ViewMode::Treemap
+                && self
+                    .with_contents(cx, |contents, cx| contents.treemap(cx).zoom_out(cx))
+                    .unwrap_or(false)
+            {
+                return self.report(cx);
+            }
             if !self.pending_delete.is_empty() {
                 self.pending_delete.clear();
                 self.status(cx, "Nothing was deleted");
@@ -3181,6 +3232,7 @@ impl App {
                     self.set_search(cx, !self.search_visible);
                     return;
                 }
+                KeyCode::KeyR if !editing => return self.rescan_map(cx),
                 KeyCode::Key1 => return self.set_mode(cx, ViewMode::Icons),
                 KeyCode::Key2 => return self.set_mode(cx, ViewMode::List),
                 KeyCode::Key3 => return self.set_mode(cx, ViewMode::Compact),
@@ -3195,6 +3247,9 @@ impl App {
         if event.key_code == KeyCode::F2 && !editing {
             return self.begin_rename(cx);
         }
+        if event.key_code == KeyCode::F5 && !editing {
+            return self.rescan_map(cx);
+        }
         if event.key_code == KeyCode::Delete && !editing {
             if shift {
                 return self.delete_forever(cx);
@@ -3208,6 +3263,32 @@ impl App {
         }
         if editing {
             return;
+        }
+        // On the map, Enter zooms into the picked folder and Backspace steps
+        // back out of one — the same pair the list view uses for open and go
+        // up, meaning the same two things one level in.
+        if self.tabs[self.tab].mode == ViewMode::Treemap {
+            match event.key_code {
+                KeyCode::ReturnKey | KeyCode::NumpadEnter => {
+                    if self
+                        .with_contents(cx, |contents, cx| {
+                            contents.treemap(cx).zoom_into_selection(cx)
+                        })
+                        .unwrap_or(false)
+                    {
+                        return self.report(cx);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if self
+                        .with_contents(cx, |contents, cx| contents.treemap(cx).zoom_out(cx))
+                        .unwrap_or(false)
+                    {
+                        return self.report(cx);
+                    }
+                }
+                _ => {}
+            }
         }
         match event.key_code {
             KeyCode::Space => self.toggle_preview(cx),
@@ -3261,11 +3342,77 @@ impl App {
         }
     }
 
+    /// Note what a job will do to the size map, so its completion can be
+    /// folded in rather than triggering a rescan. Bounded: a job that never
+    /// reports back must not leave a record here forever.
+    fn remember_for_map(&mut self, id: u64, effect: MapEffect, sources: Vec<PathBuf>) {
+        if matches!(effect, MapEffect::Nothing) || sources.is_empty() {
+            return;
+        }
+        if self.map_jobs.len() >= 32 {
+            self.map_jobs.remove(0);
+        }
+        self.map_jobs.push(MapJob {
+            id,
+            effect,
+            sources,
+        });
+    }
+
+    /// Correct the size map for a job that just finished. `touched` is where
+    /// things ended up, in the same order as the sources that produced them.
+    fn map_absorb(&mut self, cx: &mut Cx, id: u64, touched: &[PathBuf]) {
+        let Some(index) = self.map_jobs.iter().position(|job| job.id == id) else {
+            return;
+        };
+        let job = self.map_jobs.remove(index);
+        let map = self.with_contents(cx, |contents, cx| contents.treemap(cx));
+        let Some(map) = map else { return };
+        match job.effect {
+            MapEffect::Nothing => {}
+            MapEffect::Remove => {
+                let moves: Vec<(PathBuf, Option<PathBuf>)> =
+                    job.sources.into_iter().map(|from| (from, None)).collect();
+                map.absorb_moves(cx, &moves);
+            }
+            MapEffect::Move => {
+                // A job that reported fewer destinations than sources did not
+                // move all of them; the ones it cannot account for are treated
+                // as gone from where they were, which is the one thing that is
+                // certainly true.
+                let moves: Vec<(PathBuf, Option<PathBuf>)> = job
+                    .sources
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, from)| (from, touched.get(i).cloned()))
+                    .collect();
+                map.absorb_moves(cx, &moves);
+            }
+            MapEffect::Copy => {
+                let copies: Vec<(PathBuf, PathBuf)> = job
+                    .sources
+                    .into_iter()
+                    .zip(touched.iter().cloned())
+                    .collect();
+                map.absorb_copies(cx, &copies);
+            }
+        }
+    }
+
     fn handle_contents_action(&mut self, cx: &mut Cx, action: FileContentsAction) {
         match action {
             FileContentsAction::Open(entry) => self.open_entry(cx, entry),
-            FileContentsAction::Selected(entry) => self.describe(cx, &entry),
-            FileContentsAction::Sorted => self.report(cx),
+            // On the map the status line belongs to the map: it says what is
+            // on screen and what was picked, which is more than one entry's
+            // description and never goes stale behind it.
+            FileContentsAction::Selected(entry) => {
+                if self.tabs[self.tab].mode == ViewMode::Treemap {
+                    self.report(cx)
+                } else {
+                    self.describe(cx, &entry)
+                }
+            }
+            FileContentsAction::Sorted | FileContentsAction::Restated => self.report(cx),
             FileContentsAction::Renamed(path, name) => self.commit_rename(cx, path, name),
             FileContentsAction::RenameCancelled => self.report(cx),
             FileContentsAction::Dropped(paths, at) => self.handle_drop(cx, paths, at),
@@ -3273,16 +3420,53 @@ impl App {
             FileContentsAction::Context { at, entry } => self.open_menu(cx, at, entry),
             FileContentsAction::Drill(path) => {
                 let folder = if vfs().is_dir(&path) {
-                    path
+                    path.clone()
                 } else {
                     path.parent().map(Path::to_path_buf).unwrap_or_default()
                 };
                 if vfs().is_dir(&folder) {
+                    // Arriving with the file already picked out: the point of
+                    // asking the map to take you somewhere is to look at the
+                    // one thing you were pointing at.
+                    if folder != path {
+                        self.pending_select = vec![path];
+                    }
                     self.navigate(cx, folder, true);
                 }
             }
         }
     }
+}
+
+/// What a finished operation does to the size map.
+#[derive(Clone, Copy, PartialEq)]
+enum MapEffect {
+    /// The sources stop existing anywhere the map can see.
+    Remove,
+    /// The sources end up somewhere else, which may or may not be on the map.
+    Move,
+    /// The sources stay and are duplicated.
+    Copy,
+    /// Nothing worth correcting: a new empty folder is no bytes.
+    Nothing,
+}
+
+impl MapEffect {
+    fn of(kind: OpKind) -> MapEffect {
+        match kind {
+            OpKind::Delete => MapEffect::Remove,
+            OpKind::Trash | OpKind::Move | OpKind::Rename => MapEffect::Move,
+            OpKind::Copy => MapEffect::Copy,
+            OpKind::NewFolder => MapEffect::Nothing,
+        }
+    }
+}
+
+/// One submitted job, remembered until it reports back.
+struct MapJob {
+    id: u64,
+    effect: MapEffect,
+    sources: Vec<PathBuf>,
 }
 
 /// The mode as `755`, next to the `rwx` letters the listing already shows.

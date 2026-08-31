@@ -393,6 +393,78 @@ pub fn sort_indices(entries: &[FileEntry], order: &mut [usize], sort: SortSpec) 
     });
 }
 
+/// Folder names directly under the user's home that the size map never
+/// enters.
+///
+/// This is not a taste decision, it is what makes the map usable on macOS at
+/// all. `~/Library` is Apple's, not the user's: it is where Containers, Group
+/// Containers, Mail, Messages, Safari, CloudStorage and Mobile Documents live,
+/// and every one of them is behind a separate TCC grant — walking it means a
+/// permission dialog per protected folder, over and over, for bytes the user
+/// cannot delete by hand anyway. `~/.Trash` is not the user's files either;
+/// it is what they already threw away, and counting it would double every
+/// number the moment they trashed something.
+///
+/// `MPFILES_SCAN_ALL=1` turns the whole rule off for anyone who wants the
+/// literal truth about their home directory and does not mind the dialogs.
+const HOME_SKIP: [&str; 2] = ["Library", ".Trash"];
+
+/// True for a folder the size map must not enter.
+///
+/// Only ever consulted for directories, and only for the ones directly under
+/// the user's home — a `Library` folder inside a project is a project's
+/// library and gets measured like anything else.
+pub fn skip_for_scan(path: &Path) -> bool {
+    if std::env::var_os("MPFILES_SCAN_ALL").is_some_and(|v| v != "0") {
+        return false;
+    }
+    let home = home_dir();
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if parent != home {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| HOME_SKIP.contains(&name))
+}
+
+/// What the map says it left out, for the line that has to admit it.
+pub fn scan_exclusions() -> Option<String> {
+    if std::env::var_os("MPFILES_SCAN_ALL").is_some_and(|v| v != "0") {
+        return None;
+    }
+    Some("excluding Library and Trash".to_string())
+}
+
+/// One entry, read straight off the disk by path rather than found in a
+/// listing. The treemap needs this: nearly everything it draws lives below the
+/// folder the browser is listing, and a context menu on a file three folders
+/// down has to describe that file, not fail to find a row for it.
+///
+/// `None` when there is nothing there, or when the browser is on the demo
+/// filesystem — a virtual path has no `std::fs` entry to read, and inventing
+/// one would let an operation run against a file that does not exist.
+pub fn entry_at(path: &Path) -> Option<FileEntry> {
+    if crate::vfs::is_demo() {
+        return None;
+    }
+    let metadata = fs::metadata(path).ok()?;
+    let is_dir = metadata.is_dir();
+    Some(FileEntry {
+        name: display_name(path),
+        kind: kind_for(path, is_dir),
+        is_dir,
+        size: if is_dir { 0 } else { metadata.len() },
+        modified_secs: epoch_secs(metadata.modified().ok()),
+        created_secs: epoch_secs(metadata.created().ok()),
+        permissions: permissions_text(&metadata),
+        child_count: is_dir.then(|| count_children(path)).flatten(),
+        path: path.to_path_buf(),
+    })
+}
+
 /// Read one directory. Runs on a worker thread — never the UI thread.
 pub fn read_directory(path: &Path, show_hidden: bool) -> Result<Vec<FileEntry>, String> {
     let read_dir = fs::read_dir(path)
@@ -653,6 +725,25 @@ pub fn display_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The rule that keeps macOS from throwing a permission dialog per
+    // protected folder: those folders are never entered at all.
+    #[test]
+    fn the_map_leaves_apples_folders_alone_and_touches_nothing_else() {
+        let home = home_dir();
+        assert!(skip_for_scan(&home.join("Library")));
+        assert!(skip_for_scan(&home.join(".Trash")));
+        // The user's own files, which is the entire point.
+        assert!(!skip_for_scan(&home.join("Documents")));
+        assert!(!skip_for_scan(&home.join("Pictures")));
+        assert!(!skip_for_scan(&home.join("Downloads")));
+        // Only *directly* under home. A project's own `Library` folder is the
+        // project's, and gets measured like anything else in it.
+        assert!(!skip_for_scan(&home.join("code/thing/Library")));
+        assert!(!skip_for_scan(Path::new("/tmp/Library")));
+        // Whatever it leaves out, it says so.
+        assert!(scan_exclusions().is_some());
+    }
 
     fn entry(name: &str, is_dir: bool, size: u64, modified: u64) -> FileEntry {
         let path = PathBuf::from("/x").join(name);

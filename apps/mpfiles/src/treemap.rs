@@ -1,14 +1,35 @@
-//! The data layer behind the folder size map: a recursive scan of a
-//! directory's bytes, and the squarified-treemap geometry that turns a list
-//! of sizes into non-overlapping rectangles whose areas are proportional to
-//! them. Nothing here knows about widgets, drawing, or the rest of the app —
-//! a [`Cell`] is just numbers a view can turn into quads, which is what
-//! keeps this module runnable and testable on its own.
+//! The data layer behind the folder size map: a streaming recursive scan of a
+//! directory's bytes, and the squarified-treemap geometry that turns that tree
+//! into non-overlapping rectangles whose areas are proportional to the bytes
+//! they stand for. Nothing here knows about widgets, drawing, or the rest of
+//! the app — a [`Cell`] is just numbers a view can turn into quads, which is
+//! what keeps this module runnable and testable on its own.
+//!
+//! Two things make this usable on a real, full disk rather than a toy folder.
+//!
+//! The scan **streams**: it announces a directory's listing the moment it has
+//! read it and hands finished subtrees back one at a time ([`ScanStep`]), so a
+//! map of a 1.8 TB home starts drawing in milliseconds and sharpens as the walk
+//! goes deeper, instead of showing nothing for several minutes and then
+//! everything at once.
+//!
+//! The layout is **pixel-bounded, not depth-bounded**: it recurses all the way
+//! down to individual files and stops only where a rectangle gets too small to
+//! see. Siblings too small to draw are collapsed into one "N smaller items"
+//! rectangle rather than being laid out and thrown away, so the cost of laying
+//! out a folder is set by how many pixels it covers, not by how many files are
+//! inside it. A folder with 200 000 files in a 40×40 box costs the same as one
+//! with 200.
 
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Condvar, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 /// A rectangle in treemap space. Plain `f64` so this module stays free of
@@ -37,160 +58,895 @@ impl Rect {
     pub fn area(&self) -> f64 {
         self.w * self.h
     }
+
+    /// This rect pulled in by `edge` on all four sides and by an extra `top`
+    /// strip along the top. Never returns negative edges.
+    pub fn shrink(&self, edge: f64, top: f64) -> Rect {
+        Rect {
+            x: self.x + edge,
+            y: self.y + edge + top,
+            w: (self.w - 2.0 * edge).max(0.0),
+            h: (self.h - 2.0 * edge - top).max(0.0),
+        }
+    }
+
+    /// The shorter of the two edges — "how small is this rectangle" in the
+    /// only sense a map cares about.
+    pub fn short_side(&self) -> f64 {
+        self.w.min(self.h)
+    }
 }
 
-/// One scanned entry. Folders carry their children; files are leaves. This
-/// is the tree [`scan`] hands back and [`layout`] consumes; nothing else in
-/// this module mutates it.
-#[derive(Clone, Debug)]
+/// One scanned entry. Folders carry their children; files are leaves.
+///
+/// There is deliberately **no path here**. A full home directory is millions
+/// of nodes, and a `PathBuf` per node is hundreds of megabytes of the same
+/// prefixes over and over; the path of any node is its ancestors' names
+/// joined, which [`layout`] rebuilds for the few thousand rectangles that
+/// actually get drawn.
+#[derive(Clone, Debug, Default)]
 pub struct Node {
     pub name: String,
-    pub path: PathBuf,
     pub is_dir: bool,
-    /// Recursive byte total for a folder; the file's own size for a leaf.
-    pub size: u64,
+    /// False while the scan is still filling this subtree in — the rectangle
+    /// is real but its size is still growing.
+    pub done: bool,
+    /// The folder is there and could not be read: a permission the app does
+    /// not have. Its bytes are unknown, not zero, and the map has to say so
+    /// rather than quietly leaving them out of the total.
+    pub denied: bool,
     /// Opaque kind tag supplied by the caller's `classify` callback — this
     /// module never decides what a file *is*, only how big it is and where
-    /// it sits in the tree.
+    /// it sits in the tree. A folder inherits the kind of its heaviest child,
+    /// so a folder full of video reads as video rather than as "folder".
     pub kind: u8,
+    /// Recursive byte total for a folder; the file's own size for a leaf.
+    pub size: u64,
+    /// Files in this subtree. Cached rather than recounted, because a status
+    /// line that recounted a million nodes on every progress tick would cost
+    /// more than the scan.
+    pub files: u32,
     pub children: Vec<Node>,
 }
 
 impl Node {
-    /// Total entries in this subtree, including itself — the number a
-    /// status line means by "12,000 items".
-    pub fn count(&self) -> usize {
-        1 + self.children.iter().map(Node::count).sum::<usize>()
+    /// A folder with nothing in it yet.
+    pub fn dir(name: String, kind: u8) -> Node {
+        Node {
+            name,
+            is_dir: true,
+            done: false,
+            denied: false,
+            kind,
+            size: 0,
+            files: 0,
+            children: Vec::new(),
+        }
+    }
+
+    /// A file, which is complete the moment it is known.
+    pub fn file(name: String, kind: u8, size: u64) -> Node {
+        Node {
+            name,
+            is_dir: false,
+            done: true,
+            denied: false,
+            kind,
+            size,
+            files: 1,
+            children: Vec::new(),
+        }
+    }
+
+    fn at_mut(&mut self, at: &[u32]) -> Option<&mut Node> {
+        let mut node = self;
+        for &index in at {
+            node = node.children.get_mut(index as usize)?;
+        }
+        Some(node)
+    }
+
+    /// The descendant `names` leads to.
+    pub fn at(&self, names: &[String]) -> Option<&Node> {
+        let mut node = self;
+        for name in names {
+            node = node.children.iter().find(|c| &c.name == name)?;
+        }
+        Some(node)
+    }
+
+    /// The child called `name`, for resolving a zoom path.
+    pub fn child_named(&self, name: &str) -> Option<&Node> {
+        self.children.iter().find(|c| c.name == name)
+    }
+
+    /// Fold `at`'s ancestors' totals back up after something below them
+    /// changed. Only the chain named by `at` is touched — the rest of the
+    /// tree cannot have moved, so nothing else needs recomputing.
+    fn roll_up(&mut self, at: &[u32]) {
+        for depth in (0..at.len()).rev() {
+            let Some(node) = self.at_mut(&at[..depth]) else {
+                return;
+            };
+            node.size = node.children.iter().map(|c| c.size).sum();
+            node.files = node.children.iter().map(|c| c.files).sum();
+            node.kind = heaviest_kind(&node.children).unwrap_or(node.kind);
+        }
+    }
+
+    /// Fold one streamed step into this tree. Returns false when the step
+    /// names a node that is no longer there, which only happens if a caller
+    /// mixes steps from two different scans.
+    pub fn apply(&mut self, step: ScanStep) -> bool {
+        match step {
+            ScanStep::Opened {
+                at,
+                children,
+                denied,
+            } => {
+                let Some(node) = self.at_mut(&at) else {
+                    return false;
+                };
+                node.size = children.iter().map(|c| c.size).sum();
+                node.files = children.iter().map(|c| c.files).sum();
+                node.kind = heaviest_kind(&children).unwrap_or(node.kind);
+                node.children = children;
+                node.denied = denied;
+                self.roll_up(&at);
+                true
+            }
+            ScanStep::Closed { at, node: fresh } => {
+                let Some(node) = self.at_mut(&at) else {
+                    return false;
+                };
+                *node = fresh;
+                self.roll_up(&at);
+                true
+            }
+            ScanStep::Pace { .. } => true,
+            ScanStep::Growing { at, size, files } => {
+                let Some(node) = self.at_mut(&at) else {
+                    return false;
+                };
+                // A running total, so it must never go backwards and make a
+                // rectangle shrink under the pointer.
+                node.size = node.size.max(size);
+                node.files = node.files.max(files);
+                self.roll_up(&at);
+                true
+            }
+        }
+    }
+
+    /// Where `names` leads, as child indices — the form everything else here
+    /// works in. `None` when any step of it is not in the tree.
+    fn indices_of(&self, names: &[String]) -> Option<Vec<u32>> {
+        let mut node = self;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let index = node.children.iter().position(|c| &c.name == name)?;
+            out.push(index as u32);
+            node = &node.children[index];
+        }
+        Some(out)
+    }
+
+    /// Take the descendant `names` leads to out of the tree and hand it back,
+    /// subtracting its bytes from every folder above it.
+    ///
+    /// This is what makes deleting something cost nothing: the map already
+    /// knows how big the thing was, so it can be removed from the picture
+    /// exactly, and nothing has to be read off the disk again.
+    pub fn detach(&mut self, names: &[String]) -> Option<Node> {
+        let indices = self.indices_of(names)?;
+        let (parent_at, last) = indices.split_at(indices.len().checked_sub(1)?);
+        let parent = self.at_mut(parent_at)?;
+        let index = *last.first()? as usize;
+        if index >= parent.children.len() {
+            return None;
+        }
+        let node = parent.children.remove(index);
+        self.roll_up(&indices);
+        Some(node)
+    }
+
+    /// Put `node` inside the folder `names` leads to, adding its bytes back
+    /// up the chain. False when that folder is not in the tree — which is the
+    /// right answer for a file moved somewhere the map is not of.
+    pub fn graft(&mut self, names: &[String], node: Node) -> bool {
+        let Some(indices) = self.indices_of(names) else {
+            return false;
+        };
+        let Some(parent) = self.at_mut(&indices) else {
+            return false;
+        };
+        if !parent.is_dir {
+            return false;
+        }
+        // Replacing rather than duplicating: an operation that lands on a
+        // name already there overwrote it, and two rectangles for one file
+        // would be a map of a disk that does not exist.
+        parent.children.retain(|c| c.name != node.name);
+        parent.children.push(node);
+        let mut chain = indices;
+        chain.push(0);
+        self.roll_up(&chain);
+        true
+    }
+
+    /// The folders the scan was not allowed to open, by path relative to this
+    /// tree, at most `limit` of them. A map that silently leaves out a folder
+    /// it could not read is a map that lies about the total.
+    pub fn denied_paths(&self, limit: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_denied(&mut String::new(), limit, &mut out);
+        out
+    }
+
+    fn collect_denied(&self, prefix: &mut String, limit: usize, out: &mut Vec<String>) {
+        for child in &self.children {
+            if out.len() >= limit {
+                return;
+            }
+            if !child.is_dir {
+                continue;
+            }
+            let mark = prefix.len();
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&child.name);
+            if child.denied {
+                out.push(prefix.clone());
+            } else {
+                child.collect_denied(prefix, limit, out);
+            }
+            prefix.truncate(mark);
+        }
+    }
+
+    /// Mark every folder in this tree finished. The walk hands whole subtrees
+    /// back complete but announces the ones above them a level at a time, so
+    /// "is this folder still growing" is only knowable for certain once the
+    /// whole scan is over — which is exactly when this runs.
+    pub fn seal(&mut self) {
+        self.done = true;
+        for child in &mut self.children {
+            child.seal();
+        }
     }
 }
 
-/// Progress a scan reports as it walks, so a caller can show a live "N
-/// files, N bytes" line instead of a frozen spinner while a big tree is
-/// still being counted.
+/// The kind of the heaviest child — what a folder paints as, so a folder full
+/// of video reads blue and a folder full of cache reads grey without anyone
+/// having to open it up.
+fn heaviest_kind(children: &[Node]) -> Option<u8> {
+    children.iter().max_by_key(|c| c.size).map(|c| c.kind)
+}
+
+/// Progress a blocking [`scan`] reports as it walks, so a caller can show a
+/// live "N files, N bytes" line instead of a frozen spinner.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanProgress {
     pub files: u64,
     pub bytes: u64,
 }
 
-/// How many entries pass between progress reports. A treemap of a real disk
-/// can hold hundreds of thousands of entries; reporting every single one
-/// would make the report channel itself the bottleneck, so this trades
-/// reporting granularity for a scan that stays fast.
+/// One step of a streaming scan. `at` is an index path from the scan's root:
+/// `[]` is the root itself, `[3]` its fourth child, `[3, 1]` that child's
+/// second. Indices are stable because [`ScanStep::Opened`] sets a directory's
+/// children once and nothing ever reorders them.
+#[derive(Debug)]
+pub enum ScanStep {
+    /// The listing of the directory at `at` has been read: these are its
+    /// children, files already sized, directories still empty and not `done`.
+    /// `denied` says the folder is there and could not be opened at all.
+    Opened {
+        at: Vec<u32>,
+        children: Vec<Node>,
+        denied: bool,
+    },
+    /// The subtree at `at` is finished and replaces whatever stood there.
+    /// Sent for subtrees the walk scanned in one piece.
+    Closed { at: Vec<u32>, node: Node },
+    /// Running totals for a directory that is still being walked, so a big
+    /// folder's rectangle grows while it is being counted instead of sitting
+    /// at zero until it is done. Every ancestor's total follows from it.
+    Growing { at: Vec<u32>, size: u64, files: u32 },
+    /// How many folders the walk still has open. Not a percentage — a scan
+    /// cannot know its own denominator before it has walked the tree, and a
+    /// bar that sits at 95 per cent for a minute is worse than no bar. This
+    /// number is real, and it goes to zero exactly when the scan ends.
+    Pace { folders_left: u32 },
+}
+
+/// How deep the walk announces structure before it starts handing back whole
+/// finished subtrees. Three levels is what makes a home directory's shape
+/// (`~/Library/Caches/Chromium`) visible within the first second; below that
+/// the per-subtree message is cheaper than the bookkeeping to split it.
+const STREAM_DEPTH: usize = 3;
+/// How often a still-running subtree reports its running total.
+const GROW_EVERY: Duration = Duration::from_millis(120);
+/// How many entries pass between progress reports in the blocking [`scan`].
 const PROGRESS_STRIDE: u64 = 512;
 
-/// The bits [`scan_node`] threads through the walk instead of passing four
-/// separate arguments at every recursive call.
-struct ScanState<'a> {
-    classify: &'a dyn Fn(&Path, bool) -> u8,
-    cancel: &'a AtomicBool,
-    progress: &'a dyn Fn(ScanProgress),
-    since_report: u64,
-    total: ScanProgress,
+/// What one directory entry looks like before it becomes a [`Node`] — the
+/// path is kept only for as long as the walk needs it to recurse, and is
+/// never stored in the tree.
+struct Listed {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
+    kind: u8,
 }
 
-impl<'a> ScanState<'a> {
-    /// Call this once per entry visited. Only actually invokes `progress`
-    /// every [`PROGRESS_STRIDE`] entries — see that constant for why.
-    fn tick(&mut self) {
-        self.since_report += 1;
-        if self.since_report >= PROGRESS_STRIDE {
-            self.since_report = 0;
-            (self.progress)(self.total);
-        }
-    }
+/// The device a path lives on, so a walk can stay on one volume.
+#[cfg(unix)]
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).ok().map(|m| m.dev())
 }
 
-/// Walk `root` recursively, folding each folder's size up from its children.
+#[cfg(not(unix))]
+fn device_of(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// What a walk is allowed to look at, and what a file *is*.
+///
+/// The skip rule is the reason a scan of a home directory does not make macOS
+/// throw a permission dialog per protected folder: those folders are never
+/// entered in the first place. It is a plain predicate so the policy lives
+/// with the app that has an opinion about it, and this module stays a walker.
+pub struct ScanRules<'a> {
+    /// The opaque kind tag stored on each node. This module never decides
+    /// what a file *is*, only how big it is and where it sits.
+    pub classify: &'a (dyn Fn(&Path, bool) -> u8 + Sync),
+    /// True for a directory the walk must not enter and must not count.
+    pub skip: &'a (dyn Fn(&Path) -> bool + Sync),
+}
+
+/// What one directory read produced: its entries, and whether it could be
+/// read at all.
+struct Listing {
+    entries: Vec<Listed>,
+    /// The folder exists and the app is not allowed to look inside it. Tried
+    /// exactly once, never per file — one refusal per folder is a note in the
+    /// corner of the map, one per file is a storm of dialogs.
+    denied: bool,
+}
+
+/// One directory's entries.
 ///
 /// Symlinks are never followed: a link is recorded as its own leaf, sized by
 /// the link itself and never by whatever it points at, and it is never
 /// recursed into. That single rule is what keeps a cyclic link — a folder
-/// somewhere under `root` linking back to one of its own ancestors — from
+/// somewhere under the root linking back to one of its own ancestors — from
 /// turning a scan into an infinite walk.
 ///
-/// Returns `None` the moment `cancel` is found set, so a cancelled scan
-/// never hands back a half-built tree that would go on to paint as a
-/// plausible-looking but wrong picture.
+/// A directory on a different volume than the root is skipped entirely: a
+/// mounted backup disk under the folder being measured is not that folder's
+/// bytes, and counting it would make every number on the map wrong. So is
+/// anything [`ScanRules::skip`] refuses.
+fn read_listing(
+    dir: &Path,
+    rules: &ScanRules,
+    device: Option<u64>,
+    growth: &mut Growth,
+) -> Listing {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(read_dir) => read_dir,
+        Err(error) => {
+            // Not a scan failure. It is a folder we know exists and cannot
+            // see into, recorded as such rather than aborting the walk — and
+            // never opened a second time.
+            return Listing {
+                entries: Vec::new(),
+                denied: error.kind() == std::io::ErrorKind::PermissionDenied,
+            };
+        }
+    };
+
+    // First the names, which cost nothing. `file_type` comes out of the
+    // directory record itself wherever the filesystem carries one, and it
+    // never follows a symlink — exactly the leaf treatment a link needs.
+    let mut found: Vec<Found> = Vec::new();
+    for entry in read_dir.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The Finder's per-folder scratch file. It is on every disk, it is
+        // never what anybody is cleaning up, and it makes a map of a photo
+        // library half noise.
+        if name == ".DS_Store" {
+            continue;
+        }
+        found.push(Found {
+            name,
+            path: entry.path(),
+            is_dir: file_type.is_dir(),
+            size: 0,
+            keep: true,
+        });
+    }
+
+    // Then the metadata, which is the whole cost of a scan: one `lstat` per
+    // entry, each of them a round trip to the disk on a tree nobody has
+    // touched lately. They are independent, so on a directory big enough for
+    // it to matter they are made to wait in parallel rather than in turn —
+    // a folder with a quarter of a million files is otherwise one thread at
+    // disk latency while five others have nothing to do.
+    if found.len() >= STAT_PARALLEL_MIN {
+        let chunk = found.len().div_ceil(STAT_THREADS);
+        thread::scope(|scope| {
+            for slice in found.chunks_mut(chunk) {
+                scope.spawn(move || stat_all(slice, device));
+            }
+        });
+    } else {
+        stat_all(&mut found, device);
+    }
+
+    let mut entries = Vec::with_capacity(found.len());
+    for item in found {
+        if !item.keep {
+            continue;
+        }
+        if item.is_dir && (rules.skip)(&item.path) {
+            continue;
+        }
+        if !item.is_dir {
+            // Counted here rather than after the loop, because a directory
+            // holding a quarter of a million files takes many seconds to
+            // stat and the numbers on screen must not sit still for all of
+            // them — a scan that looks frozen is a scan nobody waits for.
+            growth.add(item.size);
+        }
+        entries.push(Listed {
+            kind: (rules.classify)(&item.path, item.is_dir),
+            name: item.name,
+            path: item.path,
+            is_dir: item.is_dir,
+            size: item.size,
+        });
+    }
+    Listing {
+        entries,
+        denied: false,
+    }
+}
+
+/// One entry between "the directory says it is there" and "we know how big it
+/// is". Directories carry no size and are only checked for being another
+/// volume; files carry nothing but.
+struct Found {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
+    keep: bool,
+}
+
+/// Size every file in `slice`, and drop every directory that turns out to sit
+/// on another volume — a mounted backup disk under the folder being measured
+/// is not that folder's bytes, and counting it would make every number on the
+/// map wrong.
+///
+/// `symlink_metadata` never traverses the link, so a symlink is sized by the
+/// link itself and never by whatever it points at.
+fn stat_all(slice: &mut [Found], device: Option<u64>) {
+    for item in slice {
+        if item.is_dir {
+            item.keep = device.is_none() || device_of(&item.path) == device;
+        } else {
+            item.size = fs::symlink_metadata(&item.path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+        }
+    }
+}
+
+fn stubs(listing: &[Listed]) -> Vec<Node> {
+    listing
+        .iter()
+        .map(|l| {
+            if l.is_dir {
+                Node::dir(l.name.clone(), l.kind)
+            } else {
+                Node::file(l.name.clone(), l.kind, l.size)
+            }
+        })
+        .collect()
+}
+
+/// Running totals for the directory a thread is currently chewing on,
+/// reported at a bounded rate so its rectangle grows on screen without the
+/// report channel becoming the bottleneck.
+struct Growth<'a> {
+    sink: &'a (dyn Fn(ScanStep) + Sync),
+    /// How many folders the pool still owes an answer for. Read rather than
+    /// computed, so a thread that has been inside one enormous directory for
+    /// a minute still reports a number that moves — a counter that freezes
+    /// looks exactly like a scan that has died.
+    open: &'a AtomicU32,
+    at: Vec<u32>,
+    size: u64,
+    files: u32,
+    due: Instant,
+    pace_due: Instant,
+}
+
+impl<'a> Growth<'a> {
+    fn new(sink: &'a (dyn Fn(ScanStep) + Sync), open: &'a AtomicU32) -> Growth<'a> {
+        Growth {
+            sink,
+            open,
+            at: Vec::new(),
+            size: 0,
+            files: 0,
+            due: Instant::now() + GROW_EVERY,
+            pace_due: Instant::now(),
+        }
+    }
+
+    /// Point the running total at a different node and start it over.
+    fn start(&mut self, at: &[u32]) {
+        self.at.clear();
+        self.at.extend_from_slice(at);
+        self.size = 0;
+        self.files = 0;
+    }
+
+    /// Report how much of the tree is still unopened, at the same bounded
+    /// rate as everything else — a folder finishes thousands of times a
+    /// second in a build tree and the number on screen does not need to.
+    fn pace(&mut self) {
+        let folders_left = self.open.load(Ordering::Relaxed);
+        let now = Instant::now();
+        if now >= self.pace_due || folders_left == 0 {
+            self.pace_due = now + GROW_EVERY;
+            (self.sink)(ScanStep::Pace { folders_left });
+        }
+    }
+
+    fn add(&mut self, size: u64) {
+        self.size += size;
+        self.files += 1;
+        let now = Instant::now();
+        if now < self.due {
+            return;
+        }
+        self.due = now + GROW_EVERY;
+        // The queue depth rides along on the same clock, so it keeps moving
+        // even while this thread is stuck inside one huge directory.
+        self.pace();
+        if self.at.is_empty() {
+            return;
+        }
+        (self.sink)(ScanStep::Growing {
+            at: self.at.clone(),
+            size: self.size,
+            files: self.files,
+        });
+    }
+}
+
+/// One directory the walk still owes an answer for.
+struct Job {
+    path: PathBuf,
+    at: Vec<u32>,
+}
+
+/// The walk's shared state: folders waiting to be read, and how many threads
+/// are inside one right now. A thread that finds the stack empty *and* nobody
+/// working knows the walk is over — that is the only termination condition,
+/// and it is why the two live under the same lock.
+struct Queue {
+    jobs: Vec<Job>,
+    working: usize,
+}
+
+/// A directory with at least this many entries has its metadata read by
+/// several threads at once. Below it the coordination costs more than the
+/// wait it saves.
+const STAT_PARALLEL_MIN: usize = 1024;
+/// Threads one big directory's metadata read is split across. Small on
+/// purpose: several folders can be doing this at once, and past a handful of
+/// outstanding requests a disk stops going any faster.
+const STAT_THREADS: usize = 4;
+
+/// Threads the walk uses.
+///
+/// A single thread is not the answer: walking a tree is latency-bound on
+/// every filesystem worth the name. Neither is a thread per top-level folder,
+/// which is what this used to be — a home directory is one enormous `Library`
+/// and twenty small things, so within a second the "parallel" scan is one
+/// thread doing all of the work. Every folder is a work item and any idle
+/// thread takes the next one, so the threads stay busy right down to the
+/// last directory of the deepest build tree.
+const SCAN_THREADS: usize = 6;
+
+/// Walk `root`, streaming the tree back through `sink` as it is discovered.
+///
+/// The root's own listing goes out first, so a caller has a drawable map
+/// within one `read_dir`. Every folder down to [`STREAM_DEPTH`] then becomes a
+/// work item: it announces its own listing and hands its subfolders back to
+/// the pool. Below that depth a folder is walked whole and delivered in one
+/// piece, because at that size the message costs more than the subtree.
+///
+/// Returns false when the walk was cancelled, so a caller never paints a
+/// half-built tree as if it were the finished picture.
+pub fn scan_stream(
+    root: &Path,
+    rules: &ScanRules,
+    cancel: &AtomicBool,
+    sink: &(dyn Fn(ScanStep) + Sync),
+) -> bool {
+    if cancel.load(Ordering::Relaxed) {
+        return false;
+    }
+    let device = device_of(root);
+    let queue = Mutex::new(Queue {
+        jobs: vec![Job {
+            path: root.to_path_buf(),
+            at: Vec::new(),
+        }],
+        working: 0,
+    });
+    let wake = Condvar::new();
+    let open = AtomicU32::new(1);
+    thread::scope(|scope| {
+        for _ in 0..SCAN_THREADS {
+            let queue = &queue;
+            let wake = &wake;
+            let open = &open;
+            scope.spawn(move || {
+                let mut growth = Growth::new(sink, open);
+                while let Some(job) = take(queue, wake, cancel) {
+                    let children = run_job(job, rules, device, cancel, sink, &mut growth);
+                    finish(queue, wake, children, open);
+                    growth.pace();
+                }
+            });
+        }
+    });
+    !cancel.load(Ordering::Relaxed)
+}
+
+/// The next folder to read, or `None` when the walk is over — the stack is
+/// empty and no thread is still inside a folder that could refill it.
+///
+/// Nothing is reported from in here. A sink call under this lock would
+/// serialise every worker behind whatever the caller does with a step, and a
+/// sink that panicked would leave `working` counted forever and hang the pool.
+fn take(queue: &Mutex<Queue>, wake: &Condvar, cancel: &AtomicBool) -> Option<Job> {
+    let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            wake.notify_all();
+            return None;
+        }
+        if let Some(job) = queue.jobs.pop() {
+            queue.working += 1;
+            return Some(job);
+        }
+        if queue.working == 0 {
+            // Nobody is left who could push more work, so there will not be
+            // any. Every other waiter has to hear that too.
+            wake.notify_all();
+            return None;
+        }
+        queue = wake.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Hand a folder's subfolders back to the pool and stop counting as busy.
+/// Returns how many folders are left to open.
+fn finish(queue: &Mutex<Queue>, wake: &Condvar, children: Vec<Job>, open: &AtomicU32) {
+    {
+        let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.jobs.extend(children);
+        queue.working -= 1;
+        open.store((queue.jobs.len() + queue.working) as u32, Ordering::Relaxed);
+    }
+    // Outside the lock: every waiting thread is about to try to take it.
+    wake.notify_all();
+}
+
+/// Read one folder. Shallow folders announce their listing and hand their
+/// subfolders back; deep ones are walked whole and delivered in one piece.
+fn run_job(
+    job: Job,
+    rules: &ScanRules,
+    device: Option<u64>,
+    cancel: &AtomicBool,
+    sink: &(dyn Fn(ScanStep) + Sync),
+    growth: &mut Growth,
+) -> Vec<Job> {
+    if cancel.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
+    if job.at.len() >= STREAM_DEPTH {
+        growth.start(&job.at);
+        let name = job
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let kind = (rules.classify)(&job.path, true);
+        if let Some(node) = walk_whole(&job.path, name, kind, rules, device, cancel, growth) {
+            sink(ScanStep::Closed { at: job.at, node });
+        }
+        growth.start(&[]);
+        return Vec::new();
+    }
+    // Shallow: the running total belongs to this folder while its own listing
+    // is being read, which on a folder with a quarter of a million files is
+    // most of the time this job takes.
+    growth.start(&job.at);
+    let listing = read_listing(&job.path, rules, device, growth);
+    growth.start(&[]);
+    sink(ScanStep::Opened {
+        at: job.at.clone(),
+        children: stubs(&listing.entries),
+        denied: listing.denied,
+    });
+    listing
+        .entries
+        .into_iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.is_dir)
+        .map(|(index, entry)| {
+            let mut at = job.at.clone();
+            at.push(index as u32);
+            Job {
+                path: entry.path,
+                at,
+            }
+        })
+        .collect()
+}
+
+/// The whole subtree under `dir`, built in memory and returned in one piece.
+/// Reports its running total through `growth`, so the rectangle it belongs to
+/// keeps growing while this runs.
+fn walk_whole(
+    dir: &Path,
+    name: String,
+    kind: u8,
+    rules: &ScanRules,
+    device: Option<u64>,
+    cancel: &AtomicBool,
+    growth: &mut Growth,
+) -> Option<Node> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let listing = read_listing(dir, rules, device, growth);
+    let denied = listing.denied;
+    let mut children = Vec::with_capacity(listing.entries.len());
+    for entry in listing.entries {
+        if entry.is_dir {
+            children.push(walk_whole(
+                &entry.path,
+                entry.name,
+                entry.kind,
+                rules,
+                device,
+                cancel,
+                growth,
+            )?);
+        } else {
+            children.push(Node::file(entry.name, entry.kind, entry.size));
+        }
+    }
+    Some(Node {
+        size: children.iter().map(|c| c.size).sum(),
+        files: children.iter().map(|c| c.files).sum(),
+        kind: heaviest_kind(&children).unwrap_or(kind),
+        name,
+        is_dir: true,
+        done: true,
+        denied,
+        children,
+    })
+}
+
+/// Walk `root` recursively and hand back the whole tree at once. The simple
+/// blocking form, for callers that only want a total — the map itself uses
+/// [`scan_stream`].
 pub fn scan(
     root: &Path,
-    classify: &dyn Fn(&Path, bool) -> u8,
+    rules: &ScanRules,
     cancel: &AtomicBool,
     progress: &dyn Fn(ScanProgress),
 ) -> Option<Node> {
-    let mut state = ScanState {
-        classify,
+    let mut total = ScanProgress::default();
+    let mut since = 0u64;
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let kind = (rules.classify)(root, true);
+    let device = device_of(root);
+    let node = scan_blocking(
+        root,
+        name,
+        kind,
+        rules,
+        device,
         cancel,
         progress,
-        since_report: 0,
-        total: ScanProgress::default(),
-    };
-    let node = scan_node(root, &mut state)?;
+        &mut total,
+        &mut since,
+    )?;
     // One last report so a caller that only reads the callback's argument
     // after the walk returns still sees the true final tally, rather than
-    // whatever the last PROGRESS_STRIDE boundary happened to leave behind.
-    (state.progress)(state.total);
+    // whatever the last stride boundary happened to leave behind.
+    progress(total);
     Some(node)
 }
 
-fn scan_node(path: &Path, state: &mut ScanState) -> Option<Node> {
-    // Checked on every entry, not just every directory, so a folder holding
-    // one huge flat pile of files still cancels within a fraction of a
-    // second rather than only between directories.
-    if state.cancel.load(Ordering::Relaxed) {
+#[allow(clippy::too_many_arguments)]
+fn scan_blocking(
+    dir: &Path,
+    name: String,
+    kind: u8,
+    rules: &ScanRules,
+    device: Option<u64>,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(ScanProgress),
+    total: &mut ScanProgress,
+    since: &mut u64,
+) -> Option<Node> {
+    // Checked on every directory, so a cancelled scan stops within a fraction
+    // of a second rather than at the end of the walk.
+    if cancel.load(Ordering::Relaxed) {
         return None;
     }
-    let meta = fs::symlink_metadata(path).ok()?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-
-    // `symlink_metadata` never follows the link, so a symlink's own
-    // `is_dir()` reads false here even when it points at a directory —
-    // exactly the leaf treatment a link needs.
-    if meta.is_dir() {
-        let mut children = Vec::new();
-        let mut size = 0u64;
-        // An unreadable folder (permissions, vanished mid-walk) is not a
-        // scan failure. It is a folder we know exists and cannot see into,
-        // so it is recorded with no children rather than aborting the walk.
-        if let Ok(read_dir) = fs::read_dir(path) {
-            for entry in read_dir.flatten() {
-                let child = scan_node(&entry.path(), state)?;
-                size += child.size;
-                children.push(child);
+    let idle = AtomicU32::new(0);
+    let listing = read_listing(dir, rules, device, &mut Growth::new(&|_| {}, &idle));
+    let denied = listing.denied;
+    let mut children = Vec::with_capacity(listing.entries.len());
+    for entry in listing.entries {
+        if entry.is_dir {
+            children.push(scan_blocking(
+                &entry.path,
+                entry.name,
+                entry.kind,
+                rules,
+                device,
+                cancel,
+                progress,
+                total,
+                since,
+            )?);
+        } else {
+            total.files += 1;
+            total.bytes += entry.size;
+            *since += 1;
+            if *since >= PROGRESS_STRIDE {
+                *since = 0;
+                progress(*total);
             }
+            children.push(Node::file(entry.name, entry.kind, entry.size));
         }
-        let node = Node {
-            kind: (state.classify)(path, true),
-            name,
-            path: path.to_path_buf(),
-            is_dir: true,
-            size,
-            children,
-        };
-        state.tick();
-        Some(node)
-    } else {
-        // A symlink and a plain file are both leaves here: neither is
-        // opened any further, so each is sized by what its own directory
-        // entry reports, never by chasing a link to its target.
-        let size = meta.len();
-        state.total.files += 1;
-        state.total.bytes += size;
-        let node = Node {
-            kind: (state.classify)(path, false),
-            name,
-            path: path.to_path_buf(),
-            is_dir: false,
-            size,
-            children: Vec::new(),
-        };
-        state.tick();
-        Some(node)
     }
+    Some(Node {
+        size: children.iter().map(|c| c.size).sum(),
+        files: children.iter().map(|c| c.files).sum(),
+        kind: heaviest_kind(&children).unwrap_or(kind),
+        name,
+        is_dir: true,
+        done: true,
+        denied,
+        children,
+    })
 }
+
+// ---------------------------------------------------------------- geometry
 
 /// The squarified treemap layout of `sizes` inside `rect`, one output rect
 /// per input, in the same order as `sizes`. Bruls, Huizing & van Wijk
@@ -260,10 +1016,11 @@ fn squarify_rows(areas: &[f64], mut rect: Rect) -> Vec<Rect> {
         // Grow the row one item at a time for as long as doing so does not
         // make its worst aspect ratio worse — the "squarified" rule.
         let mut end = start + 1;
+        let mut current = worst_ratio(&areas[start..end], rect);
         while end < areas.len() {
-            let current = worst_ratio(&areas[start..end], rect);
             let grown = worst_ratio(&areas[start..end + 1], rect);
             if grown <= current {
+                current = grown;
                 end += 1;
             } else {
                 break;
@@ -361,6 +1118,55 @@ fn worst_ratio(areas: &[f64], rect: Rect) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+// ------------------------------------------------------------------ layout
+
+/// The pixel sizes that decide how far down the map goes. Every one of them
+/// is a statement about what a person can see, which is why the layout has no
+/// depth limit at all: it stops where the picture stops saying anything, and
+/// on a big enough screen that is at the individual file.
+#[derive(Clone, Copy, Debug)]
+pub struct MapStyle {
+    /// A rectangle thinner than this on either edge is not drawn.
+    pub min_side: f64,
+    /// Siblings whose rectangle would come out smaller than this are not laid
+    /// out at all; they are summed into one "N smaller items" rectangle. This
+    /// is what bounds the cost of a folder to its area rather than to how
+    /// many files it holds.
+    pub min_area: f64,
+    /// The border a folder insets its children by — the visible gap that says
+    /// "these belong together". Widest at the top level and narrowing with
+    /// depth: the outermost frames are the ones carrying the shape of the
+    /// disk, and a fourth-level folder cannot afford three points of margin.
+    pub inset: f64,
+    /// The strip a folder reserves at its top for its own name, when it is
+    /// big enough to earn one.
+    pub header: f64,
+    /// A folder needs to be at least this wide and tall before it gets a
+    /// header strip; below it, the name would cost more than it tells.
+    pub header_min: (f64, f64),
+    /// A folder whose inside comes out smaller than this on either edge is
+    /// drawn as one plate instead of being opened up — nesting borders
+    /// thinner than this are all border and no bytes.
+    pub group_min: f64,
+    /// A hard ceiling on rectangles, so a pathological tree cannot make one
+    /// frame take a second.
+    pub max_cells: usize,
+}
+
+impl Default for MapStyle {
+    fn default() -> Self {
+        MapStyle {
+            min_side: 2.0,
+            min_area: 9.0,
+            inset: 1.0,
+            header: 12.0,
+            header_min: (58.0, 34.0),
+            group_min: 6.0,
+            max_cells: 60_000,
+        }
+    }
+}
+
 /// One drawable rectangle of the finished map — a folder or a file, already
 /// positioned, with nothing left for a view to compute except paint it.
 #[derive(Clone, Debug)]
@@ -368,113 +1174,165 @@ pub struct Cell {
     pub path: PathBuf,
     pub name: String,
     pub size: u64,
+    pub files: u32,
     pub is_dir: bool,
     pub kind: u8,
-    /// 0 for the current folder's own children, 1 for their children, and
-    /// so on — how many group borders separate this cell from the root.
+    /// 0 for the mapped folder's own children, 1 for their children, and so
+    /// on — how many group borders separate this cell from the root.
     pub depth: usize,
     pub rect: Rect,
     /// True when this cell is a folder drawn as a bordered group whose
-    /// children are also present in the output (i.e. `depth < max_depth`);
-    /// false for a file, and false for a folder deep enough that it is
-    /// drawn as one flat rectangle instead of being opened up.
+    /// children are also in the output; false for a file, and false for a
+    /// folder too small to open up.
     pub is_group: bool,
+    /// The header strip this group earned, in points; 0 when it earned none.
+    pub header: f64,
+    /// True while the scan is still filling this subtree in.
+    pub pending: bool,
+    /// When non-zero this cell stands for that many sibling entries at once,
+    /// each too small to draw on its own.
+    pub extra: u32,
+}
+
+impl Cell {
+    /// Whether this cell is the "N smaller items" aggregate rather than one
+    /// real file or folder.
+    pub fn is_bundle(&self) -> bool {
+        self.extra > 0
+    }
 }
 
 /// Flatten `node`'s children into drawable cells inside `area`.
 ///
-/// A folder shallower than `max_depth` becomes a bordered group: its own
-/// cell is emitted first, then its children are squarified again inside the
-/// space left after subtracting `group_inset` from every edge and an extra
-/// `header` strip from the top — room for a view to print the folder's name
-/// and size above its contents. A folder at `max_depth` or deeper is drawn
-/// as one flat rectangle instead; opening it up further would only draw
-/// borders too thin to mean anything.
-///
-/// A rect smaller than `min_side` on either edge is dropped entirely — group
-/// and children alike, since a group too small to show its own header is
-/// not worth opening up either. A map is a picture, not a list of
-/// rectangles too small to see.
+/// `root_path` is the folder `node` stands for; every cell's path is built
+/// from it and the names on the way down, which is why the tree itself does
+/// not carry paths.
 ///
 /// The output is in painter's order: a group's own cell always comes before
-/// its children, so a caller drawing the vector front-to-back gets children
-/// on top of their group for free, with no separate z-ordering step needed.
-pub fn layout(
-    node: &Node,
-    area: Rect,
-    max_depth: usize,
-    group_inset: f64,
-    header: f64,
-    min_side: f64,
-) -> Vec<Cell> {
+/// its children, so a caller drawing the vector front to back gets children
+/// on top of their group for free, with no separate z-ordering step.
+pub fn layout(node: &Node, root_path: &Path, area: Rect, style: &MapStyle) -> Vec<Cell> {
     let mut out = Vec::new();
-    layout_children(
-        &node.children,
-        area,
-        0,
-        max_depth,
-        group_inset,
-        header,
-        min_side,
-        &mut out,
-    );
+    let mut path = root_path.to_path_buf();
+    layout_children(&node.children, &mut path, area, 0, style, &mut out);
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The frame a folder at `depth` puts around its children: three points at the
+/// top level, narrowing toward one. The outer frames carry the shape of the
+/// disk and can afford the pixels; a sixth-level folder cannot.
+pub fn inset_for(style: &MapStyle, depth: usize) -> f64 {
+    style.inset * (1.0 + 2.0 / (depth as f64 + 1.0))
+}
+
 fn layout_children(
     children: &[Node],
+    path: &mut PathBuf,
     area: Rect,
     depth: usize,
-    max_depth: usize,
-    group_inset: f64,
-    header: f64,
-    min_side: f64,
+    style: &MapStyle,
     out: &mut Vec<Cell>,
 ) {
-    if children.is_empty() || area.w <= 0.0 || area.h <= 0.0 {
+    if children.is_empty() || area.w <= 0.0 || area.h <= 0.0 || out.len() >= style.max_cells {
         return;
     }
-    let sizes: Vec<u64> = children.iter().map(|c| c.size).collect();
+    let total: f64 = children.iter().map(|c| c.size as f64).sum();
+    if total <= 0.0 {
+        return;
+    }
+    // Everything below this many bytes would draw smaller than `min_area`, so
+    // it is summed rather than laid out. Bounding the work by the rectangle's
+    // area instead of by the child count is what lets this recurse to the
+    // individual file inside a folder holding a quarter of a million of them.
+    let floor = (style.min_area * total / area.area()).ceil() as u64;
+    let mut keep: Vec<usize> = Vec::new();
+    let mut bundle_size = 0u64;
+    let mut bundle_count = 0u32;
+    let mut bundle_files = 0u32;
+    for (index, child) in children.iter().enumerate() {
+        if child.size >= floor && child.size > 0 {
+            keep.push(index);
+        } else if child.size > 0 {
+            bundle_size += child.size;
+            bundle_count += 1;
+            bundle_files += child.files;
+        }
+    }
+    // Descending order is what the squarified rule assumes; sorting only the
+    // survivors keeps this proportional to the pixels, not to the files.
+    keep.sort_unstable_by(|&a, &b| children[b].size.cmp(&children[a].size));
+    let mut sizes: Vec<u64> = keep.iter().map(|&i| children[i].size).collect();
+    if bundle_count > 0 {
+        sizes.push(bundle_size);
+    }
     let rects = squarify(&sizes, area);
-    for (child, rect) in children.iter().zip(rects) {
-        if rect.w < min_side || rect.h < min_side {
-            // Invisible at this scale: drawing it would just be a sliver,
-            // and if it is a folder its children would be smaller still.
+    for (slot, rect) in rects.iter().enumerate() {
+        if out.len() >= style.max_cells {
+            return;
+        }
+        if rect.w < style.min_side || rect.h < style.min_side {
+            // Invisible at this scale: drawing it would just be a sliver, and
+            // if it is a folder its children would be smaller still.
             continue;
         }
-        let is_group = child.is_dir && depth < max_depth;
+        let Some(&index) = keep.get(slot) else {
+            // The last slot, when there is one, is the bundle of everything
+            // too small to have earned a rectangle of its own.
+            out.push(Cell {
+                path: path.clone(),
+                name: format!(
+                    "{} smaller item{}",
+                    bundle_count,
+                    if bundle_count == 1 { "" } else { "s" }
+                ),
+                size: bundle_size,
+                files: bundle_files,
+                is_dir: false,
+                kind: u8::MAX,
+                depth,
+                rect: *rect,
+                is_group: false,
+                header: 0.0,
+                pending: false,
+                extra: bundle_count,
+            });
+            continue;
+        };
+        let child = &children[index];
+        // A folder opens up when its inside is still worth looking at. The
+        // header is the first thing given up, then the nesting entirely.
+        let header = if child.is_dir
+            && rect.w >= style.header_min.0
+            && rect.h >= style.header_min.1
+        {
+            style.header
+        } else {
+            0.0
+        };
+        let inner = rect.shrink(inset_for(style, depth), header);
+        let is_group = child.is_dir
+            && !child.children.is_empty()
+            && inner.w >= style.group_min
+            && inner.h >= style.group_min;
+        path.push(&child.name);
         out.push(Cell {
-            path: child.path.clone(),
+            path: path.clone(),
             name: child.name.clone(),
             size: child.size,
+            files: child.files,
             is_dir: child.is_dir,
             kind: child.kind,
             depth,
-            rect,
+            rect: *rect,
             is_group,
+            header: if is_group { header } else { 0.0 },
+            pending: child.is_dir && !child.done,
+            extra: 0,
         });
         if is_group {
-            let inner = Rect {
-                x: rect.x + group_inset,
-                y: rect.y + group_inset + header,
-                w: rect.w - 2.0 * group_inset,
-                h: rect.h - 2.0 * group_inset - header,
-            };
-            // A negative or zero `inner` (the inset plus header ate the
-            // whole rect) is caught by `layout_children`'s own guard above,
-            // so nothing special is needed here beyond just recursing.
-            layout_children(
-                &child.children,
-                inner,
-                depth + 1,
-                max_depth,
-                group_inset,
-                header,
-                min_side,
-                out,
-            );
+            layout_children(&child.children, path, inner, depth + 1, style, out);
         }
+        path.pop();
     }
 }
 
@@ -509,27 +1367,43 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn leaf(name: &str, size: u64) -> Node {
-        Node {
-            name: name.to_string(),
-            path: PathBuf::from(name),
-            is_dir: false,
-            size,
-            kind: 0,
-            children: Vec::new(),
-        }
+        Node::file(name.to_string(), 0, size)
     }
 
     fn dir(name: &str, children: Vec<Node>) -> Node {
-        let size = children.iter().map(|c| c.size).sum();
         Node {
             name: name.to_string(),
-            path: PathBuf::from(name),
             is_dir: true,
-            size,
+            done: true,
+            denied: false,
             kind: 0,
+            size: children.iter().map(|c| c.size).sum(),
+            files: children.iter().map(|c| c.files).sum(),
             children,
+        }
+    }
+
+    /// The rules a test walks under: everything is generic, nothing is
+    /// skipped. The app's own policy is tested where the app defines it.
+    fn open_rules<'a>() -> ScanRules<'a> {
+        ScanRules {
+            classify: &|_: &Path, _: bool| 0u8,
+            skip: &|_: &Path| false,
+        }
+    }
+
+    fn style() -> MapStyle {
+        MapStyle {
+            min_side: 1.0,
+            min_area: 1.0,
+            inset: 1.0,
+            header: 6.0,
+            header_min: (30.0, 20.0),
+            group_min: 3.0,
+            max_cells: 10_000,
         }
     }
 
@@ -607,6 +1481,22 @@ mod tests {
         }
     }
 
+    // A long descending run is the shape a real folder has, and the shape a
+    // buggy row-closing rule turns into hairlines.
+    #[test]
+    fn squarify_stays_square_on_a_long_descending_run() {
+        let sizes: Vec<u64> = (1..=200).rev().map(|i| i as u64 * i as u64).collect();
+        let rect = Rect { x: 0.0, y: 0.0, w: 900.0, h: 600.0 };
+        let rects = squarify(&sizes, rect);
+        let worst = rects
+            .iter()
+            .filter(|r| r.area() > 4.0)
+            .map(|r| (r.w / r.h).max(r.h / r.w))
+            .fold(0.0_f64, f64::max);
+        assert!(worst < 6.0, "worst aspect ratio {worst} is a hairline");
+        assert_no_overlaps(&rects);
+    }
+
     #[test]
     fn squarify_edge_cases() {
         let rect = Rect { x: 1.0, y: 2.0, w: 10.0, h: 5.0 };
@@ -654,7 +1544,7 @@ mod tests {
             ],
         );
         let area = Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 };
-        let cells = layout(&tree, area, 4, 2.0, 8.0, 1.0);
+        let cells = layout(&tree, Path::new("/root"), area, &style());
 
         let sub_index = cells.iter().position(|c| c.name == "sub").unwrap();
         let a_index = cells.iter().position(|c| c.name == "a.txt").unwrap();
@@ -666,22 +1556,131 @@ mod tests {
         assert_eq!(cells[b_index].depth, 1);
         assert!(cells[sub_index].is_group);
         assert!(!cells[a_index].is_group);
+        // Paths are rebuilt from the names on the way down.
+        assert_eq!(cells[a_index].path, Path::new("/root/sub/a.txt"));
+    }
+
+    // The whole point of the rewrite: the map goes all the way down to the
+    // file, not two folders and then a flat plate.
+    #[test]
+    fn layout_reaches_individual_files_at_any_depth() {
+        let mut tree = leaf("buried.bin", 1_000_000);
+        for name in ["j", "i", "h", "g", "f", "e", "d", "c", "b", "a"] {
+            tree = dir(name, vec![tree]);
+        }
+        let tree = dir("root", vec![tree]);
+        let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
+        let cells = layout(&tree, Path::new("/root"), area, &style());
+        let buried = cells.iter().find(|c| c.name == "buried.bin").unwrap();
+        assert_eq!(buried.depth, 10);
+        assert_eq!(
+            buried.path,
+            Path::new("/root/a/b/c/d/e/f/g/h/i/j/buried.bin")
+        );
+        assert!(buried.rect.area() > 100.0);
     }
 
     #[test]
     fn layout_drops_slivers_below_min_side() {
         let tree = dir("root", vec![leaf("big.bin", 1_000_000), leaf("tiny.bin", 1)]);
         let area = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 1000.0 };
-        let cells = layout(&tree, area, 4, 0.0, 0.0, 4.0);
+        let mut style = style();
+        style.min_side = 4.0;
+        style.min_area = 16.0;
+        let cells = layout(&tree, Path::new("/root"), area, &style);
         assert!(cells.iter().any(|c| c.name == "big.bin"));
         assert!(!cells.iter().any(|c| c.name == "tiny.bin"));
+    }
+
+    // A folder with a quarter of a million tiny files must cost the map what
+    // its rectangle is worth, not what its listing is worth.
+    #[test]
+    fn layout_bundles_the_invisible_tail_instead_of_laying_it_out() {
+        let mut children = vec![leaf("big.bin", 500_000_000)];
+        children.extend((0..50_000).map(|i| leaf(&format!("t{i}.tmp"), 100)));
+        let tree = dir("root", children);
+        let area = Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 };
+        let cells = layout(&tree, Path::new("/root"), area, &MapStyle::default());
+        // Two rectangles: the big file, and one that says how many were left.
+        assert!(cells.len() < 8, "{} cells is a laid-out tail", cells.len());
+        let bundle = cells.iter().find(|c| c.is_bundle()).unwrap();
+        assert_eq!(bundle.extra, 50_000);
+        assert_eq!(bundle.size, 5_000_000);
+        // Every byte is still on the map: the bundle is a sum, not a cull.
+        let mapped: u64 = cells.iter().filter(|c| c.depth == 0).map(|c| c.size).sum();
+        assert_eq!(mapped, tree.size);
+    }
+
+    // The whole reason the map is worth keeping between runs: a delete is
+    // arithmetic on a tree we already have, not another walk of the disk.
+    #[test]
+    fn deleting_something_costs_no_scan_and_leaves_the_totals_right() {
+        let mut tree = dir(
+            "root",
+            vec![
+                dir("movies", vec![leaf("big.mov", 900), leaf("small.mov", 100)]),
+                leaf("notes.txt", 25),
+            ],
+        );
+        assert_eq!(tree.size, 1025);
+        assert_eq!(tree.files, 3);
+
+        let gone = tree
+            .detach(&["movies".into(), "big.mov".into()])
+            .expect("the file was on the map");
+        assert_eq!(gone.size, 900);
+        // Every folder above it shrank by exactly what left.
+        assert_eq!(tree.size, 125);
+        assert_eq!(tree.files, 2);
+        assert_eq!(tree.at(&["movies".into()]).unwrap().size, 100);
+
+        // Nothing is there to take twice.
+        assert!(tree.detach(&["movies".into(), "big.mov".into()]).is_none());
+    }
+
+    // Trash is a move, not a disappearance: if the Trash is inside the map,
+    // the bytes are still on it and the total must not change.
+    #[test]
+    fn a_move_inside_the_map_keeps_the_total() {
+        let mut tree = dir(
+            "root",
+            vec![
+                dir("movies", vec![leaf("big.mov", 900)]),
+                dir("trash", vec![]),
+            ],
+        );
+        let before = tree.size;
+        let node = tree.detach(&["movies".into(), "big.mov".into()]).unwrap();
+        assert_eq!(tree.size, 0);
+        assert!(tree.graft(&["trash".into()], node));
+        assert_eq!(tree.size, before);
+        assert_eq!(tree.at(&["trash".into()]).unwrap().size, 900);
+        // Somewhere the map is not of: the bytes really did leave.
+        let node = tree.detach(&["trash".into(), "big.mov".into()]).unwrap();
+        assert!(!tree.graft(&["nowhere".into()], node));
+        assert_eq!(tree.size, 0);
+    }
+
+    // A folder we were refused is not a folder of zero bytes, and the map has
+    // to be able to say which ones they were.
+    #[test]
+    fn refused_folders_are_named_not_silently_dropped() {
+        let mut locked = dir("Documents", vec![]);
+        locked.denied = true;
+        let mut inner = dir("deep", vec![]);
+        inner.denied = true;
+        let tree = dir("root", vec![locked, dir("ok", vec![inner, leaf("a", 1)])]);
+        let named = tree.denied_paths(8);
+        assert_eq!(named, vec!["Documents".to_string(), "ok/deep".to_string()]);
+        // Bounded, because a list nobody can read is not a warning.
+        assert_eq!(tree.denied_paths(1).len(), 1);
     }
 
     #[test]
     fn hit_finds_the_deepest_cell() {
         let tree = dir("root", vec![dir("sub", vec![leaf("a.txt", 100)])]);
         let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = layout(&tree, area, 4, 2.0, 5.0, 0.0);
+        let cells = layout(&tree, Path::new("/root"), area, &style());
 
         let group = cells.iter().position(|c| c.name == "sub").unwrap();
         let child = cells.iter().position(|c| c.name == "a.txt").unwrap();
@@ -701,57 +1700,77 @@ mod tests {
     }
 
     #[test]
-    fn scan_rolls_up_recursive_sizes_and_stops_symlink_cycles() {
-        let root = std::env::temp_dir().join(format!("mpfiles-treemap-test-{}", std::process::id()));
+    fn a_folder_paints_as_its_heaviest_content() {
+        let mut tree = dir(
+            "root",
+            vec![Node::file("clip.mov".into(), 5, 900), Node::file("note.txt".into(), 2, 10)],
+        );
+        // Rebuilt the way `apply` would, so the rule is the one the scan uses.
+        tree.kind = heaviest_kind(&tree.children).unwrap();
+        assert_eq!(tree.kind, 5);
+    }
+
+    // ------------------------------------------------------------- scanning
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mpfiles-treemap-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn sample_tree(root: &Path) -> u64 {
         fs::create_dir_all(root.join("sub/subsub")).unwrap();
         fs::write(root.join("a.txt"), b"aaaaa").unwrap(); // 5 bytes
         fs::write(root.join("sub/b.txt"), b"bbbbbbb").unwrap(); // 7 bytes
         fs::write(root.join("sub/subsub/c.txt"), b"ccc").unwrap(); // 3 bytes
 
         #[cfg(unix)]
-        let link_len: u64 = {
+        {
             // A link back up to an ancestor of the folder it sits in: if the
             // scan ever followed it, this test would hang rather than
             // finish, which is exactly the bug this case exists to catch.
             let link = root.join("sub/subsub/loop");
-            std::os::unix::fs::symlink(&root, &link).unwrap();
-            fs::symlink_metadata(&link).unwrap().len()
-        };
+            std::os::unix::fs::symlink(root, &link).unwrap();
+            15 + fs::symlink_metadata(&link).unwrap().len()
+        }
         #[cfg(not(unix))]
-        let link_len: u64 = 0;
+        {
+            15
+        }
+    }
+
+    #[test]
+    fn scan_rolls_up_recursive_sizes_and_stops_symlink_cycles() {
+        let root = temp_root("scan");
+        let expected = sample_tree(&root);
 
         let cancel = AtomicBool::new(false);
-        let node = scan(&root, &|_, _| 0u8, &cancel, &|_| {}).expect("scan should complete");
+        let node = scan(&root, &open_rules(), &cancel, &|_| {}).expect("scan should complete");
 
-        let leaf_bytes = 5 + 7 + 3;
-        assert_eq!(node.size, leaf_bytes + link_len);
-
-        let expected_count = if cfg!(unix) { 7 } else { 6 };
-        assert_eq!(node.count(), expected_count);
+        assert_eq!(node.size, expected);
+        assert_eq!(node.files, if cfg!(unix) { 4 } else { 3 });
 
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn scan_returns_none_when_already_cancelled() {
-        let root =
-            std::env::temp_dir().join(format!("mpfiles-treemap-test-cancel-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = temp_root("cancel");
         fs::create_dir_all(&root).unwrap();
 
         let cancel = AtomicBool::new(true);
-        let result = scan(&root, &|_, _| 0u8, &cancel, &|_| {});
-        assert!(result.is_none());
+        assert!(scan(&root, &open_rules(), &cancel, &|_| {}).is_none());
 
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn scan_reports_progress_at_a_bounded_rate_not_per_entry() {
-        let root = std::env::temp_dir()
-            .join(format!("mpfiles-treemap-test-progress-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = temp_root("progress");
         fs::create_dir_all(&root).unwrap();
         for i in 0..600 {
             fs::write(root.join(format!("f{i}.bin")), b"x").unwrap();
@@ -759,16 +1778,91 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let calls = std::sync::atomic::AtomicU32::new(0);
-        let node = scan(&root, &|_, _| 0u8, &cancel, &|_| {
+        let node = scan(&root, &open_rules(), &cancel, &|_| {
             calls.fetch_add(1, Ordering::Relaxed);
         })
         .unwrap();
 
-        assert_eq!(node.count(), 601); // root + 600 files
+        assert_eq!(node.files, 600);
         // 600 entries at a stride of 512 is at most two mid-walk reports
         // plus the guaranteed final one — nowhere near one call per file.
-        assert!(calls.load(Ordering::Relaxed) <= 4, "too many progress calls: {}", calls.load(Ordering::Relaxed));
+        let calls = calls.load(Ordering::Relaxed);
+        assert!(calls <= 4, "too many progress calls: {calls}");
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // The streamed walk and the blocking one have to agree, or the map is a
+    // different disk than the properties panel.
+    #[test]
+    fn the_streamed_scan_builds_the_same_tree_as_the_blocking_one() {
+        let root = temp_root("stream");
+        let expected = sample_tree(&root);
+        // Deep enough to cross STREAM_DEPTH, so both halves of the protocol
+        // (announced structure and whole handed-back subtrees) are exercised.
+        fs::create_dir_all(root.join("deep/a/b/c/d")).unwrap();
+        fs::write(root.join("deep/a/b/c/d/e.bin"), vec![0u8; 400]).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let steps = Mutex::new(Vec::new());
+        let ok = scan_stream(&root, &open_rules(), &cancel, &|step| {
+            steps.lock().unwrap().push(step);
+        });
+        assert!(ok);
+
+        let mut tree = Node::dir("root".into(), 0);
+        for step in steps.into_inner().unwrap() {
+            assert!(tree.apply(step), "a step named a node that is not there");
+        }
+        assert_eq!(tree.size, expected + 400);
+        assert_eq!(tree.files, if cfg!(unix) { 5 } else { 4 });
+        assert!(
+            tree.children.iter().any(|c| c.name == "deep"),
+            "the root's own listing never arrived"
+        );
+
+        // Whole subtrees arrive already finished; the folders above them are
+        // announced a level at a time and are only known to be finished when
+        // the walk is, which is what `seal` says.
+        fn all_done(node: &Node) -> bool {
+            node.children.iter().all(|c| (!c.is_dir || c.done) && all_done(c))
+        }
+        assert!(!all_done(&tree), "nothing should be sealed before the walk ends");
+        tree.seal();
+        assert!(all_done(&tree));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_streamed_scan_announces_the_root_before_it_walks_anything() {
+        let root = temp_root("first-step");
+        sample_tree(&root);
+
+        let cancel = AtomicBool::new(false);
+        let first = Mutex::new(None);
+        scan_stream(&root, &open_rules(), &cancel, &|step| {
+            let mut slot = first.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(match step {
+                    ScanStep::Opened { at, children, .. } => (at, children.len()),
+                    other => panic!("first step was {other:?}, not the root listing"),
+                });
+            }
+        });
+        let (at, count) = first.into_inner().unwrap().expect("no steps at all");
+        assert!(at.is_empty());
+        assert_eq!(count, 2); // a.txt and sub/
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cancelled_stream_reports_that_it_did_not_finish() {
+        let root = temp_root("stream-cancel");
+        sample_tree(&root);
+        let cancel = AtomicBool::new(true);
+        assert!(!scan_stream(&root, &open_rules(), &cancel, &|_| {}));
         fs::remove_dir_all(&root).ok();
     }
 

@@ -237,12 +237,13 @@ script_mod! {
         }
     }
 
-    /** One "modified within" choice. */
+    /** One "modified within" choice. The box is the text plus the same
+     * padding on every side, so the highlight is centred by construction —
+     * a fixed height had the label riding low in it. */
     let AgeChip = SolidView{
         width: Fit
-        height: 20
-        padding: Inset{left: 5 right: 5}
-        align: Align{y: 0.5}
+        height: Fit
+        padding: Inset{left: 5 right: 5 top: 3 bottom: 3}
         cursor: MouseCursor.Hand
         draw_bg +: {color: #00000000}
         chip_label := Label{
@@ -970,6 +971,7 @@ script_mod! {
                                                 height: Fit
                                                 flow: Right
                                                 spacing: 2
+                                                align: Align{y: 0.5}
                                                 filter_age_hint := Label{
                                                     margin: Inset{right: 4}
                                                     text: "new:"
@@ -2217,6 +2219,11 @@ impl App {
         self.ui
             .widget(cx, ids!(map_side))
             .set_visible(cx, mode.is_treemap() && self.filter_popup_open);
+        if mode.is_treemap() && self.filter_popup_open {
+            // Entering the map with the sidebar already open (a pref, or a
+            // mode round-trip): the legend fills now, not on the next toggle.
+            self.refresh_filter_popup(cx);
+        }
         self.map_tools_note.clear();
         self.refresh_chat(cx);
     }
@@ -3594,10 +3601,15 @@ impl App {
         // so what is *open* decides whether a key is text or navigation. The
         // chat's field is the exception: the panel stays open while the user
         // reads, so it is the keyboard that says whether they are typing in it.
+        // The filter's query field counts too: without it, typing a word into
+        // the filter let Backspace fall through to "go up" — which navigated
+        // away and started a whole new scan mid-keystroke — and q/e spun the
+        // camera under the caret.
         let editing = self.batch_open
             || self.path_edit_open
             || self.search_visible
             || self.chat_is_typing(cx)
+            || self.filter_is_typing(cx)
             || self
                 .with_contents(cx, |contents, _| contents.is_renaming())
                 .unwrap_or(false);
@@ -5095,12 +5107,20 @@ impl AppMain for App {
             self.drain_directory_results(cx);
             self.drain_ops(cx);
             self.drain_sizes(cx);
-            self.with_contents(cx, |contents, cx| {
-                contents.drain_thumbs(cx);
-                contents.treemap(cx).drain(cx)
-            });
+            let map_moved = self
+                .with_contents(cx, |contents, cx| {
+                    contents.drain_thumbs(cx);
+                    contents.treemap(cx).drain(cx)
+                })
+                .unwrap_or(false);
             if self.tabs.get(self.tab).is_some_and(|t| t.mode.is_treemap()) {
                 self.report(cx);
+                // The legend's byte totals follow the scan in — this is also
+                // what fills a sidebar that came back open from the prefs,
+                // which otherwise sat as bare swatches until the first toggle.
+                if map_moved && self.filter_popup_open {
+                    self.refresh_filter_popup(cx);
+                }
             }
             self.drain_chat(cx);
             self.preview.poll();

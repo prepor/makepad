@@ -1289,6 +1289,41 @@ pub fn filtered_size(node: &Node, query: &Query, inherited: u32) -> (u64, u32) {
     (bytes, files)
 }
 
+/// The filtered weight of every node, mirrored in the tree's own shape:
+/// `children` aligns index-for-index with the node's children. Measured once
+/// per (tree, query) and read by every relayout after that — the camera
+/// moves every frame, the answer to "which bytes match" does not. Without
+/// this, a filtered layout re-walked whole subtrees at every nesting level
+/// of every frame of an orbit, and the frame rate showed it.
+pub struct Measure {
+    pub bytes: u64,
+    pub files: u32,
+    pub children: Vec<Measure>,
+}
+
+/// One O(n) walk answering `query` for every node at once. `inherited` is
+/// the name-term mask the folders above `node` already satisfied.
+pub fn measure(node: &Node, query: &Query, inherited: u32) -> Measure {
+    if !node.is_dir {
+        return if query.file_matches(node, inherited) {
+            Measure { bytes: node.size, files: 1, children: Vec::new() }
+        } else {
+            Measure { bytes: 0, files: 0, children: Vec::new() }
+        };
+    }
+    let inherited = inherited | query.name_hits(&node.name);
+    let children: Vec<Measure> = node
+        .children
+        .iter()
+        .map(|child| measure(child, query, inherited))
+        .collect();
+    Measure {
+        bytes: children.iter().map(|m| m.bytes).sum(),
+        files: children.iter().map(|m| m.files).sum(),
+        children,
+    }
+}
+
 /// Bytes per kind tag under `node` — the legend's numbers. One walk.
 pub fn kind_totals(node: &Node) -> [u64; 16] {
     let mut totals = [0u64; 16];
@@ -1411,11 +1446,14 @@ pub fn layout(
     area: Rect,
     viewport: Rect,
     style: &MapStyle,
-    filter: Option<&Query>,
+    filter: Option<&Measure>,
 ) -> Vec<Cell> {
     let mut out = Vec::new();
     let mut path = root_path.to_path_buf();
-    let filter = filter.filter(|q| !q.is_empty()).map(|q| (q, q.name_hits(&node.name)));
+    // A stale measure — one made of a different tree — must never index out
+    // of step with the children; the caller keys its cache on the tree
+    // revision, and this is the belt to that suspender.
+    let filter = filter.filter(|m| m.children.len() == node.children.len());
     layout_children(&node.children, &mut path, area, viewport, 0, style, filter, &mut out);
     out
 }
@@ -1435,7 +1473,7 @@ fn layout_children(
     viewport: Rect,
     depth: usize,
     style: &MapStyle,
-    filter: Option<(&Query, u32)>,
+    filter: Option<&Measure>,
     out: &mut Vec<Cell>,
 ) {
     if children.is_empty() || area.w <= 0.0 || area.h <= 0.0 || out.len() >= style.max_cells {
@@ -1445,16 +1483,12 @@ fn layout_children(
         return;
     }
     // Under a filter every child weighs only its matching bytes — the whole
-    // map re-proportions to the question being asked. The unfiltered path
-    // never allocates or walks anything extra.
-    let measured: Option<Vec<(u64, u32)>> = filter.map(|(query, inherited)| {
-        children
-            .iter()
-            .map(|child| filtered_size(child, query, inherited))
-            .collect()
-    });
-    let weight = |index: usize| match &measured {
-        Some(list) => list[index].0,
+    // map re-proportions to the question being asked. The weights were all
+    // measured in one walk up front (see [`measure`]); reading them here is
+    // an index, not a subtree walk. The unfiltered path costs nothing extra.
+    let measured = filter.map(|m| &m.children);
+    let weight = |index: usize| match measured {
+        Some(list) => list[index].bytes,
         None => children[index].size,
     };
     let total: f64 = (0..children.len()).map(|i| weight(i) as f64).sum();
@@ -1477,8 +1511,8 @@ fn layout_children(
         } else if size > 0 {
             bundle_size += size;
             bundle_count += 1;
-            bundle_files += match &measured {
-                Some(list) => list[index].1,
+            bundle_files += match measured {
+                Some(list) => list[index].files,
                 None => children[index].files,
             };
         }
@@ -1549,8 +1583,8 @@ fn layout_children(
             path: path.clone(),
             name: child.name.clone(),
             size: weight(index),
-            files: match &measured {
-                Some(list) => list[index].1,
+            files: match measured {
+                Some(list) => list[index].files,
                 None => child.files,
             },
             is_dir: child.is_dir,
@@ -1563,7 +1597,7 @@ fn layout_children(
             extra: 0,
         });
         if is_group {
-            let filter = filter.map(|(q, m)| (q, m | q.name_hits(&child.name)));
+            let filter = measured.map(|list| &list[index]);
             layout_children(&child.children, path, inner, viewport, depth + 1, style, filter, out);
         }
         path.pop();
@@ -2216,15 +2250,37 @@ mod tests {
         let q = Query::parse(".mov", 0);
         let (bytes, files) = filtered_size(&tree, &q, 0);
         assert_eq!((bytes, files), (1000, 2));
+        // The one-walk measure agrees with the recursive sum, at the root
+        // and per child — it is the layout's only source of weights now.
+        let m = measure(&tree, &q, 0);
+        assert_eq!((m.bytes, m.files), (1000, 2));
+        assert_eq!(m.children.len(), 2);
+        assert_eq!(m.children[0].bytes, 1000);
+        assert_eq!(m.children[1].bytes, 0);
+        assert_eq!(m.children[0].children.iter().map(|c| c.bytes).collect::<Vec<_>>(), vec![900, 0, 100]);
         // A folder with no matching bytes vanishes from the layout entirely.
         let area = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
-        let cells = layout(&tree, Path::new("/root"), area, area, &style(), Some(&q));
+        let cells = layout(&tree, Path::new("/root"), area, area, &style(), Some(&m));
         assert!(cells.iter().any(|c| c.name == "movies" && c.size == 1000));
         assert!(!cells.iter().any(|c| c.name == "docs"));
         assert!(!cells.iter().any(|c| c.name == "b.txt"));
         // And no filter costs nothing different from before.
         let plain = layout(&tree, Path::new("/root"), area, area, &style(), None);
         assert!(plain.iter().any(|c| c.name == "docs"));
+    }
+
+    // The measure is a cache, and caches go stale: one made of a different
+    // tree shape must be refused wholesale, never indexed out of step.
+    #[test]
+    fn a_stale_measure_is_refused_not_misapplied() {
+        let tree = dir("root", vec![leaf("a.mov", 900), leaf("b.txt", 50)]);
+        let q = Query::parse(".mov", 0);
+        let mut m = measure(&tree, &q, 0);
+        m.children.pop(); // now shaped like some other tree
+        let area = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+        let cells = layout(&tree, Path::new("/root"), area, area, &style(), Some(&m));
+        // Fell back to the unfiltered weights: everything is on the map.
+        assert!(cells.iter().any(|c| c.name == "b.txt"));
     }
 
     #[test]

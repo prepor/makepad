@@ -380,6 +380,29 @@ pub struct TreemapView {
     totals: [u64; 16],
     #[rust]
     totals_dirty: bool,
+    /// The filter's weights, measured once per (tree revision, query) and
+    /// reused by every relayout since — the camera relayouts every frame of
+    /// an orbit, and re-walking six hundred thousand nodes each frame was
+    /// exactly the frame rate the user was feeling. None while unfiltered.
+    #[rust]
+    measure: Option<treemap::Measure>,
+    #[rust]
+    measure_rev: u64,
+    #[rust]
+    measure_query: Option<Query>,
+    /// Bumped whenever the measured tree itself changes — scan steps landing,
+    /// moves absorbed, a re-root — never by the camera.
+    #[rust]
+    tree_rev: u64,
+
+    /// The wheel's glide: the scale it is headed for, and the ground point
+    /// pinned under the cursor for the whole ride. Each wheel step retargets;
+    /// the camera eases there over a few frames instead of jumping.
+    #[rust]
+    zoom_glide: Option<ZoomGlide>,
+    /// Q/E's glide: the yaw the orbit is headed for, and the last tick.
+    #[rust]
+    yaw_glide: Option<(f64, Instant)>,
 
     /// The filter tween: where each surviving path was, the cells that are
     /// leaving (with the rect they were last seen at), and when it started.
@@ -440,6 +463,20 @@ struct CrumbHit {
     rect: Rect,
     depth: usize,
 }
+
+/// A wheel zoom in flight: eased toward `target` a frame at a time, always
+/// about the same map-ground `anchor`, so the point under the cursor stays
+/// put for the whole glide. Each further wheel step just retargets it.
+#[derive(Clone, Copy)]
+struct ZoomGlide {
+    target: f64,
+    anchor: DVec2,
+    last: Instant,
+}
+
+/// How fast a glide closes on its target: the ease-out's time constant.
+/// 45ms settles ~95% of the way in ~135ms — smooth, never floaty.
+const GLIDE_TAU: f64 = 0.045;
 
 /// A press waiting to learn whether it is a click or its button's drag
 /// gesture: primary orbits (pans, on the flat map), secondary pans.
@@ -677,8 +714,11 @@ impl TreemapView {
         self.yaw = 0.0;
         self.pitch = DEFAULT_PITCH;
         self.drag = None;
+        self.zoom_glide = None;
+        self.yaw_glide = None;
         self.filtered = None;
         self.totals_dirty = true;
+        self.tree_rev = self.tree_rev.wrapping_add(1);
         self.tween_capture = None;
         self.tween_start = None;
         self.tween_from.clear();
@@ -823,6 +863,7 @@ impl TreemapView {
                 self.tree.apply(step);
                 self.stale = true;
                 self.totals_dirty = true;
+                self.tree_rev = self.tree_rev.wrapping_add(1);
             }
             if let Some(outcome) = message.finished {
                 self.scanning = false;
@@ -913,6 +954,9 @@ impl TreemapView {
     /// what the eye did before it re-roots what a reveal did. False when
     /// there is nowhere left to go.
     pub fn zoom_out(&mut self, cx: &mut Cx) -> bool {
+        // Whatever is still gliding stops where Esc found it.
+        self.zoom_glide = None;
+        self.yaw_glide = None;
         if self.projection != MapProjection::Flat
             && (self.yaw.abs() > 0.01 || (self.pitch - DEFAULT_PITCH).abs() > 0.01)
         {
@@ -969,9 +1013,14 @@ impl TreemapView {
         self.stale = true;
         self.last_layout = None;
         self.laid_out = Rect::default();
+        // A re-root measures a different subtree — the filter cache must not
+        // outlive the folder it was measured against.
+        self.tree_rev = self.tree_rev.wrapping_add(1);
         // A re-root is a new picture; the camera starts over on it.
         self.cam_scale = 1.0;
         self.cam_off = DVec2::default();
+        self.zoom_glide = None;
+        self.yaw_glide = None;
         self.yaw = 0.0;
         self.pitch = DEFAULT_PITCH;
         self.redraw(cx);
@@ -1089,12 +1138,54 @@ impl TreemapView {
         self.redraw(cx);
     }
 
-    /// Nudge the orbit — the keyboard's Q/E.
+    /// Nudge the orbit — the keyboard's Q/E. A yaw-only nudge glides there
+    /// rather than snapping, and a second tap mid-glide just aims further.
     pub fn orbit_by(&mut self, cx: &mut Cx, dyaw: f64, dpitch: f64) {
         if self.projection == MapProjection::Flat {
             return;
         }
+        if dpitch == 0.0 {
+            let base = self.yaw_glide.map_or(self.yaw, |(target, _)| target);
+            self.yaw_glide = Some((wrap_angle(base + dyaw), Instant::now()));
+            self.frame = cx.new_next_frame();
+            return;
+        }
         self.set_orbit(cx, self.yaw + dyaw, self.pitch + dpitch);
+    }
+
+    /// One frame of whichever glides are running: ease toward the target,
+    /// keep the frame clock alive until both arrive.
+    fn step_glides(&mut self, cx: &mut Cx) {
+        if let Some(mut glide) = self.zoom_glide.take() {
+            let now = Instant::now();
+            let dt = now.duration_since(glide.last).as_secs_f64().min(0.1);
+            glide.last = now;
+            let current = self.cam_scale.max(1.0);
+            // Zoom lives in ratio space: equal glide time closes an equal
+            // *proportion* of the remaining ratio, in or out alike.
+            let remaining = (glide.target / current).ln();
+            if remaining.abs() < 0.002 {
+                self.zoom_at(cx, glide.anchor, glide.target / current);
+            } else {
+                let k = 1.0 - (-dt / GLIDE_TAU).exp();
+                self.zoom_at(cx, glide.anchor, (remaining * k).exp());
+                self.zoom_glide = Some(glide);
+                self.frame = cx.new_next_frame();
+            }
+        }
+        if let Some((target, last)) = self.yaw_glide.take() {
+            let now = Instant::now();
+            let dt = now.duration_since(last).as_secs_f64().min(0.1);
+            let remaining = wrap_angle(target - self.yaw);
+            if remaining.abs() < 0.002 {
+                self.set_orbit(cx, target, self.pitch);
+            } else {
+                let k = 1.0 - (-dt / GLIDE_TAU).exp();
+                self.set_orbit(cx, self.yaw + remaining * k, self.pitch);
+                self.yaw_glide = Some((target, now));
+                self.frame = cx.new_next_frame();
+            }
+        }
     }
 
     /// Change how the map projects. The layout itself never changes — only
@@ -1356,6 +1447,7 @@ impl TreemapView {
         self.hover = None;
         self.stale = true;
         self.totals_dirty = true;
+        self.tree_rev = self.tree_rev.wrapping_add(1);
         self.last_layout = None;
         self.save_cache();
         self.redraw(cx);
@@ -1409,18 +1501,39 @@ impl TreemapView {
                 }
             }
         };
-        self.cells = treemap::layout(
+        // The filter's weights come from a measure tree cached against the
+        // tree revision and the query: a camera move re-lays-out every frame
+        // and must never pay for re-measuring what did not change.
+        match &self.filter {
+            None => {
+                self.measure = None;
+                self.measure_query = None;
+                self.filtered = None;
+            }
+            Some(query) => {
+                if self.measure.is_none()
+                    || self.measure_rev != self.tree_rev
+                    || self.measure_query.as_ref() != Some(query)
+                {
+                    let focused = self.focused();
+                    let measured =
+                        treemap::measure(focused, query, query.name_hits(&focused.name));
+                    self.measure = Some(measured);
+                    self.measure_rev = self.tree_rev;
+                    self.measure_query = Some(query.clone());
+                }
+                self.filtered = self.measure.as_ref().map(|m| (m.bytes, m.files));
+            }
+        }
+        let cells = treemap::layout(
             self.focused(),
             &base,
             area,
             viewport,
             &self.style,
-            self.filter.as_ref(),
+            self.measure.as_ref(),
         );
-        self.filtered = self.filter.as_ref().map(|query| {
-            let focused = self.focused();
-            treemap::filtered_size(focused, query, query.name_hits(&focused.name))
-        });
+        self.cells = cells;
         self.paint_order = match self.projection {
             MapProjection::Flat => Vec::new(),
             _ => view_order(&self.cells, self.lean()),
@@ -2143,6 +2256,7 @@ impl Widget for TreemapView {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         if self.frame.is_event(event).is_some() {
+            self.step_glides(cx);
             if self.tween_t().is_some() {
                 self.redraw(cx);
             }
@@ -2172,6 +2286,9 @@ impl Widget for TreemapView {
                 }
             }
             Hit::FingerDown(e) => {
+                // A hand on the map takes the camera back from any glide.
+                self.zoom_glide = None;
+                self.yaw_glide = None;
                 // Either button: click or that button's drag gesture, decided
                 // on release — so a click never nudges the camera and a drag
                 // never changes the selection or opens the menu.
@@ -2238,10 +2355,21 @@ impl Widget for TreemapView {
                 // Wheel/two fingers zoom about the pointer. The exponent
                 // makes equal wheel travel worth equal zoom *ratio*, which
                 // is the only way in and out feel like the same control.
+                // The step retargets a glide rather than jumping the camera:
+                // the ease runs on the frame clock, always about the ground
+                // point that was under the cursor.
                 let factor = (-e.scroll.y * 0.011).exp();
                 let cam = self.cam_at(self.laid_out);
                 let anchor = cam.unproject_ground(e.abs);
-                self.zoom_at(cx, anchor, factor);
+                let base = self
+                    .zoom_glide
+                    .map_or(self.cam_scale.max(1.0), |glide| glide.target);
+                self.zoom_glide = Some(ZoomGlide {
+                    target: (base * factor).clamp(1.0, 512.0),
+                    anchor,
+                    last: Instant::now(),
+                });
+                self.frame = cx.new_next_frame();
             }
             _ => {}
         }

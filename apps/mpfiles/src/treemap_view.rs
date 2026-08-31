@@ -395,6 +395,23 @@ pub struct TreemapView {
     #[rust]
     tree_rev: u64,
 
+    /// The camera `cells` were laid out at. While a gesture moves the live
+    /// camera, the draw path remaps every rect from this camera to that one —
+    /// the picture rides along as one rigid sheet — and the layout is only
+    /// rebuilt when the motion settles (or on a coarse cadence during a long
+    /// one), morphing there. This is what keeps a wheel zoom visually
+    /// constant: the layout is not scale-invariant (insets and header strips
+    /// are fixed point sizes, the bundle floor moves with area), so
+    /// re-laying-out every glide frame made tiles swim and jump mid-zoom.
+    #[rust]
+    layout_scale: f64,
+    #[rust]
+    layout_off: DVec2,
+    #[rust]
+    layout_yaw: f64,
+    #[rust]
+    layout_pitch: f64,
+
     /// The wheel's glide: the scale it is headed for, and the ground point
     /// pinned under the cursor for the whole ride. Each wheel step retargets;
     /// the camera eases there over a few frames instead of jumping.
@@ -477,6 +494,15 @@ struct ZoomGlide {
 /// How fast a glide closes on its target: the ease-out's time constant.
 /// 45ms settles ~95% of the way in ~135ms — smooth, never floaty.
 const GLIDE_TAU: f64 = 0.045;
+/// How often a long, still-running camera gesture may refresh the layout
+/// underneath itself. Coarse on purpose: between refreshes the picture rides
+/// a rigid remap of the last layout — visually constant by construction —
+/// and each refresh arrives as a morph, never a per-frame reshuffle.
+const MOTION_RELAYOUT: Duration = Duration::from_millis(150);
+/// How far past the panel the flat cull reaches, as a fraction of the panel
+/// per side: the slack that lets a pan or an out-zoom ride the remap without
+/// exposing unlaid ground before the next refresh.
+const MOTION_CULL_PAD: f64 = 0.25;
 
 /// A press waiting to learn whether it is a click or its button's drag
 /// gesture: primary orbits (pans, on the flat map), secondary pans.
@@ -713,6 +739,12 @@ impl TreemapView {
         self.cam_off = DVec2::default();
         self.yaw = 0.0;
         self.pitch = DEFAULT_PITCH;
+        // The camera rests: the remap is the identity until the first layout
+        // of the new map records itself here.
+        self.layout_scale = 1.0;
+        self.layout_off = DVec2::default();
+        self.layout_yaw = 0.0;
+        self.layout_pitch = DEFAULT_PITCH;
         self.drag = None;
         self.zoom_glide = None;
         self.yaw_glide = None;
@@ -1023,17 +1055,82 @@ impl TreemapView {
         self.yaw_glide = None;
         self.yaw = 0.0;
         self.pitch = DEFAULT_PITCH;
+        self.layout_scale = 1.0;
+        self.layout_off = DVec2::default();
+        self.layout_yaw = 0.0;
+        self.layout_pitch = DEFAULT_PITCH;
         self.redraw(cx);
     }
 
     // ------------------------------------------------------------- camera
 
-    /// Move the camera: clamp so the window never leaves the map, then lay
-    /// the map out again at the new magnification. The re-layout is the whole
-    /// point of zooming here — the magnified map is laid out at its blown-up
-    /// size and culled to the window, so detail that was below the
-    /// visibility floor comes into existence instead of scaling up blurry,
-    /// and "N smaller items" plates dissolve into the things they stood for.
+    /// The rigid ride from where `cells` were laid out to where the camera
+    /// is now: `screen = laid·k + b`. Identity whenever the camera rests on
+    /// its own layout.
+    fn cam_remap(&self) -> (f64, DVec2) {
+        remap_params(
+            self.laid_out,
+            self.layout_scale,
+            self.layout_off,
+            self.cam_scale,
+            self.cam_off,
+        )
+    }
+
+    /// Whether the live camera has left the camera the layout was made at —
+    /// the one question "does anything need settling" comes down to.
+    fn camera_departed(&self) -> bool {
+        let (k, b) = self.cam_remap();
+        (k - 1.0).abs() > 1e-6
+            || b.x.abs() > 0.25
+            || b.y.abs() > 0.25
+            || (self.projection != MapProjection::Flat
+                && ((self.yaw - self.layout_yaw).abs() > 1e-6
+                    || (self.pitch - self.layout_pitch).abs() > 1e-6))
+    }
+
+    /// Whether a camera gesture still owns the frame. While one does, camera
+    /// changes ride the remap and never relayout — that is the visual
+    /// constancy the whole scheme exists for.
+    fn cam_in_motion(&self) -> bool {
+        self.zoom_glide.is_some()
+            || self.yaw_glide.is_some()
+            || self.drag.map_or(false, |d| d.moved)
+    }
+
+    /// Lay the map out at the camera's resting place, morphing there from
+    /// wherever the picture visually stands. A no-op when it already rests.
+    fn settle(&mut self, cx: &mut Cx) {
+        if self.tree.children.is_empty() || !self.camera_departed() {
+            return;
+        }
+        if self.tween_capture.is_none() {
+            self.tween_capture = Some(self.visual_snapshot());
+        }
+        self.stale = true;
+        self.last_layout = None;
+        self.redraw(cx);
+    }
+
+    /// Mid-gesture, whether the coarse layout refresh may run: something to
+    /// refresh — the camera departed, or the tree changed under the scan —
+    /// and the cadence has passed.
+    fn motion_refresh_due(&self) -> bool {
+        if !self.camera_departed() && !self.stale {
+            return false;
+        }
+        match self.last_layout {
+            Some(at) => at.elapsed() >= MOTION_RELAYOUT,
+            None => true,
+        }
+    }
+
+    /// Move the camera. Mid-gesture the picture rides the remap — one rigid
+    /// sheet, nothing re-flows — and the layout catches up when the motion
+    /// settles or on the coarse mid-motion cadence, arriving as a morph. A
+    /// discrete jump (a double-click fit, Esc) settles at once, so the new
+    /// detail — bundles dissolving into the things they stood for — morphs
+    /// in rather than popping.
     fn set_camera(&mut self, cx: &mut Cx, scale: f64, off: DVec2) {
         let body = self.laid_out;
         let scale = scale.clamp(1.0, 512.0);
@@ -1046,9 +1143,10 @@ impl TreemapView {
         }
         self.cam_scale = scale;
         self.cam_off = off;
-        self.stale = true;
-        self.last_layout = None;
         self.hover = None;
+        if !self.cam_in_motion() {
+            self.settle(cx);
+        }
         self.redraw(cx);
     }
 
@@ -1121,9 +1219,10 @@ impl TreemapView {
         dvec2(-self.yaw.sin(), -self.yaw.cos())
     }
 
-    /// Point the orbit somewhere. Everything downstream — projection, paint
-    /// order, culling — follows the camera, so this is a relayout like any
-    /// other camera move.
+    /// Point the orbit somewhere. The cells stay put — only the projection
+    /// of them moves — so no relayout mid-gesture; the paint order alone
+    /// must follow the new lean at once, or towers overlap wrongly the very
+    /// frame the yaw crosses a quadrant.
     fn set_orbit(&mut self, cx: &mut Cx, yaw: f64, pitch: f64) {
         let yaw = wrap_angle(yaw);
         let pitch = pitch.clamp(0.0, MAX_PITCH);
@@ -1132,9 +1231,14 @@ impl TreemapView {
         }
         self.yaw = yaw;
         self.pitch = pitch;
-        self.stale = true;
-        self.last_layout = None;
         self.hover = None;
+        self.paint_order = match self.projection {
+            MapProjection::Flat => Vec::new(),
+            _ => view_order(&self.cells, self.lean()),
+        };
+        if !self.cam_in_motion() {
+            self.settle(cx);
+        }
         self.redraw(cx);
     }
 
@@ -1165,11 +1269,16 @@ impl TreemapView {
             // *proportion* of the remaining ratio, in or out alike.
             let remaining = (glide.target / current).ln();
             if remaining.abs() < 0.002 {
+                // Arrived: the last step runs un-glided, and the layout
+                // settles under wherever the ride ended.
                 self.zoom_at(cx, glide.anchor, glide.target / current);
+                self.settle(cx);
             } else {
                 let k = 1.0 - (-dt / GLIDE_TAU).exp();
-                self.zoom_at(cx, glide.anchor, (remaining * k).exp());
+                // Restored before the step, so the camera change knows a
+                // glide still owns it and rides the remap.
                 self.zoom_glide = Some(glide);
+                self.zoom_at(cx, glide.anchor, (remaining * k).exp());
                 self.frame = cx.new_next_frame();
             }
         }
@@ -1179,10 +1288,11 @@ impl TreemapView {
             let remaining = wrap_angle(target - self.yaw);
             if remaining.abs() < 0.002 {
                 self.set_orbit(cx, target, self.pitch);
+                self.settle(cx);
             } else {
                 let k = 1.0 - (-dt / GLIDE_TAU).exp();
-                self.set_orbit(cx, self.yaw + remaining * k, self.pitch);
                 self.yaw_glide = Some((target, now));
+                self.set_orbit(cx, self.yaw + remaining * k, self.pitch);
                 self.frame = cx.new_next_frame();
             }
         }
@@ -1247,21 +1357,24 @@ impl TreemapView {
         Some(t * t * (3.0 - 2.0 * t))
     }
 
-    /// Every cell's current on-screen truth — layout rect and fractional
-    /// depth, mid-tween or not — plus the leavers still fading out.
+    /// Every cell's current on-screen truth — the rect it is visually at,
+    /// mid-tween and mid-gesture alike, and its fractional depth — plus the
+    /// leavers still fading out. Remapped through the live camera, so a
+    /// tween aimed from here starts exactly where the eye left off.
     fn visual_snapshot(&self) -> Vec<(Cell, MapRect, f64)> {
         let t = self.tween_t();
+        let (rk, rb) = self.cam_remap();
         let mut out: Vec<(Cell, MapRect, f64)> = Vec::with_capacity(self.cells.len());
         for cell in &self.cells {
             let (rect, depth, alive) = self.tweened(cell, t);
             if alive > 0.0 {
-                out.push((cell.clone(), rect, depth));
+                out.push((cell.clone(), remap_rect(&rect, rk, rb), depth));
             }
         }
         if let Some(t) = t {
             for (cell, rect, _) in &self.tween_leavers {
                 if 1.0 - t > 0.05 {
-                    out.push((cell.clone(), *rect, cell.depth as f64));
+                    out.push((cell.clone(), remap_rect(rect, rk, rb), cell.depth as f64));
                 }
             }
         }
@@ -1469,12 +1582,22 @@ impl TreemapView {
         // un-projected, boxed, and grown by the tallest possible lean — the
         // cull has to keep whatever could spin or lean into view.
         let viewport = match self.projection {
-            MapProjection::Flat => MapRect {
-                x: rect.pos.x,
-                y: rect.pos.y,
-                w: rect.size.x,
-                h: rect.size.y,
-            },
+            MapProjection::Flat => {
+                // A margin past the panel, so a pan or an out-zoom rides the
+                // remap without exposing unlaid ground before the next
+                // refresh. Cells in the margin are laid out but skipped at
+                // draw time, so they cost layout, not paint.
+                let pad = dvec2(
+                    rect.size.x * MOTION_CULL_PAD,
+                    rect.size.y * MOTION_CULL_PAD,
+                );
+                MapRect {
+                    x: rect.pos.x - pad.x,
+                    y: rect.pos.y - pad.y,
+                    w: rect.size.x + pad.x * 2.0,
+                    h: rect.size.y + pad.y * 2.0,
+                }
+            }
             _ => {
                 let cam = self.cam_at(rect);
                 let corners = [
@@ -1493,11 +1616,18 @@ impl TreemapView {
                     max.y = max.y.max(g.y);
                 }
                 let reach = self.elev(24) + 40.0;
+                // Rotation-proof: a mid-drag orbit swings the visible
+                // footprint around the pivot without a relayout, so the cull
+                // is the square that covers the footprint at any yaw — its
+                // centre, sides the footprint's diagonal.
+                let half = ((max.x - min.x).powi(2) + (max.y - min.y).powi(2)).sqrt() * 0.5
+                    + reach;
+                let mid = dvec2((min.x + max.x) * 0.5, (min.y + max.y) * 0.5);
                 MapRect {
-                    x: min.x - reach,
-                    y: min.y - reach,
-                    w: (max.x - min.x) + reach * 2.0,
-                    h: (max.y - min.y) + reach * 2.0,
+                    x: mid.x - half,
+                    y: mid.y - half,
+                    w: half * 2.0,
+                    h: half * 2.0,
                 }
             }
         };
@@ -1557,6 +1687,12 @@ impl TreemapView {
             self.tween_start = Some(Instant::now());
         }
         self.laid_out = rect;
+        // The layout now rests exactly under the live camera: the remap is
+        // the identity again until the next gesture departs from here.
+        self.layout_scale = self.cam_scale.max(1.0);
+        self.layout_off = self.cam_off;
+        self.layout_yaw = self.yaw;
+        self.layout_pitch = self.pitch;
         self.stale = false;
         self.last_layout = Some(Instant::now());
         // The cell list is new, so the hovered index means nothing any more.
@@ -1578,19 +1714,25 @@ impl TreemapView {
     /// it stands on — front-most first: the reverse of paint order, which is
     /// what "front" means.
     fn hit_cell(&self, pos: DVec2) -> Option<usize> {
+        let (rk, rb) = self.cam_remap();
         if self.projection == MapProjection::Flat || self.paint_order.len() != self.cells.len() {
-            return treemap::hit(&self.cells, pos.x, pos.y);
+            // The inverse ride: the pointer comes back from the screen into
+            // the space the cells were laid out in, so a mid-gesture hover
+            // or click lands on what the eye actually sees.
+            let p = dvec2((pos.x - rb.x) / rk, (pos.y - rb.y) / rk);
+            return treemap::hit(&self.cells, p.x, p.y);
         }
         let cam = self.cam_at(self.laid_out);
         let rise = self.rise();
         for &index in self.paint_order.iter().rev() {
             let cell = &self.cells[index];
+            let rect = remap_rect(&cell.rect, rk, rb);
             let z = self.elev(cell.depth);
-            if Quad::of_rect(&cam, &cell.rect, z).contains(pos) {
+            if Quad::of_rect(&cam, &rect, z).contains(pos) {
                 return Some(index);
             }
             if z > 0.0 {
-                for wall in wall_quads(&cam, &cell.rect, z, rise.min(z)).into_iter().flatten() {
+                for wall in wall_quads(&cam, &rect, z, rise.min(z)).into_iter().flatten() {
                     if wall.quad.contains(pos) {
                         return Some(index);
                     }
@@ -1660,6 +1802,10 @@ impl TreemapView {
         let raised = self.projection != MapProjection::Flat;
         let rise = self.rise();
         let cam = self.cam_at(self.laid_out);
+        // Mid-gesture, every rect rides from the layout's camera to the live
+        // one through this one affine map — the whole picture scales as one
+        // rigid sheet, which is what "visually constant" means.
+        let (rk, rb) = self.cam_remap();
 
         cx.push_clip_rect(clip);
         self.draw_tile.begin_many_instances(cx);
@@ -1671,7 +1817,7 @@ impl TreemapView {
             for index in 0..self.tween_leavers.len() {
                 let (rect, depth) = {
                     let (_, r, d) = &self.tween_leavers[index];
-                    (*r, *d)
+                    (remap_rect(r, rk, rb), *d)
                 };
                 let (fill, _) = {
                     let (cell, _, _) = &self.tween_leavers[index];
@@ -1695,6 +1841,7 @@ impl TreemapView {
         for &index in &order {
             let cell = &self.cells[index];
             let (vrect, vdepth, alpha) = self.tweened(cell, t);
+            let vrect = remap_rect(&vrect, rk, rb);
             let alpha = alpha as f32;
             if alpha <= 0.02 {
                 continue;
@@ -1702,6 +1849,17 @@ impl TreemapView {
             let z = if raised { self.elev_f(vdepth) } else { 0.0 };
             let quad = Quad::of_rect(&cam, &vrect, z);
             let rect = quad.bounds();
+            // The cull margin was laid out to ride the remap, not to be
+            // painted: whatever sits wholly off the panel is skipped, with
+            // slack for the walls hanging below a plate.
+            let slack = z + 4.0;
+            if rect.pos.x + rect.size.x < clip.pos.x - slack
+                || rect.pos.x > clip.pos.x + clip.size.x + slack
+                || rect.pos.y + rect.size.y < clip.pos.y - slack
+                || rect.pos.y > clip.pos.y + clip.size.y + slack
+            {
+                continue;
+            }
             let cell = &self.cells[index];
             let (fill, cushion) = self.tile_colors(cell, palette);
             let is_hover = Some(index) == hovered;
@@ -1825,6 +1983,7 @@ impl TreemapView {
             if let Some(index) = found {
                 let cell = &self.cells[index];
                 let (vrect, vdepth, _) = self.tweened(cell, t);
+                let vrect = remap_rect(&vrect, rk, rb);
                 let z = if raised { self.elev_f(vdepth) } else { 0.0 };
                 let quad = Quad::of_rect(&cam, &vrect, z);
                 self.draw_tile.color = Vec4f { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
@@ -2063,7 +2222,8 @@ impl TreemapView {
             MapProjection::Flat => 0.0,
             _ => self.elev(cell.depth),
         };
-        let top = Quad::of_rect(&cam, &cell.rect, z).bounds();
+        let (rk, rb) = self.cam_remap();
+        let top = Quad::of_rect(&cam, &remap_rect(&cell.rect, rk, rb), z).bounds();
         let anchor = top.pos;
         let cell_h = top.size.y;
 
@@ -2151,9 +2311,13 @@ impl TreemapView {
         }
         self.pick = Some(pick_of(&cell));
         self.redraw(cx);
+        // Where the cell IS on screen — a double-click straight after a
+        // gesture fits what the eye sees, not where the old layout had it.
+        let (rk, rb) = self.cam_remap();
+        let vrect = remap_rect(&cell.rect, rk, rb);
         let rect = Rect {
-            pos: dvec2(cell.rect.x, cell.rect.y),
-            size: dvec2(cell.rect.w, cell.rect.h),
+            pos: dvec2(vrect.x, vrect.y),
+            size: dvec2(vrect.w, vrect.h),
         };
         if cell.is_bundle() {
             // Nothing on disk is under there to act on — but zooming in on
@@ -2214,7 +2378,22 @@ impl Widget for TreemapView {
         // the other order would print a stale size and never come back for
         // the right one.
         if !self.tree.children.is_empty() {
-            if self.laid_out != body || (self.stale && self.layout_is_due()) {
+            if self.laid_out != body {
+                self.relayout(body);
+            } else if self.cam_in_motion() {
+                // A camera gesture owns the picture: it rides the remap,
+                // visually rigid, and the layout underneath only refreshes
+                // on a coarse cadence — each refresh a morph that brings in
+                // new detail and cull, never a per-frame reshuffle.
+                if self.motion_refresh_due() {
+                    if self.tween_capture.is_none() {
+                        self.tween_capture = Some(self.visual_snapshot());
+                    }
+                    self.relayout(body);
+                } else if self.stale {
+                    self.frame = cx.new_next_frame();
+                }
+            } else if self.stale && self.layout_is_due() {
                 self.relayout(body);
             } else if self.stale {
                 // Drawn from a picture the scan has already moved past. The
@@ -2355,6 +2534,10 @@ impl Widget for TreemapView {
                             // moment — the pick above has already landed.
                             cx.widget_action(self.uid, TreemapAction::Context(drag.from));
                         }
+                    } else {
+                        // The gesture is over: the layout catches up with
+                        // wherever the hand left the camera, morphing there.
+                        self.settle(cx);
                     }
                 }
             }
@@ -2521,6 +2704,38 @@ fn lerp_rect(a: &MapRect, b: &MapRect, t: f64) -> MapRect {
         y: a.y + (b.y - a.y) * t,
         w: a.w + (b.w - a.w) * t,
         h: a.h + (b.h - a.h) * t,
+    }
+}
+
+/// The affine ride from a layout camera to the live one: `screen = g·k + b`.
+/// The layout put a map fraction `u` at `body − layout_off + u·body·scale`;
+/// the live camera would put it at the same expression with its own scale
+/// and offset, and this is the unique uniform scale-and-shift between the
+/// two. Applying it to every laid-out rect moves the whole picture as one
+/// rigid sheet — no re-flow, by construction.
+fn remap_params(
+    body: Rect,
+    layout_scale: f64,
+    layout_off: DVec2,
+    cam_scale: f64,
+    cam_off: DVec2,
+) -> (f64, DVec2) {
+    let k = cam_scale.max(1.0) / layout_scale.max(1.0);
+    (
+        k,
+        dvec2(
+            (body.pos.x - cam_off.x) - (body.pos.x - layout_off.x) * k,
+            (body.pos.y - cam_off.y) - (body.pos.y - layout_off.y) * k,
+        ),
+    )
+}
+
+fn remap_rect(r: &MapRect, k: f64, b: DVec2) -> MapRect {
+    MapRect {
+        x: r.x * k + b.x,
+        y: r.y * k + b.y,
+        w: r.w * k,
+        h: r.h * k,
     }
 }
 
@@ -2830,6 +3045,62 @@ fn cell_kind(cell: &Cell) -> FileKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The visual-constancy contract: remapping a point laid out under one
+    // camera must land it exactly where laying out under the live camera
+    // would put it. This is the whole reason a wheel zoom no longer
+    // re-flows — the picture between relayouts IS this map.
+    #[test]
+    fn the_remap_rides_exactly_where_a_fresh_layout_would_put_things() {
+        let body = Rect { pos: dvec2(10.0, 20.0), size: dvec2(800.0, 600.0) };
+        let cases = [
+            ((1.0, dvec2(0.0, 0.0)), (3.0, dvec2(140.0, 260.0))),
+            ((2.0, dvec2(100.0, 50.0)), (2.0, dvec2(300.0, 120.0))),
+            ((4.0, dvec2(900.0, 400.0)), (1.0, dvec2(0.0, 0.0))),
+            ((3.0, dvec2(10.0, 700.0)), (7.5, dvec2(0.0, 40.0))),
+        ];
+        for ((ls, lo), (cs, co)) in cases {
+            let (k, b) = remap_params(body, ls, lo, cs, co);
+            for u in [dvec2(0.0, 0.0), dvec2(0.25, 0.75), dvec2(1.0, 1.0)] {
+                // Where the layout camera puts map fraction u…
+                let laid = dvec2(
+                    body.pos.x - lo.x + u.x * body.size.x * ls,
+                    body.pos.y - lo.y + u.y * body.size.y * ls,
+                );
+                // …and where the live camera would.
+                let live = dvec2(
+                    body.pos.x - co.x + u.x * body.size.x * cs,
+                    body.pos.y - co.y + u.y * body.size.y * cs,
+                );
+                assert!((laid.x * k + b.x - live.x).abs() < 1e-9, "x at {u:?}");
+                assert!((laid.y * k + b.y - live.y).abs() < 1e-9, "y at {u:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_remap_is_the_identity_when_the_camera_rests_on_its_layout() {
+        let body = Rect { pos: dvec2(0.0, 0.0), size: dvec2(640.0, 480.0) };
+        let (k, b) = remap_params(body, 2.5, dvec2(31.0, 7.0), 2.5, dvec2(31.0, 7.0));
+        assert!((k - 1.0).abs() < 1e-12);
+        assert!(b.x.abs() < 1e-9 && b.y.abs() < 1e-9);
+        let r = MapRect { x: 5.0, y: 6.0, w: 7.0, h: 8.0 };
+        let m = remap_rect(&r, k, b);
+        assert!((m.x - r.x).abs() < 1e-9 && (m.w - r.w).abs() < 1e-9);
+    }
+
+    // Hit-testing mid-gesture inverts the remap on the pointer; the two
+    // directions must be exact inverses or hover drifts off what is drawn.
+    #[test]
+    fn a_point_round_trips_through_the_remap_and_its_inverse() {
+        let body = Rect { pos: dvec2(1.0, 2.0), size: dvec2(500.0, 300.0) };
+        let (k, b) = remap_params(body, 1.0, dvec2(0.0, 0.0), 5.0, dvec2(700.0, 300.0));
+        for p in [dvec2(3.0, 4.0), dvec2(250.0, 150.0), dvec2(499.0, 299.0)] {
+            let s = dvec2(p.x * k + b.x, p.y * k + b.y);
+            let back = dvec2((s.x - b.x) / k, (s.y - b.y) / k);
+            assert!((back.x - p.x).abs() < 1e-9 && (back.y - p.y).abs() < 1e-9);
+        }
+    }
 
     #[test]
     fn the_kind_tag_survives_the_round_trip_through_a_byte() {

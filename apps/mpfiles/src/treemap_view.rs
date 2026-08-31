@@ -1756,6 +1756,13 @@ impl TreemapView {
             if labels.len() >= LABEL_BUDGET {
                 continue;
             }
+            if self.projection == MapProjection::Persp && !is_hover {
+                // The 3d view wears no name tags — a forest of prisms all
+                // labelled reads as clutter, not a city. A name appears the
+                // moment the pointer rests on its tile, and the tooltip
+                // carries the numbers as everywhere else.
+                continue;
+            }
             // A zoomed camera slides tiles half off the panel; a name pinned
             // to a corner nobody can see is a tile nobody can identify, so
             // labels clamp to the visible part of their rectangle — unless

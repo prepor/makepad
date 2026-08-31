@@ -182,6 +182,11 @@ mod apple_decoder;
 #[cfg(target_os = "macos")]
 mod apple_encoder;
 #[cfg(target_os = "macos")]
+mod apple_intra_frame;
+// Pure Rust and portable, but only the macOS still-writer uses it so far.
+#[cfg(target_os = "macos")]
+mod mp4_single_frame;
+#[cfg(target_os = "macos")]
 mod apple_stream_encoder;
 #[cfg(target_os = "macos")]
 mod apple_stream_decoder;
@@ -594,4 +599,36 @@ impl VideoFileDecoder {
             return Err(VideoFileError::new(UNSUPPORTED));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Single still pictures
+// ---------------------------------------------------------------------------
+
+/// Write one intra frame as its own mp4, without standing up a file writer.
+///
+/// A cache that keeps a picture per file pays the container cost on every
+/// picture, and for a single frame that cost dwarfs the encode: measured on an
+/// M3 Max, `AVAssetWriter` wants ~13 ms to open and ~34 ms to finalize around
+/// ~0.2 ms of HEVC. This drives the compression session directly and writes
+/// the boxes itself, so the file is the same single-frame mp4 the writer
+/// produced and the price is the encode.
+///
+/// `nv12` is a tightly packed NV12 buffer: `width * height` luma followed by
+/// interleaved chroma for `ceil(height / 2)` rows.
+#[cfg(target_os = "macos")]
+pub fn encode_intra_frame_mp4(
+    nv12: &[u8],
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    codec: VideoFileCodec,
+) -> Result<Vec<u8>, VideoFileError> {
+    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        return Err(VideoFileError::new(format!(
+            "invalid frame size {width}x{height} (must be nonzero and even)"
+        )));
+    }
+    apple_intra_frame::encode_intra_frame_mp4(nv12, width, height, fps.max(1), bitrate_bps, codec)
 }

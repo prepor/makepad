@@ -290,6 +290,20 @@ struct Label {
     scrim: bool,
 }
 
+/// A flat-map label frozen at its relayout: text already fitted, width
+/// already measured, anchor in layout space. Drawing translates the anchor
+/// through the live camera remap and nothing else — deriving names from the
+/// remapped rects every frame made each one flicker through its own
+/// truncation points and re-stack its stagger row all through a zoom glide.
+struct FrozenLabel {
+    at: DVec2,
+    line: String,
+    below: Option<String>,
+    width: f64,
+    ink: Vec4f,
+    scrim: bool,
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct TreemapView {
     #[uid]
@@ -451,6 +465,16 @@ pub struct TreemapView {
     /// edits and scan changes keep the arrival ceremony.
     #[rust]
     tween_calm: bool,
+    /// Bumped by every relayout; keys the frozen labels to their layout.
+    #[rust]
+    layout_rev: u64,
+    /// The flat map's printed names, derived once per relayout against the
+    /// settled rects and merely translated while a gesture is in flight.
+    #[rust]
+    frozen_labels: Vec<FrozenLabel>,
+    /// Which relayout `frozen_labels` was derived from.
+    #[rust]
+    frozen_rev: Option<u64>,
 
     #[rust]
     generation: u64,
@@ -779,6 +803,8 @@ impl TreemapView {
         self.tween_start = None;
         self.tween_from.clear();
         self.tween_leavers.clear();
+        self.frozen_labels.clear();
+        self.frozen_rev = None;
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
@@ -1759,77 +1785,89 @@ impl TreemapView {
         // A filter change captured the map as it looked; aim the tween from
         // there to the layout just built.
         if let Some(snapshot) = self.tween_capture.take() {
-            let now_here: std::collections::HashSet<&Path> =
-                self.cells.iter().map(|c| c.path.as_path()).collect();
-            self.tween_from = snapshot
-                .iter()
-                .filter(|(cell, _, _)| now_here.contains(cell.path.as_path()))
-                .map(|(cell, rect, depth)| {
-                    (cell.path.clone(), TweenFrom { rect: *rect, depth: *depth })
-                })
-                .collect();
-            // A cell new to the list is either a camera reveal — it was
-            // sitting outside the outgoing layout's cull, always there on
-            // disk, merely unlaid — or detail that genuinely appeared (a
-            // bundle dissolving, a scan step, a filter edit). Reveals must
-            // simply *be there*: styling them with the arrival fade reads
-            // as data popping into existence at the edge of an orbit or
-            // pan. So a reveal joins the tween at its own rect (no motion,
-            // full alpha) and only true arrivals keep the fade-and-grow.
-            // The snapshot and the fresh layout share a frame — snapshot
-            // rects were remapped to the live camera, which the fresh
-            // layout now rests under — so the old cull is compared in that
-            // frame too, through the remap the snapshot itself used.
             let calm = std::mem::take(&mut self.tween_calm);
-            if calm {
-                // A camera-asked settle: everything the refresh brought in
-                // was always there — a plate dissolving into its items at a
-                // deeper zoom is the SAME bytes at more detail, not data
-                // arriving. It materialises in place, full alpha, no grow;
-                // survivors still morph from their remapped rects (which the
-                // invariant packing makes a near no-op).
-                for cell in &self.cells {
-                    if !self.tween_from.contains_key(&cell.path) {
-                        self.tween_from.insert(
-                            cell.path.clone(),
-                            TweenFrom { rect: cell.rect, depth: cell.depth as f64 },
-                        );
-                    }
-                }
-            } else if old_cull.w > 0.0 {
-                let (rk, rb) = old_remap;
-                let seen = remap_rect(&old_cull, rk, rb);
-                for cell in &self.cells {
-                    if !self.tween_from.contains_key(&cell.path)
-                        && !cell.rect.intersects(&seen)
-                    {
-                        self.tween_from.insert(
-                            cell.path.clone(),
-                            TweenFrom { rect: cell.rect, depth: cell.depth as f64 },
-                        );
-                    }
-                }
-            }
-            // Symmetric on the way out: a cell the new layout culled away
-            // is just going off-view — it vanishes with the frame, no
-            // goodbye fade. Only a leaver still inside the laid region
-            // (absorbed, filtered out) earns one — and a calm settle owes
-            // nobody a goodbye at all: what left merely coarsened back
-            // into its plate.
-            self.tween_leavers = if calm {
-                Vec::new()
+            if calm && self.tween_t().is_none() {
+                // A camera-asked settle with nothing already morphing runs
+                // no animation at all. With zoom-invariant packing a
+                // survivor's fresh rect IS its remapped old rect, and the
+                // detail the refresh brought in was always there on disk —
+                // the new layout simply is. Starting the interpolator here
+                // would be 200ms of re-presentation per cadence: the "boxes
+                // animating" a quiet zoom must not have.
+                self.tween_from.clear();
+                self.tween_leavers.clear();
+                self.tween_start = None;
             } else {
-                snapshot
-                    .into_iter()
-                    .filter(|(cell, rect, _)| {
-                        !now_here.contains(cell.path.as_path())
-                            && rect.intersects(&self.laid_cull)
+                let now_here: std::collections::HashSet<&Path> =
+                    self.cells.iter().map(|c| c.path.as_path()).collect();
+                self.tween_from = snapshot
+                    .iter()
+                    .filter(|(cell, _, _)| now_here.contains(cell.path.as_path()))
+                    .map(|(cell, rect, depth)| {
+                        (cell.path.clone(), TweenFrom { rect: *rect, depth: *depth })
                     })
-                    .collect()
-            };
-            self.tween_start = Some(Instant::now());
+                    .collect();
+                if calm {
+                    // A camera settle that landed while an older morph (a
+                    // filter edit moments ago) was still in flight: re-aim
+                    // the running morph from the visual truth and let it
+                    // finish. Everything the refresh added joins at its own
+                    // rect, full alpha — camera-brought detail never fades.
+                    for cell in &self.cells {
+                        if !self.tween_from.contains_key(&cell.path) {
+                            self.tween_from.insert(
+                                cell.path.clone(),
+                                TweenFrom { rect: cell.rect, depth: cell.depth as f64 },
+                            );
+                        }
+                    }
+                    self.tween_leavers = Vec::new();
+                } else {
+                    // A cell new to the list is either a camera reveal — it
+                    // was sitting outside the outgoing layout's cull, always
+                    // there on disk, merely unlaid — or detail that genuinely
+                    // appeared (a bundle dissolving, a scan step, a filter
+                    // edit). Reveals must simply *be there*: styling them
+                    // with the arrival fade reads as data popping into
+                    // existence at the edge of an orbit or pan. So a reveal
+                    // joins the tween at its own rect (no motion, full alpha)
+                    // and only true arrivals keep the fade-and-grow. The
+                    // snapshot and the fresh layout share a frame — snapshot
+                    // rects were remapped to the live camera, which the
+                    // fresh layout now rests under — so the old cull is
+                    // compared in that frame too, through the remap the
+                    // snapshot itself used.
+                    if old_cull.w > 0.0 {
+                        let (rk, rb) = old_remap;
+                        let seen = remap_rect(&old_cull, rk, rb);
+                        for cell in &self.cells {
+                            if !self.tween_from.contains_key(&cell.path)
+                                && !cell.rect.intersects(&seen)
+                            {
+                                self.tween_from.insert(
+                                    cell.path.clone(),
+                                    TweenFrom { rect: cell.rect, depth: cell.depth as f64 },
+                                );
+                            }
+                        }
+                    }
+                    // Symmetric on the way out: a cell the new layout culled
+                    // away is just going off-view — it vanishes with the
+                    // frame, no goodbye fade. Only a leaver still inside the
+                    // laid region (absorbed, filtered out) earns one.
+                    self.tween_leavers = snapshot
+                        .into_iter()
+                        .filter(|(cell, rect, _)| {
+                            !now_here.contains(cell.path.as_path())
+                                && rect.intersects(&self.laid_cull)
+                        })
+                        .collect();
+                }
+                self.tween_start = Some(Instant::now());
+            }
         }
         self.laid_out = rect;
+        self.layout_rev = self.layout_rev.wrapping_add(1);
         // The layout now rests exactly under the live camera: the remap is
         // the identity again until the next gesture departs from here.
         self.layout_scale = self.cam_scale.max(1.0);
@@ -1946,6 +1984,12 @@ impl TreemapView {
         let mut placed_names: Vec<(f64, f64, f64)> = Vec::new();
         let t = self.tween_t();
         let raised = self.projection != MapProjection::Flat;
+        // The flat map's printed names are frozen per relayout and drawn by
+        // draw_frozen_labels, riding the remap untouched. Deriving them here,
+        // per frame from the remapped rects, is only for tween windows —
+        // where names travel with their morphing tiles — and for the raised
+        // hover label.
+        let live_labels = raised || t.is_some();
         let rise = self.rise();
         let cam = self.cam_at(self.laid_out);
         // Mid-gesture, every rect rides from the layout's camera to the live
@@ -2057,7 +2101,7 @@ impl TreemapView {
             self.draw_tile.border = border as f32;
             face(&mut self.draw_tile, cx, &quad);
 
-            if labels.len() >= LABEL_BUDGET {
+            if !live_labels || labels.len() >= LABEL_BUDGET {
                 continue;
             }
             if self.projection != MapProjection::Flat && !is_hover {
@@ -2245,6 +2289,168 @@ impl TreemapView {
             }
         }
         cx.pop_clip_rect();
+    }
+
+    /// Derive the flat map's labels from the settled layout, once. Content,
+    /// truncation and stagger row are all decided here against the layout's
+    /// own rects; the draw path then only translates anchors. Keyed on the
+    /// layout revision, so this is free until the next relayout.
+    fn ensure_frozen_labels(&mut self, cx: &mut Cx2d, palette: &Palette, clip: Rect) {
+        if self.frozen_rev == Some(self.layout_rev) {
+            return;
+        }
+        self.frozen_rev = Some(self.layout_rev);
+        let bright = Palette::vec4(&palette.fg_bright);
+        let ink_dark = Palette::vec4(&palette.bg_dark);
+        // Clamping happens in layout space: the panel carried back through
+        // the inverse of the live remap — the identity right after a settle,
+        // which is when this normally runs.
+        let (rk, rb) = self.cam_remap();
+        let lclip = MapRect {
+            x: (clip.pos.x - rb.x) / rk,
+            y: (clip.pos.y - rb.y) / rk,
+            w: clip.size.x / rk,
+            h: clip.size.y / rk,
+        };
+        let mut placed_names: Vec<(f64, f64, f64)> = Vec::new();
+        let mut out: Vec<FrozenLabel> = Vec::new();
+        for cell in &self.cells {
+            if out.len() >= LABEL_BUDGET {
+                break;
+            }
+            let rect = cell.rect;
+            let at_x = (rect.x + 4.0).max(lclip.x + 4.0);
+            let room = rect.x + rect.w - at_x - 4.0;
+            let clamped = rect.y < lclip.y;
+            if clamped && rect.y + rect.h - lclip.y < 40.0 {
+                continue;
+            }
+            if cell.is_group && cell.header > 0.0 {
+                let mut at_y = (rect.y + 1.0).max(lclip.y + 1.0);
+                loop {
+                    let mut bumped = false;
+                    for &(x0, x1, y) in &placed_names {
+                        let next = y + 12.0;
+                        if at_x < x1 && at_x + room > x0 && (at_y - y).abs() < 12.0 && next > at_y
+                        {
+                            at_y = next;
+                            bumped = true;
+                        }
+                    }
+                    if !bumped {
+                        break;
+                    }
+                }
+                if at_y > rect.y + rect.h - 12.0 {
+                    continue;
+                }
+                let full = format!("{}  {}", cell.name, treemap::format_bytes(cell.size));
+                let line = fit_text(&self.draw_text, cx, &full, room);
+                if line.is_empty() {
+                    continue;
+                }
+                placed_names.push((at_x, at_x + room, at_y));
+                let width = text_width(&self.draw_text, cx, &line);
+                out.push(FrozenLabel {
+                    at: dvec2(at_x, at_y),
+                    line,
+                    below: None,
+                    width,
+                    ink: bright,
+                    scrim: true,
+                });
+            } else if !cell.is_group && rect.w >= LABEL_MIN.x && rect.h >= LABEL_MIN.y {
+                let mut at_y = (rect.y + 3.0).max(lclip.y + 3.0);
+                loop {
+                    let mut bumped = false;
+                    for &(x0, x1, y) in &placed_names {
+                        let next = y + 12.0;
+                        if at_x < x1 && at_x + room > x0 && (at_y - y).abs() < 12.0 && next > at_y
+                        {
+                            at_y = next;
+                            bumped = true;
+                        }
+                    }
+                    if !bumped {
+                        break;
+                    }
+                }
+                if at_y > rect.y + rect.h - 12.0 {
+                    continue;
+                }
+                let line = fit_text(&self.draw_text, cx, &cell.name, room);
+                if line.is_empty() {
+                    continue;
+                }
+                placed_names.push((at_x, at_x + room, at_y));
+                let width = text_width(&self.draw_text, cx, &line);
+                let below = (rect.h + rect.y - at_y >= LABEL_TWO_LINE_H)
+                    .then(|| fit_text(&self.draw_text, cx, &treemap::format_bytes(cell.size), room));
+                out.push(FrozenLabel {
+                    at: dvec2(at_x, at_y),
+                    line,
+                    below,
+                    width,
+                    ink: ink_dark,
+                    scrim: false,
+                });
+            }
+        }
+        self.frozen_labels = out;
+    }
+
+    /// Draw the frozen labels: each anchor rides the same affine remap the
+    /// tiles ride, the text itself untouched — so a glide moves names, and
+    /// nothing about them flickers.
+    fn draw_frozen_labels(&mut self, cx: &mut Cx2d, palette: &Palette, clip: Rect) {
+        if self.frozen_labels.is_empty() {
+            return;
+        }
+        let (rk, rb) = self.cam_remap();
+        let labels = std::mem::take(&mut self.frozen_labels);
+        cx.push_clip_rect(clip);
+        if labels.iter().any(|l| l.scrim) {
+            let plate_ink = Palette::vec4(&palette.bg_dark);
+            self.draw_tile.new_draw_call(cx);
+            self.draw_tile.cushion = 0.0;
+            self.draw_tile.border = 0.0;
+            for label in &labels {
+                if !label.scrim {
+                    continue;
+                }
+                let at = dvec2(label.at.x * rk + rb.x, label.at.y * rk + rb.y);
+                if off_panel(at, label.width, &clip) {
+                    continue;
+                }
+                let pos = at - dvec2(3.0, 1.0);
+                let size = dvec2(label.width + 6.0, 13.0);
+                let plate = fade(plate_ink, 0.78 * label.ink.w);
+                self.draw_tile.color = plate;
+                self.draw_tile.edge = plate;
+                face(&mut self.draw_tile, cx, &Quad {
+                    p: [
+                        pos,
+                        dvec2(pos.x + size.x, pos.y),
+                        pos + size,
+                        dvec2(pos.x, pos.y + size.y),
+                    ],
+                });
+            }
+        }
+        for label in &labels {
+            let at = dvec2(label.at.x * rk + rb.x, label.at.y * rk + rb.y);
+            if off_panel(at, label.width, &clip) {
+                continue;
+            }
+            self.draw_text.color = label.ink;
+            self.draw_text.draw_abs(cx, at, &label.line);
+            if let Some(below) = &label.below {
+                self.draw_text.color = fade(label.ink, 0.72);
+                self.draw_text.draw_abs(cx, at + dvec2(0.0, 11.0), below);
+            }
+        }
+        cx.pop_clip_rect();
+        self.frozen_labels = labels;
     }
 
     /// The zoom breadcrumb, and on the right whatever the scan is doing.
@@ -2658,7 +2864,15 @@ impl Widget for TreemapView {
         }
 
         let labels = self.draw_map(cx, palette, body);
-        self.draw_labels(cx, labels, body, palette);
+        if self.projection == MapProjection::Flat && self.tween_t().is_none() {
+            // Outside a tween the flat map's names are frozen against the
+            // layout and merely ride the remap — nothing about them changes
+            // frame to frame, which is what keeps a glide quiet.
+            self.ensure_frozen_labels(cx, palette, body);
+            self.draw_frozen_labels(cx, palette, body);
+        } else {
+            self.draw_labels(cx, labels, body, palette);
+        }
         self.draw_tooltip(cx, body, palette);
 
         // A running tween owns the frame clock; the frame after it ends
@@ -2963,6 +3177,15 @@ fn remap_params(
             (body.pos.y - cam_off.y) - (body.pos.y - layout_off.y) * k,
         ),
     )
+}
+
+/// Whether a translated label anchor has slid far enough off the panel that
+/// nothing of its text could show.
+fn off_panel(at: DVec2, width: f64, clip: &Rect) -> bool {
+    at.x + width < clip.pos.x
+        || at.x > clip.pos.x + clip.size.x
+        || at.y + 12.0 < clip.pos.y
+        || at.y > clip.pos.y + clip.size.y
 }
 
 fn remap_rect(r: &MapRect, k: f64, b: DVec2) -> MapRect {

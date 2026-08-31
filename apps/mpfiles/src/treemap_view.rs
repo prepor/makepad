@@ -1635,6 +1635,10 @@ impl TreemapView {
 
     fn relayout(&mut self, rect: Rect) {
         let base = self.focus_path();
+        // The region the *outgoing* layout covered, before it is replaced —
+        // the line between a camera reveal and data actually appearing.
+        let old_cull = self.laid_cull;
+        let old_remap = self.cam_remap();
         // The map is laid out at the camera's magnification and culled to
         // the panel: zoomed in, the layout does the work of the pixels on
         // screen, not of the whole magnified picture.
@@ -1748,9 +1752,42 @@ impl TreemapView {
                     (cell.path.clone(), TweenFrom { rect: *rect, depth: *depth })
                 })
                 .collect();
+            // A cell new to the list is either a camera reveal — it was
+            // sitting outside the outgoing layout's cull, always there on
+            // disk, merely unlaid — or detail that genuinely appeared (a
+            // bundle dissolving, a scan step, a filter edit). Reveals must
+            // simply *be there*: styling them with the arrival fade reads
+            // as data popping into existence at the edge of an orbit or
+            // pan. So a reveal joins the tween at its own rect (no motion,
+            // full alpha) and only true arrivals keep the fade-and-grow.
+            // The snapshot and the fresh layout share a frame — snapshot
+            // rects were remapped to the live camera, which the fresh
+            // layout now rests under — so the old cull is compared in that
+            // frame too, through the remap the snapshot itself used.
+            if old_cull.w > 0.0 {
+                let (rk, rb) = old_remap;
+                let seen = remap_rect(&old_cull, rk, rb);
+                for cell in &self.cells {
+                    if !self.tween_from.contains_key(&cell.path)
+                        && !cell.rect.intersects(&seen)
+                    {
+                        self.tween_from.insert(
+                            cell.path.clone(),
+                            TweenFrom { rect: cell.rect, depth: cell.depth as f64 },
+                        );
+                    }
+                }
+            }
+            // Symmetric on the way out: a cell the new layout culled away
+            // is just going off-view — it vanishes with the frame, no
+            // goodbye fade. Only a leaver still inside the laid region
+            // (absorbed, filtered out) earns one.
             self.tween_leavers = snapshot
                 .into_iter()
-                .filter(|(cell, _, _)| !now_here.contains(cell.path.as_path()))
+                .filter(|(cell, rect, _)| {
+                    !now_here.contains(cell.path.as_path())
+                        && rect.intersects(&self.laid_cull)
+                })
                 .collect();
             self.tween_start = Some(Instant::now());
         }

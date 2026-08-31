@@ -1354,10 +1354,14 @@ pub fn kind_totals(node: &Node) -> [u64; 16] {
 pub struct MapStyle {
     /// A rectangle thinner than this on either edge is not drawn.
     pub min_side: f64,
-    /// Siblings whose rectangle would come out smaller than this are not laid
-    /// out at all; they are summed into one "N smaller items" rectangle. This
-    /// is what bounds the cost of a folder to its area rather than to how
-    /// many files it holds.
+    /// Where refinement stops: once a row's lead rectangle would come out
+    /// smaller than this, that row and everything after it are drawn as one
+    /// "N smaller items" plate over the region their rows would occupy.
+    /// Deliberately NOT an input to the packing itself — the arrangement is
+    /// fixed by the weights and the rect's aspect alone, so a zoom can only
+    /// refine the plate in place, never re-shuffle what was already visible.
+    /// This is also what bounds the cost of a folder to its pixels rather
+    /// than to how many files it holds.
     pub min_area: f64,
     /// The border a folder insets its children by — the visible gap that says
     /// "these belong together". Widest at the top level and narrowing with
@@ -1458,7 +1462,10 @@ pub fn layout(
     // of step with the children; the caller keys its cache on the tree
     // revision, and this is the belt to that suspender.
     let filter = filter.filter(|m| m.children.len() == node.children.len());
-    layout_children(&node.children, &mut path, area, viewport, 0, style, filter, &mut out);
+    // At the root the canonical packing space IS the area: the body's aspect
+    // is the same at every zoom, so invariance starts true and the recursion
+    // keeps it true (see `layout_children` on what canon is for).
+    layout_children(&node.children, &mut path, area, area, viewport, 0, style, filter, &mut out);
     out
 }
 
@@ -1469,11 +1476,22 @@ pub fn inset_for(style: &MapStyle, depth: usize) -> f64 {
     style.inset * (1.0 + 2.0 / (depth as f64 + 1.0))
 }
 
+/// `canon` is the packing space: a rect with the same area as `area` but a
+/// *canonical* aspect, derived purely from the map's own zoom-invariant
+/// proportions — never from the point-sized insets and header strips that
+/// make the realized `area`'s aspect wobble a few percent as the zoom
+/// changes. All row-membership decisions run in canon space and the finished
+/// geometry is mapped affinely onto `area`, so the arrangement literally
+/// cannot drift with zoom: the packer never sees a zoom-dependent number.
+/// The price is rows optimized for an aspect a few percent off the realized
+/// one — a squareness error far below what the eye notices, where a row
+/// re-break is exactly what the eye is drawn to.
 #[allow(clippy::too_many_arguments)]
 fn layout_children(
     children: &[Node],
     path: &mut PathBuf,
     area: Rect,
+    canon: Rect,
     viewport: Rect,
     depth: usize,
     style: &MapStyle,
@@ -1481,6 +1499,9 @@ fn layout_children(
     out: &mut Vec<Cell>,
 ) {
     if children.is_empty() || area.w <= 0.0 || area.h <= 0.0 || out.len() >= style.max_cells {
+        return;
+    }
+    if canon.w <= 0.0 || canon.h <= 0.0 {
         return;
     }
     if !area.intersects(&viewport) {
@@ -1495,118 +1516,289 @@ fn layout_children(
         Some(list) => list[index].bytes,
         None => children[index].size,
     };
+    let files_of = |index: usize| match measured {
+        Some(list) => list[index].files,
+        None => children[index].files,
+    };
     let total: f64 = (0..children.len()).map(|i| weight(i) as f64).sum();
     if total <= 0.0 {
         return;
     }
-    // Everything below this many bytes would draw smaller than `min_area`, so
-    // it is summed rather than laid out. Bounding the work by the rectangle's
-    // area instead of by the child count is what lets this recurse to the
-    // individual file inside a folder holding a quarter of a million of them.
-    let floor = (style.min_area * total / area.area()).ceil() as u64;
-    let mut keep: Vec<usize> = Vec::new();
-    let mut bundle_size = 0u64;
-    let mut bundle_count = 0u32;
-    let mut bundle_files = 0u32;
-    for index in 0..children.len() {
-        let size = weight(index);
-        if size >= floor && size > 0 {
-            keep.push(index);
-        } else if size > 0 {
-            bundle_size += size;
-            bundle_count += 1;
-            bundle_files += match measured {
-                Some(list) => list[index].files,
-                None => children[index].files,
-            };
+    // The packing is of ALL the children, always. An earlier design fed only
+    // the children big enough to see into the packer and swept the rest into
+    // a synthetic "smaller items" entry — which made the packer's INPUT
+    // depend on the zoom, so crossing any zoom step re-packed the whole
+    // group and the map visibly reshuffled. Now the arrangement is fixed by
+    // the weights and the rect's aspect alone — both zoom-invariant — and
+    // the zoom only decides how far down the row list refinement runs.
+    //
+    // Cost stays bounded by the pixels, not the child count, because the
+    // rows come out biggest-first: everything too small to see is a suffix
+    // of the sorted order, so only the items that could reach a visible row
+    // need sorting at all. `sort_floor` keeps a 64× margin below the
+    // visibility cutoff so the last visible row closes on exactly the
+    // neighbours the full sort would have offered it — an item 64× smaller
+    // than a row-mate makes the aspect test slam the row shut long before,
+    // so nothing below the margin can ever influence visible geometry.
+    // The canon packing space, re-anchored at the origin and normalized to
+    // the realized rect's exact area: row math happens here, so membership
+    // depends only on the canonical aspect and the weights; the stop
+    // thresholds stay honest because canon areas equal screen areas.
+    let canon = {
+        let aspect = canon.w / canon.h;
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: (area.area() * aspect).sqrt(),
+            h: (area.area() / aspect).sqrt(),
+        }
+    };
+    let realize = |r: &Rect| Rect {
+        x: area.x + r.x / canon.w * area.w,
+        y: area.y + r.y / canon.h * area.h,
+        w: r.w / canon.w * area.w,
+        h: r.h / canon.h * area.h,
+    };
+    let scale = area.area() / total; // square points per byte
+    let tail_floor = (style.min_area / scale).max(1.0);
+    let sort_floor = (tail_floor / 64.0).max(1.0) as u64;
+    let mut order: Vec<usize> = Vec::new();
+    let mut rest_size: u64 = 0;
+    let mut rest_count: u32 = 0;
+    let mut rest_files: u32 = 0;
+    let mut max_weight: u64 = 0;
+    for i in 0..children.len() {
+        let w = weight(i);
+        max_weight = max_weight.max(w);
+        if w >= sort_floor {
+            order.push(i);
+        } else if w > 0 {
+            rest_size += w;
+            rest_count += 1;
+            rest_files += files_of(i);
         }
     }
-    // Descending order is what the squarified rule assumes; sorting only the
-    // survivors keeps this proportional to the pixels, not to the files.
-    // Deterministic under ties (child index breaks them), so the same
-    // children lay out the same way every single time.
-    keep.sort_unstable_by(|&a, &b| weight(b).cmp(&weight(a)).then(a.cmp(&b)));
-    let mut sizes: Vec<u64> = keep.iter().map(|&i| weight(i)).collect();
-    if bundle_count > 0 {
-        sizes.push(bundle_size);
-    }
-    let rects = squarify(&sizes, area);
-    for (slot, rect) in rects.iter().enumerate() {
-        if out.len() >= style.max_cells {
-            return;
-        }
-        if rect.w < style.min_side || rect.h < style.min_side {
-            // Invisible at this scale: drawing it would just be a sliver, and
-            // if it is a folder its children would be smaller still.
-            continue;
-        }
-        if !rect.intersects(&viewport) {
-            // Off the edge of the window the camera is looking through, and
-            // so is everything inside it.
-            continue;
-        }
-        let Some(&index) = keep.get(slot) else {
-            // The last slot, when there is one, is the bundle of everything
-            // too small to have earned a rectangle of its own.
+    // When even the biggest child is below the visibility floor the whole
+    // group is one tail plate — no order, no sort, no rows.
+    if (max_weight as f64) * scale < style.min_area {
+        let count = rest_count as usize + order.len();
+        if count > 0
+            && area.w >= style.min_side
+            && area.h >= style.min_side
+            && out.len() < style.max_cells
+        {
             out.push(Cell {
                 path: path.clone(),
-                name: format!(
-                    "{} smaller item{}",
-                    bundle_count,
-                    if bundle_count == 1 { "" } else { "s" }
-                ),
-                size: bundle_size,
-                files: bundle_files,
+                name: format!("{count} smaller item{}", if count == 1 { "" } else { "s" }),
+                size: rest_size + order.iter().map(|&i| weight(i)).sum::<u64>(),
+                files: rest_files + order.iter().map(|&i| files_of(i)).sum::<u32>(),
                 is_dir: false,
                 kind: u8::MAX,
                 depth,
-                rect: *rect,
+                rect: area,
                 is_group: false,
                 header: 0.0,
                 pending: false,
-                extra: bundle_count,
+                extra: count as u32,
             });
-            continue;
-        };
-        let child = &children[index];
-        // A folder opens up when its inside is still worth looking at. The
-        // header is the first thing given up, then the nesting entirely.
-        let header = if child.is_dir
-            && rect.w >= style.header_min.0
-            && rect.h >= style.header_min.1
-        {
-            style.header
+        }
+        return;
+    }
+    // The sort is cut at what the pixels can hold before sorting: an item
+    // ranked past `area / min_area` has, by descending order, less than
+    // `min_area` to its name, so it lives in the tail plate and only its
+    // sum matters — its exact position in the order buys nothing. This is
+    // what keeps a quarter-million-file folder costing a selection pass, not
+    // a quarter-million-element sort, at every distance.
+    let cap = ((area.area() / style.min_area) as usize + 64).min(style.max_cells + 64);
+    if order.len() > cap {
+        order.select_nth_unstable_by(cap, |&a, &b| {
+            weight(b).cmp(&weight(a)).then(a.cmp(&b))
+        });
+        for &i in &order[cap..] {
+            rest_size += weight(i);
+            rest_count += 1;
+            rest_files += files_of(i);
+        }
+        order.truncate(cap);
+    }
+    // Descending, deterministic under ties (child index breaks them), so the
+    // same children lay out the same way every single time.
+    order.sort_unstable_by(|&a, &b| weight(b).cmp(&weight(a)).then(a.cmp(&b)));
+    let scaled: Vec<f64> = order.iter().map(|&i| weight(i) as f64 * scale).collect();
+
+    // Stream the squarified rows biggest-first, exactly as the full packing
+    // would place them, and stop refining at the first row whose lead item
+    // is too small to see. Everything from there on — plus whatever never
+    // made the sort — is drawn as one aggregate plate over the leftover
+    // rect, which is precisely the region those rows would occupy: zooming
+    // in only ever subdivides that plate in place, and nothing that was
+    // already on screen can move, because nothing about its inputs changed.
+    let mut leftover_canon = canon;
+    let mut start = 0usize;
+    while start < scaled.len() {
+        if leftover_canon.w <= 0.0 || leftover_canon.h <= 0.0 {
+            break;
+        }
+        if scaled[start] < style.min_area {
+            break;
+        }
+        if out.len() >= style.max_cells {
+            return;
+        }
+        if !realize(&leftover_canon).intersects(&viewport) {
+            // Everything still unplaced lives inside the leftover, and the
+            // leftover only ever shrinks toward one corner: once it has left
+            // the window, so has every remaining row and the tail plate.
+            return;
+        }
+        // Grow the row while doing so does not worsen its worst aspect —
+        // the squarified rule, unchanged, in canon space.
+        let mut end = start + 1;
+        let mut current = worst_ratio(&scaled[start..end], leftover_canon);
+        while end < scaled.len() {
+            let grown = worst_ratio(&scaled[start..end + 1], leftover_canon);
+            if grown <= current {
+                current = grown;
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        // The strip this row occupies. A row whose strip misses the window
+        // still consumes its area — the leftover chain is the geometry — but
+        // its items need no rects, no cells and no recursion.
+        let next_leftover = leftover(&scaled[start..end], leftover_canon);
+        let strip = if leftover_canon.w >= leftover_canon.h {
+            Rect {
+                x: leftover_canon.x,
+                y: leftover_canon.y,
+                w: leftover_canon.w - next_leftover.w,
+                h: leftover_canon.h,
+            }
         } else {
-            0.0
+            Rect {
+                x: leftover_canon.x,
+                y: leftover_canon.y,
+                w: leftover_canon.w,
+                h: leftover_canon.h - next_leftover.h,
+            }
         };
-        let inner = rect.shrink(inset_for(style, depth), header);
-        let is_group = child.is_dir
-            && !child.children.is_empty()
-            && inner.w >= style.group_min
-            && inner.h >= style.group_min;
-        path.push(&child.name);
+        if !realize(&strip).intersects(&viewport) {
+            leftover_canon = next_leftover;
+            start = end;
+            continue;
+        }
+        let row_rects = lay_out_row(&scaled[start..end], leftover_canon);
+        for (slot, canon_rect) in row_rects.iter().enumerate() {
+            let rect = &realize(canon_rect);
+            if out.len() >= style.max_cells {
+                return;
+            }
+            if rect.w < style.min_side || rect.h < style.min_side {
+                // Invisible at this scale: drawing it would just be a
+                // sliver, and if it is a folder its children are smaller
+                // still. Skipping it moves nothing — the geometry of every
+                // neighbour was fixed before this test ran.
+                continue;
+            }
+            if !rect.intersects(&viewport) {
+                // Off the edge of the window the camera is looking through,
+                // and so is everything inside it.
+                continue;
+            }
+            let index = order[start + slot];
+            let child = &children[index];
+            // A folder opens up when its inside is still worth looking at.
+            // The header is the first thing given up, then the nesting.
+            let header = if child.is_dir
+                && rect.w >= style.header_min.0
+                && rect.h >= style.header_min.1
+            {
+                style.header
+            } else {
+                0.0
+            };
+            let inner = rect.shrink(inset_for(style, depth), header);
+            let is_group = child.is_dir
+                && !child.children.is_empty()
+                && inner.w >= style.group_min
+                && inner.h >= style.group_min;
+            path.push(&child.name);
+            out.push(Cell {
+                path: path.clone(),
+                name: child.name.clone(),
+                size: weight(index),
+                files: files_of(index),
+                is_dir: child.is_dir,
+                kind: child.kind,
+                depth,
+                rect: *rect,
+                is_group,
+                header: if is_group { header } else { 0.0 },
+                pending: child.is_dir && !child.done,
+                extra: 0,
+            });
+            if is_group {
+                let filter = measured.map(|list| &list[index]);
+                // The child packs against its own raw canon rect — its
+                // zoom-invariant share of this packing — never against the
+                // inset-shrunk realized rect whose aspect wobbles with zoom.
+                layout_children(
+                    &child.children,
+                    path,
+                    inner,
+                    *canon_rect,
+                    viewport,
+                    depth + 1,
+                    style,
+                    filter,
+                    out,
+                );
+            }
+            path.pop();
+        }
+        leftover_canon = next_leftover;
+        start = end;
+    }
+
+    // The tail: every remaining sorted item plus everything below the sort
+    // margin, presented as the one "N smaller items" plate over the region
+    // their rows will occupy when a deeper zoom refines them into being.
+    let mut tail_size = rest_size;
+    let mut tail_count = rest_count;
+    let mut tail_files = rest_files;
+    for &i in &order[start..] {
+        tail_size += weight(i);
+        tail_count += 1;
+        tail_files += files_of(i);
+    }
+    let tail_rect = realize(&leftover_canon);
+    if tail_count > 0
+        && tail_size > 0
+        && tail_rect.w >= style.min_side
+        && tail_rect.h >= style.min_side
+        && tail_rect.intersects(&viewport)
+        && out.len() < style.max_cells
+    {
         out.push(Cell {
             path: path.clone(),
-            name: child.name.clone(),
-            size: weight(index),
-            files: match measured {
-                Some(list) => list[index].files,
-                None => child.files,
-            },
-            is_dir: child.is_dir,
-            kind: child.kind,
+            name: format!(
+                "{} smaller item{}",
+                tail_count,
+                if tail_count == 1 { "" } else { "s" }
+            ),
+            size: tail_size,
+            files: tail_files,
+            is_dir: false,
+            kind: u8::MAX,
             depth,
-            rect: *rect,
-            is_group,
-            header: if is_group { header } else { 0.0 },
-            pending: child.is_dir && !child.done,
-            extra: 0,
+            rect: tail_rect,
+            is_group: false,
+            header: 0.0,
+            pending: false,
+            extra: tail_count,
         });
-        if is_group {
-            let filter = measured.map(|list| &list[index]);
-            layout_children(&child.children, path, inner, viewport, depth + 1, style, filter, out);
-        }
-        path.pop();
     }
 }
 
@@ -1658,6 +1850,177 @@ mod tests {
             files: children.iter().map(|c| c.files).sum(),
             modified: children.iter().map(|c| c.modified).max().unwrap_or(0),
             children,
+        }
+    }
+
+    // The zoom-invariance contract, mechanically: pack a rich tree at a
+    // ladder of zooms over the same anchored viewport and demand that every
+    // cell present at two zooms sits in the same place in map space. The
+    // only tolerated motion is the few points of drift that point-sized
+    // insets cost nested cells, and the only tolerated exception is the
+    // subtree of a group whose header strip appeared or vanished between
+    // the two zooms — that shove is local by construction. Root-level cells
+    // have no inset above them and must not move at all. This is the test
+    // that fails when any zoom-dependent quantity leaks back into the
+    // packing.
+    #[test]
+    fn the_arrangement_is_zoom_invariant_by_construction() {
+        // Mixed sizes, an equal-size run (the tie-swap trap), nesting, and
+        // one folder with ten thousand files (the bundle-floor trap).
+        let mut crowd = Vec::new();
+        for i in 0..10_000u64 {
+            let size = ((i.wrapping_mul(2_654_435_761)) % 997 + 1) * 4096;
+            crowd.push(leaf(&format!("c{i}.bin"), size));
+        }
+        let tree = dir(
+            "root",
+            vec![
+                leaf("huge.mov", 6_000_000_000),
+                dir(
+                    "nest",
+                    vec![
+                        dir(
+                            "deep",
+                            vec![leaf("a.bin", 900_000_000), leaf("b.bin", 400_000_000)],
+                        ),
+                        leaf("c.bin", 700_000_000),
+                    ],
+                ),
+                dir("crowd", crowd),
+                dir(
+                    "equal",
+                    (0..8).map(|i| leaf(&format!("e{i}.dat"), 50_000_000)).collect(),
+                ),
+                leaf("mid.tar", 350_000_000),
+            ],
+        );
+        let style = MapStyle::default();
+        let viewport = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 };
+        // The camera anchor: map point (0.3, 0.4) pinned to screen (400, 300)
+        // at every zoom, the way the view's zoom-at-cursor works.
+        let layout_at = |z: f64| {
+            let area = Rect {
+                x: 400.0 - 0.3 * 1200.0 * z,
+                y: 300.0 - 0.4 * 800.0 * z,
+                w: 1200.0 * z,
+                h: 800.0 * z,
+            };
+            (layout(&tree, Path::new("/root"), area, viewport, &style, None), area)
+        };
+        let zooms = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+        let laid: Vec<_> = zooms.iter().map(|&z| layout_at(z)).collect();
+
+        for pair in laid.windows(2) {
+            let (cells_a, area_a) = &pair[0];
+            let (cells_b, area_b) = &pair[1];
+            check_invariant(cells_a, *area_a, cells_b, *area_b);
+        }
+        // And the far ends against each other: the full 32× throw.
+        let (first, area_first) = &laid[0];
+        let (last, area_last) = &laid[laid.len() - 1];
+        check_invariant(first, *area_first, last, *area_last);
+    }
+
+    /// Every real cell present in both layouts must occupy the same map-space
+    /// rect, up to the inset drift budget — except under a header flip.
+    fn check_invariant(cells_a: &[Cell], area_a: Rect, cells_b: &[Cell], area_b: Rect) {
+        use std::collections::HashMap;
+        let by_path_a: HashMap<&Path, &Cell> = cells_a
+            .iter()
+            .filter(|c| !c.is_bundle())
+            .map(|c| (c.path.as_path(), c))
+            .collect();
+        // Groups whose header state differs between the two layouts: their
+        // subtrees are the one tolerated local exception.
+        let mut header_flips: Vec<PathBuf> = Vec::new();
+        for cell in cells_b.iter().filter(|c| c.is_group) {
+            if let Some(a) = by_path_a.get(cell.path.as_path()) {
+                if (a.header > 0.0) != (cell.header > 0.0) {
+                    header_flips.push(cell.path.clone());
+                }
+            }
+        }
+        let exempt = |path: &Path| header_flips.iter().any(|flip| path.starts_with(flip) && path != flip);
+        let mut compared = 0usize;
+        for cell in cells_b.iter().filter(|c| !c.is_bundle()) {
+            let Some(a) = by_path_a.get(cell.path.as_path()) else {
+                continue;
+            };
+            if exempt(&cell.path) {
+                continue;
+            }
+            // Map A's rect into B's screen space and compare centres.
+            let scale_w = area_b.w / area_a.w;
+            let scale_h = area_b.h / area_a.h;
+            let expected_x = area_b.x + (a.rect.x - area_a.x) * scale_w + a.rect.w * scale_w * 0.5;
+            let expected_y = area_b.y + (a.rect.y - area_a.y) * scale_h + a.rect.h * scale_h * 0.5;
+            let actual_x = cell.rect.x + cell.rect.w * 0.5;
+            let actual_y = cell.rect.y + cell.rect.h * 0.5;
+            let dx = (expected_x - actual_x).abs();
+            let dy = (expected_y - actual_y).abs();
+            // Root-level cells have no inset above them: exact. Nested cells
+            // may drift by the point-sized chrome (insets + a header strip)
+            // of each level above them — and that drift, measured at the
+            // deeper zoom, scales with the zoom ratio, because a fixed-point
+            // shrink at the shallow zoom is a proportionally bigger bite of
+            // a smaller rect. A genuine row flip moves a tile by a whole
+            // row pitch and blows straight through this.
+            let ratio = area_b.w / area_a.w;
+            let budget = if cell.depth == 0 {
+                1e-6
+            } else {
+                16.0 * (1.0 + cell.depth as f64) * ratio.max(1.0)
+            };
+            assert!(
+                dx <= budget && dy <= budget,
+                "{} moved {:.1},{:.1}pt between zooms (depth {}, sizes {} vs {}, {:?} -> {:?})",
+                cell.path.display(),
+                dx,
+                dy,
+                cell.depth,
+                a.size,
+                cell.size,
+                a.rect,
+                cell.rect
+            );
+            compared += 1;
+        }
+        assert!(compared > 20, "only {compared} cells survived both layouts — the test is not biting");
+    }
+
+    // The cost canary the bundle floor used to be for: a quarter-million
+    // files in one folder must cost the layout what its pixels cost, not
+    // what its listing costs. Run by hand with
+    // `cargo test -p mpfiles --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn packing_cost_canary_200k() {
+        let mut crowd = Vec::new();
+        for i in 0..200_000u64 {
+            let size = ((i.wrapping_mul(2_654_435_761)) % 9973 + 1) * 4096;
+            crowd.push(leaf(&format!("f{i}.bin"), size));
+        }
+        let tree = dir(
+            "root",
+            vec![leaf("huge.mov", 900_000_000_000), dir("crowd", crowd)],
+        );
+        let style = MapStyle::default();
+        let viewport = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 };
+        // Far: the crowd is a small tile, its files all in the tail plate.
+        let far = Rect { x: 0.0, y: 0.0, w: 1200.0, h: 800.0 };
+        // Near: 64x in, anchored inside the crowd so its files fill the panel.
+        let near = Rect { x: -20_000.0, y: -20_000.0, w: 1200.0 * 64.0, h: 800.0 * 64.0 };
+        for (name, area) in [("far", far), ("near", near)] {
+            let t = std::time::Instant::now();
+            let mut cells = 0usize;
+            const RUNS: u32 = 20;
+            for _ in 0..RUNS {
+                cells = layout(&tree, Path::new("/root"), area, viewport, &style, None).len();
+            }
+            println!(
+                "200k-folder {name}: {:.2}ms per layout, {cells} cells",
+                t.elapsed().as_secs_f64() * 1000.0 / RUNS as f64
+            );
         }
     }
 

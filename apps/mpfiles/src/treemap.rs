@@ -956,7 +956,11 @@ pub fn squarify(sizes: &[u64], rect: Rect) -> Vec<Rect> {
     // `out` already holds; only the strictly positive sizes go through the
     // real algorithm, sorted descending as it requires.
     let mut order: Vec<usize> = (0..n).filter(|&i| sizes[i] > 0).collect();
-    order.sort_unstable_by(|&a, &b| sizes[b].cmp(&sizes[a]));
+    // Size descending, input index as the tiebreak: equal sizes are
+    // everywhere on a real disk (shards, dedup'd assets), and a sort that
+    // may swap them between two layouts of the same data is a map that
+    // shuffles its tiles every time the camera settles.
+    order.sort_unstable_by(|&a, &b| sizes[b].cmp(&sizes[a]).then(a.cmp(&b)));
     // Scale byte counts to areas that sum exactly to the container's area —
     // this is what makes every output rect's area proportional to its size.
     let scale = rect.area() / total;
@@ -1519,7 +1523,9 @@ fn layout_children(
     }
     // Descending order is what the squarified rule assumes; sorting only the
     // survivors keeps this proportional to the pixels, not to the files.
-    keep.sort_unstable_by(|&a, &b| weight(b).cmp(&weight(a)));
+    // Deterministic under ties (child index breaks them), so the same
+    // children lay out the same way every single time.
+    keep.sort_unstable_by(|&a, &b| weight(b).cmp(&weight(a)).then(a.cmp(&b)));
     let mut sizes: Vec<u64> = keep.iter().map(|&i| weight(i)).collect();
     if bundle_count > 0 {
         sizes.push(bundle_size);
@@ -1948,6 +1954,51 @@ mod tests {
     // The camera contract: blowing the map up N× and looking at it through a
     // window must cost what the window costs, and must actually show more —
     // the detail floor follows the magnified area, not the screen.
+    fn layout_of(tree: &Node, area: Rect) -> Vec<String> {
+        layout(tree, Path::new("/root"), area, area, &MapStyle::default(), None)
+            .into_iter()
+            .filter(|c| !c.is_bundle())
+            .map(|c| c.name)
+            .collect()
+    }
+
+    // Equal sizes are everywhere on a real disk — shards, dedup'd assets —
+    // and they must lay out in the same order every single time, and keep
+    // that order when the camera's area drifts. Anything else is a map that
+    // shuffles its tiles whenever the camera settles.
+    #[test]
+    fn equal_sized_siblings_never_swap_between_layouts() {
+        let children: Vec<Node> = (0..120)
+            .map(|i| leaf(&format!("shard-{i:03}"), 510_000_000))
+            .chain((0..300).map(|i| leaf(&format!("t{i}.tmp"), 1_000 + i as u64)))
+            .collect();
+        let tree = dir("root", children);
+        let area = Rect { x: 0.0, y: 0.0, w: 900.0, h: 600.0 };
+
+        // Twice at the same area: byte-identical order.
+        let a = layout_of(&tree, area);
+        let b = layout_of(&tree, area);
+        assert_eq!(a, b);
+        // The equal-size run keeps child order, deterministically.
+        let shards: Vec<&String> = a.iter().filter(|n| n.starts_with("shard")).collect();
+        assert!(shards.windows(2).all(|w| w[0] < w[1]), "{shards:?}");
+
+        // At a slightly different area (a small zoom's settle), tiles may be
+        // added or dropped — but the ones present in both keep their
+        // relative order exactly.
+        let grown = Rect { x: 0.0, y: 0.0, w: 940.0, h: 627.0 };
+        let c = layout_of(&tree, grown);
+        let shared: std::collections::HashSet<&String> = a
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .intersection(&c.iter().collect())
+            .copied()
+            .collect();
+        let a_shared: Vec<&String> = a.iter().filter(|n| shared.contains(n)).collect();
+        let c_shared: Vec<&String> = c.iter().filter(|n| shared.contains(n)).collect();
+        assert_eq!(a_shared, c_shared, "surviving tiles reordered across a small zoom");
+    }
+
     #[test]
     fn a_zoomed_layout_culls_to_the_viewport_and_gains_detail() {
         // 200 equal folders of 40 files each: at screen size a folder is a

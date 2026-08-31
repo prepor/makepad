@@ -411,6 +411,13 @@ pub struct TreemapView {
     layout_yaw: f64,
     #[rust]
     layout_pitch: f64,
+    /// The ground region the current cells were laid out over (the padded
+    /// cull). As long as the live camera still looks inside it — and has not
+    /// zoomed in past what the layout resolves — the layout is not remade at
+    /// all: a settling gesture keeps the exact arrangement on screen instead
+    /// of buying a fresh packing nobody asked for.
+    #[rust]
+    laid_cull: MapRect,
 
     /// The wheel's glide: the scale it is headed for, and the ground point
     /// pinned under the cursor for the whole ride. Each wheel step retargets;
@@ -493,6 +500,11 @@ struct ZoomGlide {
 
 /// How fast a glide closes on its target: the ease-out's time constant.
 /// 45ms settles ~95% of the way in ~135ms — smooth, never floaty.
+/// How far past the layout's own scale the camera may zoom IN before the
+/// map is worth re-laying-out. Inside this band the detail floor is at most
+/// this factor coarser than ideal — imperceptible — and keeping the cells
+/// in hand keeps the arrangement rock steady.
+const DETAIL_SLACK: f64 = 1.3;
 const GLIDE_TAU: f64 = 0.045;
 /// How often a long, still-running camera gesture may refresh the layout
 /// underneath itself. Coarse on purpose: between refreshes the picture rides
@@ -1077,17 +1089,6 @@ impl TreemapView {
         )
     }
 
-    /// Whether the live camera has left the camera the layout was made at —
-    /// the one question "does anything need settling" comes down to.
-    fn camera_departed(&self) -> bool {
-        let (k, b) = self.cam_remap();
-        (k - 1.0).abs() > 1e-6
-            || b.x.abs() > 0.25
-            || b.y.abs() > 0.25
-            || (self.projection != MapProjection::Flat
-                && ((self.yaw - self.layout_yaw).abs() > 1e-6
-                    || (self.pitch - self.layout_pitch).abs() > 1e-6))
-    }
 
     /// Whether a camera gesture still owns the frame. While one does, camera
     /// changes ride the remap and never relayout — that is the visual
@@ -1098,10 +1099,76 @@ impl TreemapView {
             || self.drag.map_or(false, |d| d.moved)
     }
 
+    /// Whether the layout no longer honestly covers what the camera shows —
+    /// the only reason a camera move is ever allowed to remake the map.
+    ///
+    /// This is deliberately a wide band, not an equality test. The layout is
+    /// not scale-invariant (the bundle floor moves with area, insets are
+    /// fixed point sizes), so *any* relayout at a slightly different camera
+    /// repacks groups and reads as tiles randomly reordering. Within the
+    /// band the rigid remap of the cells in hand is visually
+    /// indistinguishable from a fresh layout — so the fresh layout is not
+    /// bought. Spent means: zoomed in past what the layout resolves
+    /// ([`DETAIL_SLACK`]), or looking at ground outside the laid cull.
+    fn layout_spent(&self) -> bool {
+        let body = self.laid_out;
+        if body.size.x <= 0.0 || self.laid_cull.w <= 0.0 {
+            return true;
+        }
+        if self.cam_scale.max(1.0) / self.layout_scale.max(1.0) > DETAIL_SLACK {
+            return true;
+        }
+        // What the live camera can see, in the layout's own ground space.
+        let corners = [
+            body.pos,
+            dvec2(body.pos.x + body.size.x, body.pos.y),
+            dvec2(body.pos.x + body.size.x, body.pos.y + body.size.y),
+            dvec2(body.pos.x, body.pos.y + body.size.y),
+        ];
+        let mut min = dvec2(f64::MAX, f64::MAX);
+        let mut max = dvec2(f64::MIN, f64::MIN);
+        match self.projection {
+            MapProjection::Flat => {
+                let (k, b) = self.cam_remap();
+                for corner in corners {
+                    let g = dvec2((corner.x - b.x) / k, (corner.y - b.y) / k);
+                    min.x = min.x.min(g.x);
+                    min.y = min.y.min(g.y);
+                    max.x = max.x.max(g.x);
+                    max.y = max.y.max(g.y);
+                }
+            }
+            _ => {
+                let cam = self.cam_at(body);
+                for corner in corners {
+                    let g = cam.unproject_ground(corner);
+                    min.x = min.x.min(g.x);
+                    min.y = min.y.min(g.y);
+                    max.x = max.x.max(g.x);
+                    max.y = max.y.max(g.y);
+                }
+                // The cull was a rotation-proof square around the *layout*
+                // camera's footprint plus the lean reach; the live footprint
+                // needs that same reach to stay honestly inside.
+                let reach = self.elev(24) + 40.0;
+                min.x -= reach;
+                min.y -= reach;
+                max.x += reach;
+                max.y += reach;
+            }
+        }
+        min.x < self.laid_cull.x
+            || min.y < self.laid_cull.y
+            || max.x > self.laid_cull.x + self.laid_cull.w
+            || max.y > self.laid_cull.y + self.laid_cull.h
+    }
+
     /// Lay the map out at the camera's resting place, morphing there from
-    /// wherever the picture visually stands. A no-op when it already rests.
+    /// wherever the picture visually stands. A no-op when the layout in hand
+    /// still covers the view — which is exactly what keeps a small zoom or
+    /// pan visually constant end to end.
     fn settle(&mut self, cx: &mut Cx) {
-        if self.tree.children.is_empty() || !self.camera_departed() {
+        if self.tree.children.is_empty() || (!self.stale && !self.layout_spent()) {
             return;
         }
         if self.tween_capture.is_none() {
@@ -1113,10 +1180,10 @@ impl TreemapView {
     }
 
     /// Mid-gesture, whether the coarse layout refresh may run: something to
-    /// refresh — the camera departed, or the tree changed under the scan —
-    /// and the cadence has passed.
+    /// refresh — the layout spent, or the tree changed under the scan — and
+    /// the cadence has passed.
     fn motion_refresh_due(&self) -> bool {
-        if !self.camera_departed() && !self.stale {
+        if !self.layout_spent() && !self.stale {
             return false;
         }
         match self.last_layout {
@@ -1663,6 +1730,7 @@ impl TreemapView {
             &self.style,
             self.measure.as_ref(),
         );
+        self.laid_cull = viewport;
         self.cells = cells;
         self.paint_order = match self.projection {
             MapProjection::Flat => Vec::new(),
@@ -1914,11 +1982,12 @@ impl TreemapView {
             if labels.len() >= LABEL_BUDGET {
                 continue;
             }
-            if self.projection == MapProjection::Persp && !is_hover {
-                // The 3d view wears no name tags — a forest of prisms all
-                // labelled reads as clutter, not a city. A name appears the
+            if self.projection != MapProjection::Flat && !is_hover {
+                // The raised views wear no name tags — a city of prisms all
+                // labelled reads as clutter, not a map. A name appears the
                 // moment the pointer rests on its tile, and the tooltip
-                // carries the numbers as everywhere else.
+                // carries the numbers as everywhere else. Only the flat map
+                // keeps its printed labels.
                 continue;
             }
             // A zoomed camera slides tiles half off the panel; a name pinned
@@ -1932,22 +2001,20 @@ impl TreemapView {
             if clamped && rect.pos.y + rect.size.y - clip.pos.y < 40.0 {
                 continue;
             }
-            if cell.is_group
-                && cell.header > 0.0
-                && !(self.projection == MapProjection::Persp && cell.depth >= 2)
-            {
-                // Deep plates in perspective swell over their neighbours'
-                // label strips; those names go quiet and live on the tooltip.
+            if cell.is_group && cell.header > 0.0 {
                 // A group's name goes in the strip it reserved for it, which
                 // is the only place on a group that its children are not
                 // about to be drawn over — clamped on top of them when the
-                // strip itself has slid off. In the raised projections the
-                // children float up over that strip, so the name moves to
-                // the plate's *bottom* edge, which the lift exposes instead.
+                // strip itself has slid off, one line further down per
+                // nesting level so a stack of clamped ancestors reads as a
+                // breadcrumb instead of overprinting into garble. In the
+                // raised projections the children float up over that strip,
+                // so the name moves to the plate's *bottom* edge, which the
+                // lift exposes instead.
                 let at_y = if raised {
                     (rect.pos.y + rect.size.y - 13.0).min(clip.pos.y + clip.size.y - 13.0)
                 } else {
-                    (rect.pos.y + 1.0).max(clip.pos.y + 1.0)
+                    (rect.pos.y + 1.0).max(clip.pos.y + 1.0 + cell.depth as f64 * 12.0)
                 };
                 labels.push(Label {
                     at: dvec2(at_x, at_y),

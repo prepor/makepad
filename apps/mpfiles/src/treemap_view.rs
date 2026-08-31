@@ -600,18 +600,37 @@ impl Cam {
     /// The ground point (z = 0) that projects to screen point `s` — the
     /// exact inverse of [`Cam::project`], for both projections.
     fn unproject_ground(&self, s: DVec2) -> DVec2 {
+        self.unproject_at(s, 0.0)
+    }
+
+    /// The point on the plane at elevation `z` that projects to screen
+    /// point `s`. The cursor in a raised projection rests on a tile *top*,
+    /// not the ground behind it — anchoring a zoom at z = 0 under a tall
+    /// tower drifts by the tower's own parallax.
+    fn unproject_at(&self, s: DVec2, z: f64) -> DVec2 {
         let sx = s.x - self.pivot.x;
         let sy = s.y - self.pivot.y;
         let (xr, yr);
         if !self.persp {
-            yr = if self.cos_pitch.abs() < 1e-4 { 0.0 } else { sy / self.cos_pitch };
+            // sy = yr·cosφ − z·sinφ.
+            yr = if self.cos_pitch.abs() < 1e-4 {
+                0.0
+            } else {
+                (sy + z * self.sin_pitch) / self.cos_pitch
+            };
             xr = sx;
         } else {
-            // vy·s = sy with s = E/(E − yr·sinφ) and vy = yr·cosφ is linear
-            // in yr once multiplied out.
+            // vy·s = sy with s = E/(E − yr·sinφ − z·cosφ) and
+            // vy = yr·cosφ − z·sinφ is linear in yr once multiplied out.
             let denom = PERSP_EYE * self.cos_pitch + sy * self.sin_pitch;
-            yr = if denom.abs() < 1e-6 { 0.0 } else { sy * PERSP_EYE / denom };
-            let sc = (PERSP_EYE / (PERSP_EYE - yr * self.sin_pitch)).clamp(0.5, 2.5);
+            yr = if denom.abs() < 1e-6 {
+                0.0
+            } else {
+                (sy * PERSP_EYE - z * (sy * self.cos_pitch - PERSP_EYE * self.sin_pitch))
+                    / denom
+            };
+            let sc = (PERSP_EYE / (PERSP_EYE - yr * self.sin_pitch - z * self.cos_pitch))
+                .clamp(0.5, 2.5);
             xr = sx / sc;
         }
         let dx = xr * self.cos_yaw + yr * self.sin_yaw;
@@ -3089,7 +3108,17 @@ impl Widget for TreemapView {
                 // point that was under the cursor.
                 let factor = (-e.scroll.y * 0.011).exp();
                 let cam = self.cam_at(self.laid_out);
-                let anchor = cam.unproject_ground(e.abs);
+                // Anchor on the surface the cursor actually rests on: in the
+                // raised projections that is a tile top, and unprojecting at
+                // its elevation keeps THAT point pinned instead of the ground
+                // hiding behind a tall tower.
+                let z = if self.projection == MapProjection::Flat {
+                    0.0
+                } else {
+                    self.hit_cell(e.abs)
+                        .map_or(0.0, |i| self.elev(self.cells[i].depth))
+                };
+                let anchor = cam.unproject_at(e.abs, z);
                 let base = self
                     .zoom_glide
                     .map_or(self.cam_scale.max(1.0), |glide| glide.target);

@@ -34,7 +34,7 @@ use crate::treemap::Node;
 const MAGIC: u32 = 0x4D50_464D;
 /// Bump this whenever [`Node`]'s encoding changes. Every older file then
 /// fails to load and is simply rewritten by the next scan.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// A ceiling on how big a tree is worth keeping. Past this the file itself
 /// becomes slow enough to read that a fresh scan is competitive, and writing
@@ -93,7 +93,12 @@ pub fn age_text(scanned_at: u64) -> String {
 fn cache_path(root: &Path) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let dir = PathBuf::from(home).join(".config/mpfiles/sizemaps");
-    Some(dir.join(format!("{:016x}.map", hash_path(root))))
+    // The scan scope is part of the map's identity: a tree measured with the
+    // system folders in it must never be served as the excluded one, or the
+    // other way round. Both scopes keep their own file, so flipping the
+    // checkbox back is instant once each has been scanned.
+    let scope = if crate::model::scan_all() { "-all" } else { "" };
+    Some(dir.join(format!("{:016x}{scope}.map", hash_path(root))))
 }
 
 /// FNV-1a over the path's bytes. Not a security hash — a name, and a stable
@@ -192,6 +197,7 @@ fn write_node(out: &mut Vec<u8>, node: &Node) {
     out.push(node.kind);
     out.extend_from_slice(&node.size.to_le_bytes());
     out.extend_from_slice(&node.files.to_le_bytes());
+    out.extend_from_slice(&node.modified.to_le_bytes());
     out.extend_from_slice(&(node.children.len() as u32).to_le_bytes());
     for child in &node.children {
         write_node(out, child);
@@ -243,6 +249,7 @@ impl<'a> Reader<'a> {
         let kind = self.u8()?;
         let size = self.u64()?;
         let files = self.u32()?;
+        let modified = self.u32()?;
         let count = self.u32()?;
         // A child count larger than the bytes left could only come from a
         // damaged file, and reserving on it would be the damage's whole point.
@@ -261,6 +268,7 @@ impl<'a> Reader<'a> {
             kind,
             size,
             files,
+            modified,
             children,
         })
     }
@@ -272,7 +280,8 @@ mod tests {
 
     fn sample() -> Node {
         let mut root = Node::dir("root".into(), 0);
-        root.children.push(Node::file("a.mov".into(), 5, 900));
+        root.children.push(Node::file_at("a.mov".into(), 5, 900, 123_456));
+        root.modified = 123_456;
         let mut sub = Node::dir("sub".into(), 0);
         sub.children.push(Node::file("b.txt".into(), 2, 30));
         sub.size = 30;
@@ -313,6 +322,10 @@ mod tests {
         assert_eq!(back.children.len(), 3);
         assert_eq!(back.children[0].name, "a.mov");
         assert_eq!(back.children[0].kind, 5);
+        // v2's whole point: the age survives, so "show me what's new" works
+        // straight off a loaded map.
+        assert_eq!(back.children[0].modified, 123_456);
+        assert_eq!(back.modified, 123_456);
         assert_eq!(back.children[1].children[0].name, "b.txt");
         // The one thing a reload must not forget: which folders it could not
         // read, so the map keeps admitting the total is short.

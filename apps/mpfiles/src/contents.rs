@@ -345,7 +345,8 @@ script_mod! {
     }
 }
 
-/// The four ways to look at a folder.
+/// The ways to look at a folder. The last three are one treemap under three
+/// projections — flat, extruded, perspective — sharing scan, camera and pick.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ViewMode {
     #[default]
@@ -353,6 +354,8 @@ pub enum ViewMode {
     List,
     Compact,
     Treemap,
+    Treemap25,
+    Treemap3d,
 }
 
 impl ViewMode {
@@ -362,7 +365,14 @@ impl ViewMode {
             ViewMode::List => "List",
             ViewMode::Compact => "Compact",
             ViewMode::Treemap => "Treemap",
+            ViewMode::Treemap25 => "Treemap 2.5D",
+            ViewMode::Treemap3d => "Treemap 3D",
         }
+    }
+
+    /// Whether this mode shows the treemap page, whatever the projection.
+    pub fn is_treemap(self) -> bool {
+        matches!(self, ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d)
     }
 }
 
@@ -400,8 +410,9 @@ pub enum FileContentsAction {
     Dropped(Vec<PathBuf>, DVec2),
     /// A folder in the List tree was opened and its children are not loaded.
     NeedChildren(PathBuf),
-    /// The treemap wants the browser to move into this folder.
-    Drill(PathBuf),
+    /// The map's filter chip was clicked away; the filter controls should
+    /// show themselves cleared.
+    MapFilterCleared,
     /// A secondary press: open the context menu at `at`, for `entry` when the
     /// press landed on one and for the folder itself when it landed on the
     /// empty space.
@@ -660,7 +671,7 @@ impl FileContents {
             .set_visible(cx, mode == ViewMode::Compact);
         self.view
             .view(cx, ids!(treemap_page))
-            .set_visible(cx, mode == ViewMode::Treemap);
+            .set_visible(cx, mode.is_treemap());
         // The tree only exists in the List view, so leaving it flattens the
         // rows and entering it can bring them back.
         if was_tree != (mode == ViewMode::List) {
@@ -912,7 +923,7 @@ impl FileContents {
             }
             // The grid scrolls itself from `sync_grid_selection`; the map has
             // no scroll at all.
-            ViewMode::List | ViewMode::Treemap => {}
+            ViewMode::List | ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => {}
         }
     }
 
@@ -929,7 +940,7 @@ impl FileContents {
         if !self.rows.iter().any(|r| r.entry.path == path) {
             return false;
         }
-        if self.mode == ViewMode::Treemap {
+        if self.mode.is_treemap() {
             return false;
         }
         self.renaming = Some(path.to_path_buf());
@@ -979,7 +990,7 @@ impl FileContents {
                 let (_, item) = grid.get_item(position, 0)?;
                 Some(item.text_input(cx, ids!(cell_edit)))
             }
-            ViewMode::Treemap => None,
+            ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => None,
         }
     }
 
@@ -1361,7 +1372,7 @@ impl FileContents {
                     out.push(FileContentsAction::Sorted);
                 }
             }
-            ViewMode::Treemap => {
+            ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => {
                 let map = self.treemap(cx);
                 match map.action(actions) {
                     // Picking is picking. The old rule — anything not in the
@@ -1388,9 +1399,6 @@ impl FileContents {
                             out.push(FileContentsAction::Restated);
                         }
                     }
-                    // A double-click on a file: take the browser to where it
-                    // lives, which is the one navigation the map ever asks for.
-                    TreemapAction::Reveal(path) => out.push(FileContentsAction::Drill(path)),
                     // The map was showing something that is not there any
                     // more — deleted by something other than this app since
                     // the folder was measured. It has already dropped it; the
@@ -1398,6 +1406,9 @@ impl FileContents {
                     TreemapAction::Vanished(path) => {
                         self.selected.remove(&path);
                         out.push(FileContentsAction::Restated);
+                    }
+                    TreemapAction::FilterCleared => {
+                        out.push(FileContentsAction::MapFilterCleared);
                     }
                     TreemapAction::None => {}
                 }
@@ -1560,7 +1571,7 @@ impl Widget for FileContents {
                         self.draw_list(cx, &mut grid);
                     }
                 }
-                ViewMode::Treemap => {}
+                ViewMode::Treemap | ViewMode::Treemap25 | ViewMode::Treemap3d => {}
             }
         }
         DrawStep::done()

@@ -409,13 +409,47 @@ pub fn sort_indices(entries: &[FileEntry], order: &mut [usize], sort: SortSpec) 
 /// literal truth about their home directory and does not mind the dialogs.
 const HOME_SKIP: [&str; 2] = ["Library", ".Trash"];
 
+/// Whether the size map measures the system folders too. Off by default —
+/// the map skips ~/Library and ~/.Trash so macOS never storms the user with
+/// permission dialogs — and flipped by the "ignore system" checkbox on the
+/// map's tool strip. `MPFILES_SCAN_ALL=1` or a saved preference turns it on
+/// at startup; every change is written back so the choice survives launches.
+pub fn scan_all() -> bool {
+    *scan_all_flag().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Change the scope and remember it. The caller owns triggering the rescan.
+pub fn set_scan_all(on: bool) {
+    *scan_all_flag().lock().unwrap_or_else(|e| e.into_inner()) = on;
+    let path = home_dir().join(".config").join("mpfiles").join("prefs");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, if on { "scan_all=1\n" } else { "scan_all=0\n" });
+}
+
+fn scan_all_flag() -> &'static std::sync::Mutex<bool> {
+    static FLAG: std::sync::OnceLock<std::sync::Mutex<bool>> = std::sync::OnceLock::new();
+    FLAG.get_or_init(|| {
+        if std::env::var_os("MPFILES_SCAN_ALL").is_some_and(|v| v != "0") {
+            return std::sync::Mutex::new(true);
+        }
+        let saved = std::fs::read_to_string(
+            home_dir().join(".config").join("mpfiles").join("prefs"),
+        )
+        .map(|text| text.lines().any(|l| l.trim() == "scan_all=1"))
+        .unwrap_or(false);
+        std::sync::Mutex::new(saved)
+    })
+}
+
 /// True for a folder the size map must not enter.
 ///
 /// Only ever consulted for directories, and only for the ones directly under
 /// the user's home — a `Library` folder inside a project is a project's
 /// library and gets measured like anything else.
 pub fn skip_for_scan(path: &Path) -> bool {
-    if std::env::var_os("MPFILES_SCAN_ALL").is_some_and(|v| v != "0") {
+    if scan_all() {
         return false;
     }
     let home = home_dir();
@@ -430,10 +464,11 @@ pub fn skip_for_scan(path: &Path) -> bool {
         .is_some_and(|name| HOME_SKIP.contains(&name))
 }
 
-/// What the map says it left out, for the line that has to admit it.
+/// What scope the map's numbers were measured under — always said, in both
+/// states, so nobody misreads a total.
 pub fn scan_exclusions() -> Option<String> {
-    if std::env::var_os("MPFILES_SCAN_ALL").is_some_and(|v| v != "0") {
-        return None;
+    if scan_all() {
+        return Some("including system folders".to_string());
     }
     Some("excluding Library and Trash".to_string())
 }

@@ -116,6 +116,11 @@ pub struct Node {
     /// line that recounted a million nodes on every progress tick would cost
     /// more than the scan.
     pub files: u32,
+    /// When this subtree last changed: minutes since the epoch of the newest
+    /// file under it (a leaf's own mtime), 0 when unknown. Minutes because a
+    /// "show me what's new" filter never needs seconds and a u32 of minutes
+    /// outlives everyone. A folder counts as new when anything inside it is.
+    pub modified: u32,
     pub children: Vec<Node>,
 }
 
@@ -130,12 +135,20 @@ impl Node {
             kind,
             size: 0,
             files: 0,
+            modified: 0,
             children: Vec::new(),
         }
     }
 
-    /// A file, which is complete the moment it is known.
+    /// A file with no known age — the tests' shorthand; the walk always
+    /// knows better and uses [`Node::file_at`].
+    #[cfg(test)]
     pub fn file(name: String, kind: u8, size: u64) -> Node {
+        Node::file_at(name, kind, size, 0)
+    }
+
+    /// A file with its modification time, in minutes since the epoch.
+    pub fn file_at(name: String, kind: u8, size: u64, modified: u32) -> Node {
         Node {
             name,
             is_dir: false,
@@ -144,6 +157,7 @@ impl Node {
             kind,
             size,
             files: 1,
+            modified,
             children: Vec::new(),
         }
     }
@@ -180,6 +194,7 @@ impl Node {
             };
             node.size = node.children.iter().map(|c| c.size).sum();
             node.files = node.children.iter().map(|c| c.files).sum();
+            node.modified = node.children.iter().map(|c| c.modified).max().unwrap_or(0);
             node.kind = heaviest_kind(&node.children).unwrap_or(node.kind);
         }
     }
@@ -199,6 +214,7 @@ impl Node {
                 };
                 node.size = children.iter().map(|c| c.size).sum();
                 node.files = children.iter().map(|c| c.files).sum();
+                node.modified = children.iter().map(|c| c.modified).max().unwrap_or(0);
                 node.kind = heaviest_kind(&children).unwrap_or(node.kind);
                 node.children = children;
                 node.denied = denied;
@@ -385,6 +401,7 @@ struct Listed {
     path: PathBuf,
     is_dir: bool,
     size: u64,
+    modified: u32,
     kind: u8,
 }
 
@@ -475,6 +492,7 @@ fn read_listing(
             path: entry.path(),
             is_dir: file_type.is_dir(),
             size: 0,
+            modified: 0,
             keep: true,
         });
     }
@@ -517,6 +535,7 @@ fn read_listing(
             path: item.path,
             is_dir: item.is_dir,
             size: item.size,
+            modified: item.modified,
         });
     }
     Listing {
@@ -533,7 +552,17 @@ struct Found {
     path: PathBuf,
     is_dir: bool,
     size: u64,
+    modified: u32,
     keep: bool,
+}
+
+/// A SystemTime as whole minutes since the epoch, saturating; 0 for a time
+/// the filesystem would not say.
+fn minutes_since_epoch(time: std::io::Result<std::time::SystemTime>) -> u32 {
+    time.ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs() / 60).min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
 }
 
 /// Size every file in `slice`, and drop every directory that turns out to sit
@@ -547,10 +576,11 @@ fn stat_all(slice: &mut [Found], device: Option<u64>) {
     for item in slice {
         if item.is_dir {
             item.keep = device.is_none() || device_of(&item.path) == device;
-        } else {
-            item.size = fs::symlink_metadata(&item.path)
-                .map(|meta| meta.len())
-                .unwrap_or(0);
+        } else if let Ok(meta) = fs::symlink_metadata(&item.path) {
+            item.size = meta.len();
+            // Free with the stat already in hand — this is what lets the map
+            // answer "show me only what's new".
+            item.modified = minutes_since_epoch(meta.modified());
         }
     }
 }
@@ -562,7 +592,7 @@ fn stubs(listing: &[Listed]) -> Vec<Node> {
             if l.is_dir {
                 Node::dir(l.name.clone(), l.kind)
             } else {
-                Node::file(l.name.clone(), l.kind, l.size)
+                Node::file_at(l.name.clone(), l.kind, l.size, l.modified)
             }
         })
         .collect()
@@ -881,12 +911,13 @@ fn scan_blocking(
                 *since = 0;
                 progress(*total);
             }
-            children.push(Node::file(entry.name, entry.kind, entry.size));
+            children.push(Node::file_at(entry.name, entry.kind, entry.size, entry.modified));
         }
     }
     Some(Node {
         size: children.iter().map(|c| c.size).sum(),
         files: children.iter().map(|c| c.files).sum(),
+        modified: children.iter().map(|c| c.modified).max().unwrap_or(0),
         kind: heaviest_kind(&children).unwrap_or(kind),
         name,
         is_dir: true,
@@ -1068,6 +1099,218 @@ fn worst_ratio(areas: &[f64], rect: Rect) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+// ------------------------------------------------------------------ filter
+
+/// What the filter box means. Every field is ANDed; a file matches when it
+/// passes all of them, and a folder's filtered size is the sum of its
+/// matching files — so under ".mov" the map is literally "where do my movie
+/// bytes live", and folders holding none of them vanish.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Query {
+    /// Lowercase substrings. A term is satisfied by the file's own name or
+    /// by any folder on the way down to it — "cache" means everything under
+    /// a cache folder, which is what a person pointing at a treemap means.
+    pub names: Vec<String>,
+    /// Lowercase extensions, no dot. Any of these (ORed) when non-empty.
+    pub exts: Vec<String>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    /// Only files at least this new: minutes since the epoch.
+    pub newer_than: Option<u32>,
+    /// Only files at least this old — `>1y` finds the forgotten stuff.
+    pub older_than: Option<u32>,
+    /// Allowed kind tags as a bitmask over [`Node::kind`]; None = all kinds.
+    pub kinds: Option<u16>,
+}
+
+impl Query {
+    /// True when this query filters nothing — the map is the whole disk.
+    pub fn is_empty(&self) -> bool {
+        *self == Query::default()
+    }
+
+    /// Parse the typed form: whitespace-separated terms, ANDed.
+    /// `>100mb` / `<2gb` / `>=1kb` bound file sizes; `<7d` / `<24h` / `<2w` /
+    /// `<3mo` / `<1y` mean "modified within"; `.mov` / `*.mov` match an
+    /// extension; anything else is a name substring. `now_min` is the current
+    /// time in minutes since the epoch, for the age terms.
+    pub fn parse(text: &str, now_min: u32) -> Query {
+        let mut query = Query::default();
+        for raw in text.split_whitespace() {
+            let term = raw.to_lowercase();
+            if let Some(rest) = term.strip_prefix("*.") {
+                if !rest.is_empty() {
+                    query.exts.push(rest.to_string());
+                }
+            } else if let Some(rest) = term.strip_prefix('.') {
+                if !rest.is_empty() && rest.chars().all(|c| c.is_alphanumeric()) {
+                    query.exts.push(rest.to_string());
+                }
+            } else if let Some(bound) = term
+                .strip_prefix(">=")
+                .or_else(|| term.strip_prefix('>'))
+            {
+                if let Some(minutes) = parse_age(bound) {
+                    // ">7d" reads as "older than a week" — untouched since.
+                    query.older_than = Some(now_min.saturating_sub(minutes));
+                } else if let Some(bytes) = parse_size(bound) {
+                    query.min_size = Some(bytes);
+                } else {
+                    query.names.push(term);
+                }
+            } else if let Some(bound) = term
+                .strip_prefix("<=")
+                .or_else(|| term.strip_prefix('<'))
+            {
+                if let Some(minutes) = parse_age(bound) {
+                    query.newer_than = Some(now_min.saturating_sub(minutes));
+                } else if let Some(bytes) = parse_size(bound) {
+                    query.max_size = Some(bytes);
+                } else {
+                    query.names.push(term);
+                }
+            } else {
+                query.names.push(term);
+            }
+        }
+        query
+    }
+
+    /// The bitmask of name terms `name` satisfies.
+    pub fn name_hits(&self, name: &str) -> u32 {
+        let mut hits = 0u32;
+        if self.names.is_empty() {
+            return 0;
+        }
+        let lower = name.to_lowercase();
+        for (index, term) in self.names.iter().enumerate().take(32) {
+            if lower.contains(term.as_str()) {
+                hits |= 1 << index;
+            }
+        }
+        hits
+    }
+
+    /// The mask that means "every name term satisfied".
+    fn all_names(&self) -> u32 {
+        if self.names.is_empty() {
+            0
+        } else {
+            (1u32 << self.names.len().min(32)) - 1
+        }
+    }
+
+    /// Whether one file passes, given the name terms its folders already
+    /// satisfied on the way down.
+    fn file_matches(&self, node: &Node, inherited: u32) -> bool {
+        if let Some(min) = self.min_size {
+            if node.size < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_size {
+            if node.size > max {
+                return false;
+            }
+        }
+        if let Some(cutoff) = self.newer_than {
+            if node.modified < cutoff {
+                return false;
+            }
+        }
+        if let Some(cutoff) = self.older_than {
+            if node.modified > cutoff {
+                return false;
+            }
+        }
+        if let Some(kinds) = self.kinds {
+            if kinds & (1u16 << (node.kind as u32).min(15)) == 0 {
+                return false;
+            }
+        }
+        if !self.exts.is_empty() {
+            let lower = node.name.to_lowercase();
+            if !self
+                .exts
+                .iter()
+                .any(|ext| lower.len() > ext.len() && lower.ends_with(ext.as_str())
+                    && lower.as_bytes()[lower.len() - ext.len() - 1] == b'.')
+            {
+                return false;
+            }
+        }
+        (inherited | self.name_hits(&node.name)) == self.all_names()
+    }
+}
+
+/// "100mb" -> bytes. 1000-based, like every number this app prints.
+fn parse_size(text: &str) -> Option<u64> {
+    let unit_at = text.find(|c: char| c.is_alphabetic())?;
+    let value: f64 = text[..unit_at].parse().ok()?;
+    let scale: u64 = match &text[unit_at..] {
+        "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "t" | "tb" => 1_000_000_000_000,
+        _ => return None,
+    };
+    (value >= 0.0).then(|| (value * scale as f64) as u64)
+}
+
+/// "7d" -> minutes. Hours, days, weeks, months, years.
+fn parse_age(text: &str) -> Option<u32> {
+    let unit_at = text.find(|c: char| c.is_alphabetic())?;
+    let value: f64 = text[..unit_at].parse().ok()?;
+    let scale: u32 = match &text[unit_at..] {
+        "h" => 60,
+        "d" => 60 * 24,
+        "w" => 60 * 24 * 7,
+        "mo" => 60 * 24 * 30,
+        "y" => 60 * 24 * 365,
+        _ => return None,
+    };
+    (value >= 0.0).then(|| (value * scale as f64) as u32)
+}
+
+/// The bytes and files under `node` that pass `query`, with `inherited` name
+/// terms already satisfied by the folders above. One prune-walk — this is
+/// what a keystroke in the filter box costs.
+pub fn filtered_size(node: &Node, query: &Query, inherited: u32) -> (u64, u32) {
+    if !node.is_dir {
+        return if query.file_matches(node, inherited) {
+            (node.size, 1)
+        } else {
+            (0, 0)
+        };
+    }
+    let inherited = inherited | query.name_hits(&node.name);
+    let mut bytes = 0u64;
+    let mut files = 0u32;
+    for child in &node.children {
+        let (b, f) = filtered_size(child, query, inherited);
+        bytes += b;
+        files += f;
+    }
+    (bytes, files)
+}
+
+/// Bytes per kind tag under `node` — the legend's numbers. One walk.
+pub fn kind_totals(node: &Node) -> [u64; 16] {
+    let mut totals = [0u64; 16];
+    fn add(node: &Node, totals: &mut [u64; 16]) {
+        if node.is_dir {
+            for child in &node.children {
+                add(child, totals);
+            }
+        } else {
+            totals[(node.kind as usize).min(15)] += node.size;
+        }
+    }
+    add(node, &mut totals);
+    totals
+}
+
 // ------------------------------------------------------------------ layout
 
 /// The pixel sizes that decide how far down the map goes. Every one of them
@@ -1174,10 +1417,12 @@ pub fn layout(
     area: Rect,
     viewport: Rect,
     style: &MapStyle,
+    filter: Option<&Query>,
 ) -> Vec<Cell> {
     let mut out = Vec::new();
     let mut path = root_path.to_path_buf();
-    layout_children(&node.children, &mut path, area, viewport, 0, style, &mut out);
+    let filter = filter.filter(|q| !q.is_empty()).map(|q| (q, q.name_hits(&node.name)));
+    layout_children(&node.children, &mut path, area, viewport, 0, style, filter, &mut out);
     out
 }
 
@@ -1188,6 +1433,7 @@ pub fn inset_for(style: &MapStyle, depth: usize) -> f64 {
     style.inset * (1.0 + 2.0 / (depth as f64 + 1.0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_children(
     children: &[Node],
     path: &mut PathBuf,
@@ -1195,6 +1441,7 @@ fn layout_children(
     viewport: Rect,
     depth: usize,
     style: &MapStyle,
+    filter: Option<(&Query, u32)>,
     out: &mut Vec<Cell>,
 ) {
     if children.is_empty() || area.w <= 0.0 || area.h <= 0.0 || out.len() >= style.max_cells {
@@ -1203,7 +1450,20 @@ fn layout_children(
     if !area.intersects(&viewport) {
         return;
     }
-    let total: f64 = children.iter().map(|c| c.size as f64).sum();
+    // Under a filter every child weighs only its matching bytes — the whole
+    // map re-proportions to the question being asked. The unfiltered path
+    // never allocates or walks anything extra.
+    let measured: Option<Vec<(u64, u32)>> = filter.map(|(query, inherited)| {
+        children
+            .iter()
+            .map(|child| filtered_size(child, query, inherited))
+            .collect()
+    });
+    let weight = |index: usize| match &measured {
+        Some(list) => list[index].0,
+        None => children[index].size,
+    };
+    let total: f64 = (0..children.len()).map(|i| weight(i) as f64).sum();
     if total <= 0.0 {
         return;
     }
@@ -1216,19 +1476,23 @@ fn layout_children(
     let mut bundle_size = 0u64;
     let mut bundle_count = 0u32;
     let mut bundle_files = 0u32;
-    for (index, child) in children.iter().enumerate() {
-        if child.size >= floor && child.size > 0 {
+    for index in 0..children.len() {
+        let size = weight(index);
+        if size >= floor && size > 0 {
             keep.push(index);
-        } else if child.size > 0 {
-            bundle_size += child.size;
+        } else if size > 0 {
+            bundle_size += size;
             bundle_count += 1;
-            bundle_files += child.files;
+            bundle_files += match &measured {
+                Some(list) => list[index].1,
+                None => children[index].files,
+            };
         }
     }
     // Descending order is what the squarified rule assumes; sorting only the
     // survivors keeps this proportional to the pixels, not to the files.
-    keep.sort_unstable_by(|&a, &b| children[b].size.cmp(&children[a].size));
-    let mut sizes: Vec<u64> = keep.iter().map(|&i| children[i].size).collect();
+    keep.sort_unstable_by(|&a, &b| weight(b).cmp(&weight(a)));
+    let mut sizes: Vec<u64> = keep.iter().map(|&i| weight(i)).collect();
     if bundle_count > 0 {
         sizes.push(bundle_size);
     }
@@ -1290,8 +1554,11 @@ fn layout_children(
         out.push(Cell {
             path: path.clone(),
             name: child.name.clone(),
-            size: child.size,
-            files: child.files,
+            size: weight(index),
+            files: match &measured {
+                Some(list) => list[index].1,
+                None => child.files,
+            },
             is_dir: child.is_dir,
             kind: child.kind,
             depth,
@@ -1302,7 +1569,8 @@ fn layout_children(
             extra: 0,
         });
         if is_group {
-            layout_children(&child.children, path, inner, viewport, depth + 1, style, out);
+            let filter = filter.map(|(q, m)| (q, m | q.name_hits(&child.name)));
+            layout_children(&child.children, path, inner, viewport, depth + 1, style, filter, out);
         }
         path.pop();
     }
@@ -1354,6 +1622,7 @@ mod tests {
             kind: 0,
             size: children.iter().map(|c| c.size).sum(),
             files: children.iter().map(|c| c.files).sum(),
+            modified: children.iter().map(|c| c.modified).max().unwrap_or(0),
             children,
         }
     }
@@ -1516,7 +1785,7 @@ mod tests {
             ],
         );
         let area = Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 };
-        let cells = layout(&tree, Path::new("/root"), area, area, &style());
+        let cells = layout(&tree, Path::new("/root"), area, area, &style(), None);
 
         let sub_index = cells.iter().position(|c| c.name == "sub").unwrap();
         let a_index = cells.iter().position(|c| c.name == "a.txt").unwrap();
@@ -1542,7 +1811,7 @@ mod tests {
         }
         let tree = dir("root", vec![tree]);
         let area = Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 };
-        let cells = layout(&tree, Path::new("/root"), area, area, &style());
+        let cells = layout(&tree, Path::new("/root"), area, area, &style(), None);
         let buried = cells.iter().find(|c| c.name == "buried.bin").unwrap();
         assert_eq!(buried.depth, 10);
         assert_eq!(
@@ -1559,7 +1828,7 @@ mod tests {
         let mut style = style();
         style.min_side = 4.0;
         style.min_area = 16.0;
-        let cells = layout(&tree, Path::new("/root"), area, area, &style);
+        let cells = layout(&tree, Path::new("/root"), area, area, &style, None);
         assert!(cells.iter().any(|c| c.name == "big.bin"));
         assert!(!cells.iter().any(|c| c.name == "tiny.bin"));
     }
@@ -1572,7 +1841,7 @@ mod tests {
         children.extend((0..50_000).map(|i| leaf(&format!("t{i}.tmp"), 100)));
         let tree = dir("root", children);
         let area = Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 };
-        let cells = layout(&tree, Path::new("/root"), area, area, &MapStyle::default());
+        let cells = layout(&tree, Path::new("/root"), area, area, &MapStyle::default(), None);
         // Two rectangles: the big file, and one that says how many were left.
         assert!(cells.len() < 8, "{} cells is a laid-out tail", cells.len());
         let bundle = cells.iter().find(|c| c.is_bundle()).unwrap();
@@ -1668,13 +1937,13 @@ mod tests {
         let style = MapStyle::default();
 
         // Unzoomed: the folders show, their files are bundled away.
-        let flat = layout(&tree, Path::new("/root"), screen, screen, &style);
+        let flat = layout(&tree, Path::new("/root"), screen, screen, &style, None);
         assert!(flat.iter().any(|c| c.name == "d0"));
         assert!(flat.iter().all(|c| !c.name.starts_with('f')));
 
         // 8× camera, looking at the top-left corner of the blown-up map.
         let area = Rect { x: 0.0, y: 0.0, w: 2400.0, h: 1600.0 };
-        let zoomed = layout(&tree, Path::new("/root"), area, screen, &style);
+        let zoomed = layout(&tree, Path::new("/root"), area, screen, &style, None);
 
         // Everything delivered is at least partly on screen…
         for cell in &zoomed {
@@ -1696,7 +1965,7 @@ mod tests {
     fn hit_finds_the_deepest_cell() {
         let tree = dir("root", vec![dir("sub", vec![leaf("a.txt", 100)])]);
         let area = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = layout(&tree, Path::new("/root"), area, area, &style());
+        let cells = layout(&tree, Path::new("/root"), area, area, &style(), None);
 
         let group = cells.iter().position(|c| c.name == "sub").unwrap();
         let child = cells.iter().position(|c| c.name == "a.txt").unwrap();
@@ -1914,6 +2183,129 @@ mod tests {
         let cancel = AtomicBool::new(true);
         assert!(!scan_stream(&root, &open_rules(), &cancel, &|_| {}));
         fs::remove_dir_all(&root).ok();
+    }
+
+    // ------------------------------------------------------------- filter
+
+    #[test]
+    fn the_query_parser_reads_every_term_form() {
+        let now = 1_000_000u32;
+        let q = Query::parse("cache .mov *.mkv >100mb <2gb <7d qwen", now);
+        assert_eq!(q.names, vec!["cache".to_string(), "qwen".to_string()]);
+        assert_eq!(q.exts, vec!["mov".to_string(), "mkv".to_string()]);
+        assert_eq!(q.min_size, Some(100_000_000));
+        assert_eq!(q.max_size, Some(2_000_000_000));
+        assert_eq!(q.newer_than, Some(now - 7 * 24 * 60));
+        assert!(q.older_than.is_none());
+        // ">1y" is the other direction: untouched for a year.
+        let old = Query::parse(">1y", now);
+        assert_eq!(old.older_than, Some(now - 525_600));
+        // Sizes are 1000-based like every number the app prints; bounds
+        // that fail to parse fall back to being name terms, never dropped.
+        let odd = Query::parse(">wat", now);
+        assert_eq!(odd.names, vec![">wat".to_string()]);
+        assert!(Query::parse("", now).is_empty());
+    }
+
+    #[test]
+    fn a_filtered_folder_weighs_only_its_matching_bytes() {
+        let tree = dir(
+            "root",
+            vec![
+                dir(
+                    "movies",
+                    vec![leaf("a.mov", 900), leaf("b.txt", 50), leaf("c.mov", 100)],
+                ),
+                dir("docs", vec![leaf("d.txt", 500)]),
+            ],
+        );
+        let q = Query::parse(".mov", 0);
+        let (bytes, files) = filtered_size(&tree, &q, 0);
+        assert_eq!((bytes, files), (1000, 2));
+        // A folder with no matching bytes vanishes from the layout entirely.
+        let area = Rect { x: 0.0, y: 0.0, w: 400.0, h: 300.0 };
+        let cells = layout(&tree, Path::new("/root"), area, area, &style(), Some(&q));
+        assert!(cells.iter().any(|c| c.name == "movies" && c.size == 1000));
+        assert!(!cells.iter().any(|c| c.name == "docs"));
+        assert!(!cells.iter().any(|c| c.name == "b.txt"));
+        // And no filter costs nothing different from before.
+        let plain = layout(&tree, Path::new("/root"), area, area, &style(), None);
+        assert!(plain.iter().any(|c| c.name == "docs"));
+    }
+
+    #[test]
+    fn a_name_term_matches_everything_under_a_matching_folder() {
+        let tree = dir(
+            "root",
+            vec![
+                dir("cache", vec![leaf("blob.bin", 700)]),
+                leaf("cache.log", 40),
+                leaf("other.bin", 25),
+            ],
+        );
+        let q = Query::parse("cache", 0);
+        let (bytes, files) = filtered_size(&tree, &q, 0);
+        assert_eq!((bytes, files), (740, 2));
+    }
+
+    #[test]
+    fn age_terms_ride_on_the_rolled_up_mtime() {
+        let now = 2_000_000u32;
+        let mut tree = dir(
+            "root",
+            vec![dir(
+                "sub",
+                vec![
+                    Node::file_at("new.txt".into(), 0, 10, now - 60),
+                    Node::file_at("old.txt".into(), 0, 20, now - 1_000_000),
+                ],
+            )],
+        );
+        tree.children[0].modified = now - 60;
+        tree.modified = now - 60;
+        let q = Query::parse("<7d", now);
+        assert_eq!(filtered_size(&tree, &q, 0), (10, 1));
+        // The folder counts as new because something new is inside it —
+        // that is what the max roll-up means.
+        assert_eq!(tree.modified, now - 60);
+    }
+
+    #[test]
+    fn the_walk_rolls_the_newest_mtime_up_to_the_root() {
+        let root = temp_root("mtime");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), b"aa").unwrap();
+        let cancel = AtomicBool::new(false);
+        let steps = Mutex::new(Vec::new());
+        assert!(scan_stream(&root, &open_rules(), &cancel, &|step| {
+            steps.lock().unwrap().push(step);
+        }));
+        let mut tree = Node::dir("root".into(), 0);
+        for step in steps.into_inner().unwrap() {
+            tree.apply(step);
+        }
+        // Written moments ago: the minutes-since-epoch must be recent and
+        // must have reached the root through the roll-up.
+        assert!(tree.modified > 0);
+        let now = super::minutes_since_epoch(Ok(std::time::SystemTime::now()));
+        assert!(now - tree.modified < 5, "root mtime {} vs now {}", tree.modified, now);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn kind_totals_sum_files_by_tag() {
+        let tree = dir(
+            "root",
+            vec![
+                Node::file("a.mov".into(), 5, 900),
+                Node::file("b.mov".into(), 5, 100),
+                Node::file("c.txt".into(), 2, 30),
+            ],
+        );
+        let totals = kind_totals(&tree);
+        assert_eq!(totals[5], 1000);
+        assert_eq!(totals[2], 30);
+        assert_eq!(totals[0], 0);
     }
 
     #[test]

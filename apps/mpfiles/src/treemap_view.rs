@@ -23,6 +23,7 @@ use makepad_widgets::makepad_platform::thread::SignalToUI;
 use makepad_widgets::*;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -36,7 +37,7 @@ use std::{
 use crate::{
     model::FileKind,
     theme::Palette,
-    treemap::{self, Cell, MapStyle, Node, Rect as MapRect, ScanStep},
+    treemap::{self, Cell, MapStyle, Node, Query, Rect as MapRect, ScanStep},
 };
 
 /// The strip along the top carrying the zoom breadcrumb and the scan state.
@@ -61,6 +62,15 @@ const SIGNAL_EVERY: Duration = Duration::from_millis(45);
 const KIND_BUNDLE: u8 = u8::MAX;
 /// The palette class everything unrecognised falls into.
 const OTHER_CLASS: usize = 6;
+/// How long a filter change morphs the map from the old cell set to the new.
+const TWEEN: Duration = Duration::from_millis(200);
+/// Points of elevation one nesting level is worth at camera scale 1 — the
+/// whole meaning of the raised projections: height is depth. Big enough
+/// that a nested plate clears its parent's label line.
+const RISE: f64 = 11.0;
+/// The perspective eye's height over the base plane, in the same points.
+/// Large on purpose: the 3d mode is the ortho map breathing, not a flyover.
+const PERSP_EYE: f64 = 1500.0;
 /// The tile size at which the cushion is at full strength. A cushion lives in
 /// the tile's own 0..1 space, so left alone a huge rectangle gets a huge soft
 /// gradient that reads as a spotlight rather than as a surface. The shading is
@@ -145,10 +155,11 @@ pub enum TreemapAction {
     /// A rectangle was picked. The map keeps showing it; the browser may
     /// select it too when it happens to be in the current listing.
     Selected(PathBuf),
-    /// A file was double-clicked: take the browser to where it lives.
-    Reveal(PathBuf),
     /// What was picked is not on the disk any more; the map has dropped it.
     Vanished(PathBuf),
+    /// The ✕ on the filter chip: the map is unfiltered again, and whoever
+    /// owns the filter controls should show them cleared.
+    FilterCleared,
     #[default]
     None,
 }
@@ -276,6 +287,42 @@ pub struct TreemapView {
     #[rust]
     panning: bool,
 
+    /// How the map is drawn: flat, extruded, or in perspective.
+    #[rust]
+    projection: MapProjection,
+    /// The order cells paint in for the raised projections. Empty for the
+    /// flat map, whose own vector is already painter's order.
+    #[rust]
+    paint_order: Vec<usize>,
+
+    /// The live filter. None (or an empty query) is the whole disk.
+    #[rust]
+    filter: Option<Query>,
+    /// What the filter matched under the focused folder: (bytes, files).
+    #[rust]
+    filtered: Option<(u64, u32)>,
+    /// Where the filter chip's ✕ was drawn, for the click that clears it.
+    #[rust]
+    filter_hit: Rect,
+    /// Byte totals per kind tag — the legend's numbers, recomputed lazily.
+    #[rust]
+    totals: [u64; 16],
+    #[rust]
+    totals_dirty: bool,
+
+    /// The filter tween: where each surviving path was, the cells that are
+    /// leaving (with the rect they were last seen at), and when it started.
+    #[rust]
+    tween_from: HashMap<PathBuf, TweenFrom>,
+    #[rust]
+    tween_leavers: Vec<(Cell, MapRect, f64)>,
+    #[rust]
+    tween_start: Option<Instant>,
+    /// A snapshot of the map as it looks right now, taken when the filter
+    /// changes, consumed by the next relayout to aim the tween.
+    #[rust]
+    tween_capture: Option<Vec<(Cell, MapRect, f64)>>,
+
     #[rust]
     generation: u64,
     #[rust]
@@ -331,6 +378,27 @@ struct Drag {
     taps: u32,
 }
 
+/// How the map is projected onto the panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum MapProjection {
+    /// The flat map — exactly the 2D treemap.
+    #[default]
+    Flat,
+    /// 2.5D: every cell extrudes straight up by its nesting depth, showing a
+    /// darker riser below its plate. Deep tangles read as towers.
+    Ortho,
+    /// The same prisms through a gentle straight-down perspective: higher
+    /// plates swell and lean away from the middle of the panel.
+    Persp,
+}
+
+/// Where a cell was when a filter tween started, so it can glide to where it
+/// is now.
+struct TweenFrom {
+    rect: MapRect,
+    depth: f64,
+}
+
 impl TreemapView {
     /// The folder the map is currently of.
     pub fn root(&self) -> &Path {
@@ -371,6 +439,18 @@ impl TreemapView {
             return;
         }
         self.begin(cx, path, false);
+    }
+
+    /// Re-open the current root under whatever the scan rules now say —
+    /// the scope checkbox's move. The saved map for the *new* scope is
+    /// welcome (that is what makes flipping back instant); the tree in hand
+    /// was measured under the old rules and is not.
+    pub fn remap(&mut self, cx: &mut Cx) {
+        let root = self.root.clone();
+        if root.as_os_str().is_empty() {
+            return;
+        }
+        self.begin(cx, &root, false);
     }
 
     /// Measure the disk again and replace the saved map, whatever its age.
@@ -414,6 +494,12 @@ impl TreemapView {
         self.cam_off = DVec2::default();
         self.drag = None;
         self.panning = false;
+        self.filtered = None;
+        self.totals_dirty = true;
+        self.tween_capture = None;
+        self.tween_start = None;
+        self.tween_from.clear();
+        self.tween_leavers.clear();
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
@@ -553,6 +639,7 @@ impl TreemapView {
                 }
                 self.tree.apply(step);
                 self.stale = true;
+                self.totals_dirty = true;
             }
             if let Some(outcome) = message.finished {
                 self.scanning = false;
@@ -746,6 +833,153 @@ impl TreemapView {
         );
     }
 
+    // -------------------------------------------------- projection & filter
+
+    /// One nesting level's worth of elevation, in on-screen points. Grows
+    /// with the square root of the camera so towers stay proud when zoomed
+    /// without ever dwarfing the tiles.
+    fn rise(&self) -> f64 {
+        RISE * self.cam_scale.max(1.0).sqrt()
+    }
+
+    /// The elevation of a plate at `depth`. The top level sits on the floor
+    /// — exactly where the flat map has it — and every nesting level steps
+    /// up one rise from there.
+    fn elev(&self, depth: usize) -> f64 {
+        depth.min(24) as f64 * self.rise()
+    }
+
+    fn elev_f(&self, depth: f64) -> f64 {
+        depth.min(24.0) * self.rise()
+    }
+
+    /// `rect` as drawn at elevation `z` under the current projection.
+    fn project_rect(&self, rect: &MapRect, z: f64) -> MapRect {
+        match self.projection {
+            MapProjection::Flat => *rect,
+            MapProjection::Ortho => MapRect {
+                x: rect.x,
+                y: rect.y - z,
+                w: rect.w,
+                h: rect.h,
+            },
+            MapProjection::Persp => {
+                let body = self.laid_out;
+                let cx = body.pos.x + body.size.x * 0.5;
+                let cy = body.pos.y + body.size.y * 0.5;
+                let s = (PERSP_EYE / (PERSP_EYE - z)).clamp(1.0, 1.6);
+                MapRect {
+                    x: cx + (rect.x - cx) * s,
+                    y: cy + (rect.y - cy) * s,
+                    w: rect.w * s,
+                    h: rect.h * s,
+                }
+            }
+        }
+    }
+
+    /// Change how the map projects. The layout itself never changes — only
+    /// what is done with it on the way to the screen.
+    pub fn set_projection(&mut self, cx: &mut Cx, projection: MapProjection) {
+        if self.projection == projection {
+            return;
+        }
+        self.projection = projection;
+        self.hover = None;
+        self.stale = true;
+        self.last_layout = None;
+        self.redraw(cx);
+    }
+
+    /// Apply (or clear) the live filter, morphing from the picture on screen.
+    pub fn set_filter(&mut self, cx: &mut Cx, filter: Option<Query>) {
+        let filter = filter.filter(|q| !q.is_empty());
+        if filter == self.filter {
+            return;
+        }
+        // Aim the tween from wherever things visually are right now — a
+        // slider mid-drag retargets smoothly instead of jumping.
+        self.tween_capture = Some(self.visual_snapshot());
+        self.filter = filter;
+        self.stale = true;
+        self.last_layout = None;
+        self.hover = None;
+        self.redraw(cx);
+    }
+
+    /// Whether a filter is active, and what it matched: (bytes, files).
+    pub fn filter_matched(&self) -> Option<(u64, u32)> {
+        self.filter.as_ref()?;
+        self.filtered
+    }
+
+    /// Byte totals per kind tag under the mapped folder — the legend's
+    /// numbers. Recounted only after the tree actually changed.
+    pub fn kind_totals(&mut self) -> [u64; 16] {
+        if self.totals_dirty {
+            self.totals = treemap::kind_totals(&self.tree);
+            self.totals_dirty = false;
+        }
+        self.totals
+    }
+
+    /// Eased tween progress, or None when nothing is morphing.
+    fn tween_t(&self) -> Option<f64> {
+        let start = self.tween_start?;
+        let t = start.elapsed().as_secs_f64() / TWEEN.as_secs_f64();
+        if t >= 1.0 {
+            return None;
+        }
+        // Smoothstep: no snap at either end.
+        Some(t * t * (3.0 - 2.0 * t))
+    }
+
+    /// Every cell's current on-screen truth — layout rect and fractional
+    /// depth, mid-tween or not — plus the leavers still fading out.
+    fn visual_snapshot(&self) -> Vec<(Cell, MapRect, f64)> {
+        let t = self.tween_t();
+        let mut out: Vec<(Cell, MapRect, f64)> = Vec::with_capacity(self.cells.len());
+        for cell in &self.cells {
+            let (rect, depth, alive) = self.tweened(cell, t);
+            if alive > 0.0 {
+                out.push((cell.clone(), rect, depth));
+            }
+        }
+        if let Some(t) = t {
+            for (cell, rect, _) in &self.tween_leavers {
+                if 1.0 - t > 0.05 {
+                    out.push((cell.clone(), *rect, cell.depth as f64));
+                }
+            }
+        }
+        out
+    }
+
+    /// Where `cell` is right now: (layout rect, fractional depth, alpha).
+    fn tweened(&self, cell: &Cell, t: Option<f64>) -> (MapRect, f64, f64) {
+        let Some(t) = t else {
+            return (cell.rect, cell.depth as f64, 1.0);
+        };
+        match self.tween_from.get(&cell.path) {
+            Some(from) => (
+                lerp_rect(&from.rect, &cell.rect, t),
+                from.depth + (cell.depth as f64 - from.depth) * t,
+                1.0,
+            ),
+            None => {
+                // An arriver: grows out of its own footprint.
+                let grown = 0.7 + 0.3 * t;
+                let rect = MapRect {
+                    x: cell.rect.x + cell.rect.w * (1.0 - grown) * 0.5,
+                    y: cell.rect.y + cell.rect.h * (1.0 - grown) * 0.5,
+                    w: cell.rect.w * grown,
+                    h: cell.rect.h * grown,
+                };
+                (rect, cell.depth as f64, t)
+            }
+        }
+    }
+
     /// Fill the panel with `rect` — what a double-click means: go look at
     /// this one, without re-rooting anything.
     fn fit_rect(&mut self, cx: &mut Cx, rect: Rect) {
@@ -899,6 +1133,7 @@ impl TreemapView {
     fn after_change(&mut self, cx: &mut Cx) {
         self.hover = None;
         self.stale = true;
+        self.totals_dirty = true;
         self.last_layout = None;
         self.save_cache();
         self.redraw(cx);
@@ -922,7 +1157,51 @@ impl TreemapView {
             w: rect.size.x,
             h: rect.size.y,
         };
-        self.cells = treemap::layout(self.focused(), &base, area, viewport, &self.style);
+        // The raised projections lift plates up the screen, so give the
+        // layout a little extra world below the window — otherwise a tower
+        // whose footprint sits just south of the panel could never lean in.
+        let viewport = match self.projection {
+            MapProjection::Flat => viewport,
+            _ => MapRect {
+                h: viewport.h + self.elev(24),
+                ..viewport
+            },
+        };
+        self.cells = treemap::layout(
+            self.focused(),
+            &base,
+            area,
+            viewport,
+            &self.style,
+            self.filter.as_ref(),
+        );
+        self.filtered = self.filter.as_ref().map(|query| {
+            let focused = self.focused();
+            treemap::filtered_size(focused, query, query.name_hits(&focused.name))
+        });
+        self.paint_order = match self.projection {
+            MapProjection::Flat => Vec::new(),
+            MapProjection::Ortho => cascade_order(&self.cells),
+            MapProjection::Persp => raise_order(&self.cells),
+        };
+        // A filter change captured the map as it looked; aim the tween from
+        // there to the layout just built.
+        if let Some(snapshot) = self.tween_capture.take() {
+            let now_here: std::collections::HashSet<&Path> =
+                self.cells.iter().map(|c| c.path.as_path()).collect();
+            self.tween_from = snapshot
+                .iter()
+                .filter(|(cell, _, _)| now_here.contains(cell.path.as_path()))
+                .map(|(cell, rect, depth)| {
+                    (cell.path.clone(), TweenFrom { rect: *rect, depth: *depth })
+                })
+                .collect();
+            self.tween_leavers = snapshot
+                .into_iter()
+                .filter(|(cell, _, _)| !now_here.contains(cell.path.as_path()))
+                .collect();
+            self.tween_start = Some(Instant::now());
+        }
         self.laid_out = rect;
         self.stale = false;
         self.last_layout = Some(Instant::now());
@@ -940,9 +1219,25 @@ impl TreemapView {
         }
     }
 
-    /// The cell under a window point, if any.
+    /// The cell under a window point, if any. In the raised projections the
+    /// test happens on the top faces (plus the riser it stands on), front-most
+    /// first — the reverse of paint order, which is what "front" means.
     fn hit_cell(&self, pos: DVec2) -> Option<usize> {
-        treemap::hit(&self.cells, pos.x, pos.y)
+        if self.projection == MapProjection::Flat || self.paint_order.len() != self.cells.len() {
+            return treemap::hit(&self.cells, pos.x, pos.y);
+        }
+        let rise = self.rise();
+        for &index in self.paint_order.iter().rev() {
+            let cell = &self.cells[index];
+            let mut top = self.project_rect(&cell.rect, self.elev(cell.depth));
+            if self.projection == MapProjection::Ortho {
+                top.h += rise;
+            }
+            if top.contains(pos.x, pos.y) {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// The file or folder under a window point — what a right-click there is
@@ -1001,17 +1296,110 @@ impl TreemapView {
         let hovered = self.hover;
         let picked = self.pick.as_ref().map(|p| p.path.clone());
         let mut labels: Vec<Label> = Vec::new();
+        let t = self.tween_t();
+        let raised = self.projection != MapProjection::Flat;
+        let rise = self.rise();
 
         cx.push_clip_rect(clip);
         self.draw_tile.begin_many_instances(cx);
-        for (index, cell) in self.cells.iter().enumerate() {
+
+        // Whatever the filter just dismissed fades out where it stood,
+        // under everything that is staying.
+        if let Some(t) = t {
+            let ghost = (1.0 - t) as f32 * 0.9;
+            for index in 0..self.tween_leavers.len() {
+                let (rect, depth) = {
+                    let (_, r, d) = &self.tween_leavers[index];
+                    (*r, *d)
+                };
+                let (fill, _) = {
+                    let (cell, _, _) = &self.tween_leavers[index];
+                    self.tile_colors(cell, palette)
+                };
+                let z = if raised { self.elev_f(depth) } else { 0.0 };
+                let top = self.project_rect(&rect, z);
+                self.draw_tile.color = fade(fill, ghost);
+                self.draw_tile.edge = fade(border_ink, ghost);
+                self.draw_tile.cushion = 0.0;
+                self.draw_tile.border = 0.5;
+                self.draw_tile.draw_abs(
+                    cx,
+                    Rect {
+                        pos: dvec2(top.x, top.y),
+                        size: dvec2(top.w, top.h),
+                    },
+                );
+            }
+        }
+
+        let order: Vec<usize> = if self.paint_order.len() == self.cells.len() {
+            self.paint_order.clone()
+        } else {
+            (0..self.cells.len()).collect()
+        };
+        for &index in &order {
+            let cell = &self.cells[index];
+            let (vrect, vdepth, alpha) = self.tweened(cell, t);
+            let alpha = alpha as f32;
+            if alpha <= 0.02 {
+                continue;
+            }
+            let z = if raised { self.elev_f(vdepth) } else { 0.0 };
+            let top = self.project_rect(&vrect, z);
             let rect = Rect {
-                pos: dvec2(cell.rect.x, cell.rect.y),
-                size: dvec2(cell.rect.w, cell.rect.h),
+                pos: dvec2(top.x, top.y),
+                size: dvec2(top.w, top.h),
             };
+            let cell = &self.cells[index];
             let (fill, cushion) = self.tile_colors(cell, palette);
             let is_hover = Some(index) == hovered;
             let is_pick = picked.as_deref() == Some(cell.path.as_path()) && !cell.is_bundle();
+
+            // The prism's body, under its own plate but over everything
+            // already painted — which is exactly what one shared instance
+            // batch in paint order gives.
+            match self.projection {
+                MapProjection::Flat => {}
+                MapProjection::Ortho if z > 0.0 => {
+                    // The riser: the face between this plate and the plateau
+                    // it stands on. This is where "height means depth" is
+                    // actually visible.
+                    self.draw_tile.color = fade(scale_rgb(fill, 0.42), alpha);
+                    self.draw_tile.edge = fade(border_ink, alpha);
+                    self.draw_tile.cushion = 0.0;
+                    self.draw_tile.border = 0.0;
+                    self.draw_tile.draw_abs(
+                        cx,
+                        Rect {
+                            pos: dvec2(top.x, top.y + top.h),
+                            size: dvec2(top.w, rise),
+                        },
+                    );
+                }
+                MapProjection::Ortho => {}
+                MapProjection::Persp => {
+                    // A soft drop shadow sells the altitude the parallax
+                    // implies; it grows with elevation.
+                    let lift = 1.5 + z * 0.05;
+                    self.draw_tile.color = Vec4f {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                        w: 0.32 * alpha,
+                    };
+                    self.draw_tile.edge = Vec4f::default();
+                    self.draw_tile.cushion = 0.0;
+                    self.draw_tile.border = 0.0;
+                    self.draw_tile.draw_abs(
+                        cx,
+                        Rect {
+                            pos: dvec2(top.x + lift * 0.6, top.y + lift),
+                            size: dvec2(top.w, top.h),
+                        },
+                    );
+                }
+            }
+
             // Hover is the outline only — a bright border flash, never a
             // relit tile: on a dense map a whole rectangle changing value
             // under the pointer reads as the data changing.
@@ -1020,21 +1408,24 @@ impl TreemapView {
             // with a one-point border on every side is all border. So it
             // scales with the tile and simply stops existing on the small
             // ones, where the cushion's own shading does the separating.
-            let short = cell.rect.short_side();
+            let short = top.short_side();
             let border = if is_pick || is_hover {
                 1.5
             } else {
                 (short * 0.14).min(1.0)
             };
             let cushion = cushion * (CUSHION_FULL_AT / short.max(4.0)).clamp(0.30, 1.0) as f32;
-            self.draw_tile.color = fill;
-            self.draw_tile.edge = if is_pick {
-                accent
-            } else if is_hover {
-                bright
-            } else {
-                border_ink
-            };
+            self.draw_tile.color = fade(fill, alpha);
+            self.draw_tile.edge = fade(
+                if is_pick {
+                    accent
+                } else if is_hover {
+                    bright
+                } else {
+                    border_ink
+                },
+                alpha,
+            );
             self.draw_tile.cushion = cushion;
             self.draw_tile.border = border as f32;
             self.draw_tile.draw_abs(cx, rect);
@@ -1053,17 +1444,29 @@ impl TreemapView {
             if clamped && rect.pos.y + rect.size.y - clip.pos.y < 40.0 {
                 continue;
             }
-            if cell.is_group && cell.header > 0.0 {
+            if cell.is_group
+                && cell.header > 0.0
+                && !(self.projection == MapProjection::Persp && cell.depth >= 2)
+            {
+                // Deep plates in perspective swell over their neighbours'
+                // label strips; those names go quiet and live on the tooltip.
                 // A group's name goes in the strip it reserved for it, which
                 // is the only place on a group that its children are not
                 // about to be drawn over — clamped on top of them when the
-                // strip itself has slid off.
+                // strip itself has slid off. In the raised projections the
+                // children float up over that strip, so the name moves to
+                // the plate's *bottom* edge, which the lift exposes instead.
+                let at_y = if raised {
+                    (rect.pos.y + rect.size.y - 13.0).min(clip.pos.y + clip.size.y - 13.0)
+                } else {
+                    (rect.pos.y + 1.0).max(clip.pos.y + 1.0)
+                };
                 labels.push(Label {
-                    at: dvec2(at_x, (rect.pos.y + 1.0).max(clip.pos.y + 1.0)),
+                    at: dvec2(at_x, at_y),
                     room,
                     line: format!("{}  {}", cell.name, treemap::format_bytes(cell.size)),
                     below: None,
-                    ink: bright,
+                    ink: fade(bright, alpha),
                 });
             } else if !cell.is_group
                 && rect.size.x >= LABEL_MIN.x
@@ -1075,7 +1478,7 @@ impl TreemapView {
                     room,
                     line: cell.name.clone(),
                     below: two_lines.then(|| treemap::format_bytes(cell.size)),
-                    ink: ink_dark,
+                    ink: fade(ink_dark, alpha),
                 });
             }
         }
@@ -1085,7 +1488,15 @@ impl TreemapView {
         // thing you are about to delete must be findable even when it is a
         // folder whose children cover it.
         if let Some(path) = &picked {
-            if let Some(cell) = self.cells.iter().find(|c| &c.path == path && !c.is_bundle()) {
+            let found = self
+                .cells
+                .iter()
+                .position(|c| &c.path == path && !c.is_bundle());
+            if let Some(index) = found {
+                let cell = &self.cells[index];
+                let (vrect, vdepth, _) = self.tweened(cell, t);
+                let z = if raised { self.elev_f(vdepth) } else { 0.0 };
+                let top = self.project_rect(&vrect, z);
                 self.draw_tile.color = Vec4f { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
                 self.draw_tile.edge = accent;
                 self.draw_tile.cushion = 0.0;
@@ -1093,8 +1504,8 @@ impl TreemapView {
                 self.draw_tile.draw_abs(
                     cx,
                     Rect {
-                        pos: dvec2(cell.rect.x, cell.rect.y),
-                        size: dvec2(cell.rect.w, cell.rect.h),
+                        pos: dvec2(top.x, top.y),
+                        size: dvec2(top.w, top.h),
                     },
                 );
             }
@@ -1146,6 +1557,25 @@ impl TreemapView {
             self.draw_bold.color = accent;
             self.draw_bold.draw_abs(cx, dvec2(right, strip.pos.y + 4.0), word);
             self.rescan_hit = Rect {
+                pos: dvec2(right - 4.0, strip.pos.y),
+                size: dvec2(width + 8.0, strip.size.y),
+            };
+            right -= 14.0;
+        }
+        // The active filter is never invisible: while one is on, the strip
+        // says what it matched and offers the way out.
+        self.filter_hit = Rect::default();
+        if let Some((bytes, _)) = self.filter_matched() {
+            let chip = format!(
+                "matching {} of {} · clear",
+                treemap::format_bytes(bytes),
+                treemap::format_bytes(self.focused().size),
+            );
+            let width = text_width(&self.draw_bold, cx, &chip);
+            right -= width;
+            self.draw_bold.color = accent;
+            self.draw_bold.draw_abs(cx, dvec2(right, strip.pos.y + 4.0), &chip);
+            self.filter_hit = Rect {
                 pos: dvec2(right - 4.0, strip.pos.y),
                 size: dvec2(width + 8.0, strip.size.y),
             };
@@ -1299,8 +1729,15 @@ impl TreemapView {
             },
             if cell.pending { " · still scanning" } else { "" },
         );
-        let anchor = dvec2(cell.rect.x, cell.rect.y);
-        let cell_h = cell.rect.h;
+        let top = self.project_rect(
+            &cell.rect,
+            match self.projection {
+                MapProjection::Flat => 0.0,
+                _ => self.elev(cell.depth),
+            },
+        );
+        let anchor = dvec2(top.x, top.y);
+        let cell_h = top.h;
 
         let width = text_width(&self.draw_bold, cx, &head)
             .max(text_width(&self.draw_text, cx, &foot))
@@ -1344,6 +1781,13 @@ impl TreemapView {
     }
 
     fn press(&mut self, cx: &mut Cx, at: DVec2, taps: u32, primary: bool) {
+        if self.filter_hit.contains(at) {
+            if primary {
+                self.set_filter(cx, None);
+                cx.widget_action(self.uid, TreemapAction::FilterCleared);
+            }
+            return;
+        }
         if self.rescan_hit.contains(at) {
             if primary {
                 self.rescan(cx);
@@ -1468,16 +1912,31 @@ impl Widget for TreemapView {
         self.draw_labels(cx, labels, body);
         self.draw_tooltip(cx, body, palette);
 
+        // A running tween owns the frame clock; the frame after it ends
+        // draws the exact target state, and only then is it let go of.
+        if self.tween_t().is_some() {
+            self.frame = cx.new_next_frame();
+        } else if self.tween_start.is_some() {
+            self.tween_start = None;
+            self.tween_from.clear();
+            self.tween_leavers.clear();
+        }
+
         cx.add_aligned_rect_area(&mut self.area, rect);
         DrawStep::done()
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
-        if self.frame.is_event(event).is_some() && self.stale {
-            if self.layout_is_due() {
+        if self.frame.is_event(event).is_some() {
+            if self.tween_t().is_some() {
                 self.redraw(cx);
-            } else {
-                self.frame = cx.new_next_frame();
+            }
+            if self.stale {
+                if self.layout_is_due() {
+                    self.redraw(cx);
+                } else {
+                    self.frame = cx.new_next_frame();
+                }
             }
         }
         match event.hits(cx, self.area) {
@@ -1592,6 +2051,32 @@ impl TreemapViewRef {
         }
     }
 
+    /// Re-open the current root under the current scan rules, cache welcome.
+    pub fn remap(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.remap(cx);
+        }
+    }
+
+    /// Choose how the map projects: flat, extruded, or perspective.
+    pub fn set_projection(&self, cx: &mut Cx, projection: MapProjection) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_projection(cx, projection);
+        }
+    }
+
+    /// Apply (or clear, with None) the live filter.
+    pub fn set_filter(&self, cx: &mut Cx, filter: Option<Query>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_filter(cx, filter);
+        }
+    }
+
+    /// Bytes per kind tag under the mapped folder, for the legend.
+    pub fn kind_totals(&self, _cx: &mut Cx) -> [u64; 16] {
+        self.borrow_mut().map(|mut i| i.kind_totals()).unwrap_or([0; 16])
+    }
+
     /// Fold finished moves and deletes into the map rather than rescanning.
     pub fn absorb_moves(&self, cx: &mut Cx, moves: &[(PathBuf, Option<PathBuf>)]) {
         if let Some(mut inner) = self.borrow_mut() {
@@ -1642,6 +2127,58 @@ fn pick_of(cell: &Cell) -> Pick {
         is_dir: cell.is_dir,
         bundle: cell.extra,
     }
+}
+
+fn lerp_rect(a: &MapRect, b: &MapRect, t: f64) -> MapRect {
+    MapRect {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        w: a.w + (b.w - a.w) * t,
+        h: a.h + (b.h - a.h) * t,
+    }
+}
+
+/// The paint order for the vertically-extruded map: everything only ever
+/// leans *north* (up the screen), so a cell may only cover cells above it —
+/// paint north before south. Nesting still means "parent under child", so
+/// the sort happens among siblings and each subtree stays together. The
+/// input is the layout's pre-order, which keeps every subtree contiguous.
+fn cascade_order(cells: &[Cell]) -> Vec<usize> {
+    fn emit(cells: &[Cell], start: usize, end: usize, depth: usize, out: &mut Vec<usize>) {
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut i = start;
+        while i < end {
+            let s = i;
+            i += 1;
+            while i < end && cells[i].depth > depth {
+                i += 1;
+            }
+            blocks.push((s, i));
+        }
+        blocks.sort_by(|a, b| {
+            cells[a.0]
+                .rect
+                .y
+                .partial_cmp(&cells[b.0].rect.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (s, e) in blocks {
+            out.push(s);
+            emit(cells, s + 1, e, depth + 1, out);
+        }
+    }
+    let mut out = Vec::with_capacity(cells.len());
+    emit(cells, 0, cells.len(), 0, &mut out);
+    out
+}
+
+/// The paint order for the perspective map: nothing at a lower elevation can
+/// ever be in front of something higher under a straight-down eye, so floor
+/// to sky is correct. Stable, so the layout's order settles equal depths.
+fn raise_order(cells: &[Cell]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..cells.len()).collect();
+    order.sort_by_key(|&i| cells[i].depth);
+    order
 }
 
 /// `a` over `b` at `t`, in premultiplication-free straight colour.
@@ -1787,6 +2324,48 @@ mod tests {
         let archive = kind_class(FileKind::Archive);
         assert_ne!(video, image);
         assert_ne!(image, archive);
+    }
+
+    fn cell(name: &str, depth: usize, y: f64) -> Cell {
+        Cell {
+            path: PathBuf::from(format!("/{name}")),
+            name: name.to_string(),
+            size: 1,
+            files: 1,
+            is_dir: true,
+            kind: 0,
+            depth,
+            rect: MapRect { x: 0.0, y, w: 10.0, h: 10.0 },
+            is_group: true,
+            header: 0.0,
+            pending: false,
+            extra: 0,
+        }
+    }
+
+    // The rule that makes the extruded map paint correctly: everything only
+    // ever leans north, so north paints first — among siblings, with each
+    // subtree kept together and parents under their children.
+    #[test]
+    fn the_cascade_paints_north_before_south_and_parents_before_children() {
+        // Pre-order: P(y=50) with children c1(y=90), c2(y=60); then Q(y=0).
+        let cells = vec![
+            cell("p", 0, 50.0),
+            cell("c1", 1, 90.0),
+            cell("c2", 1, 60.0),
+            cell("q", 0, 0.0),
+        ];
+        let order = cascade_order(&cells);
+        let names: Vec<&str> = order.iter().map(|&i| cells[i].name.as_str()).collect();
+        assert_eq!(names, vec!["q", "p", "c2", "c1"]);
+    }
+
+    #[test]
+    fn the_perspective_paints_floor_to_sky() {
+        let cells = vec![cell("deep", 3, 0.0), cell("shallow", 0, 50.0), cell("mid", 1, 9.0)];
+        let order = raise_order(&cells);
+        let depths: Vec<usize> = order.iter().map(|&i| cells[i].depth).collect();
+        assert_eq!(depths, vec![0, 1, 3]);
     }
 
     // The bundle rectangle carries a kind no palette class answers to, and it

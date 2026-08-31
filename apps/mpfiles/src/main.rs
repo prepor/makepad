@@ -57,6 +57,7 @@ use crate::{
     preview::{Preview, PreviewHost},
     rename::BatchMode,
     theme::Palette,
+    treemap_view::MapProjection,
     vfs::vfs,
 };
 
@@ -201,6 +202,53 @@ script_mod! {
             draw_text +: {
                 color: mod.mpf.fg
                 text_style: theme.font_regular{font_size: 10.0}
+            }
+        }
+    }
+
+    /** One row of the filter popup's legend: swatch, kind, live bytes.
+     * Clicking it IS the filter toggle for that kind. */
+    let LegendRow = SolidView{
+        width: Fill
+        height: 22
+        flow: Right
+        spacing: 8
+        padding: Inset{left: 8 right: 8}
+        align: Align{y: 0.5}
+        cursor: MouseCursor.Hand
+        draw_bg +: {color: #00000000}
+        lg_swatch := SolidView{
+            width: 10
+            height: 10
+            draw_bg +: {color: #x565f89}
+        }
+        lg_name := Label{
+            width: Fill
+            draw_text +: {
+                color: mod.mpf.fg
+                text_style: theme.font_regular{font_size: 9.5}
+            }
+        }
+        lg_bytes := Label{
+            draw_text +: {
+                color: mod.mpf.fg_dim
+                text_style: theme.font_regular{font_size: 9.5}
+            }
+        }
+    }
+
+    /** One "modified within" choice. */
+    let AgeChip = SolidView{
+        width: Fit
+        height: 20
+        padding: Inset{left: 5 right: 5}
+        align: Align{y: 0.5}
+        cursor: MouseCursor.Hand
+        draw_bg +: {color: #00000000}
+        chip_label := Label{
+            draw_text +: {
+                color: mod.mpf.fg_dim
+                text_style: theme.font_regular{font_size: 9.0}
             }
         }
     }
@@ -538,6 +586,24 @@ script_mod! {
                                     }
                                 }
                             }
+                            treemap25_button := ToolButton{
+                                Icon{
+                                    icon_walk: Walk{width: 15 height: 15}
+                                    draw_icon +: {
+                                        svg: crate_resource("self://resources/icons/treemap25.svg")
+                                        color: mod.mpf.fg
+                                    }
+                                }
+                            }
+                            treemap3d_button := ToolButton{
+                                Icon{
+                                    icon_walk: Walk{width: 15 height: 15}
+                                    draw_icon +: {
+                                        svg: crate_resource("self://resources/icons/treemap3d.svg")
+                                        color: mod.mpf.fg
+                                    }
+                                }
+                            }
 
                             View{width: 6 height: 1}
 
@@ -811,6 +877,16 @@ script_mod! {
                                             }
                                         }
                                     }
+                                    View{width: 10 height: 1}
+                                    map_filter := ToolButton{
+                                        map_filter_icon := Icon{
+                                            icon_walk: Walk{width: 15 height: 15}
+                                            draw_icon +: {
+                                                svg: crate_resource("self://resources/icons/filter.svg")
+                                                color: mod.mpf.fg
+                                            }
+                                        }
+                                    }
                                     map_tools_hint := Label{
                                         width: Fill
                                         max_lines: 1
@@ -821,6 +897,9 @@ script_mod! {
                                             color: mod.mpf.fg_dim
                                             text_style: theme.font_regular{font_size: 8.5}
                                         }
+                                    }
+                                    map_scan_all := CheckBox{
+                                        text: "ignore system"
                                     }
                                 }
                                 contents := mod.widgets.FileContents{}
@@ -979,6 +1058,92 @@ script_mod! {
                             menu_modified := MenuRow{}
                             menu_created := MenuRow{}
                             menu_permissions := MenuRow{}
+                        }
+                    }
+
+                    filter_popup := View{
+                        visible: false
+                        width: Fill
+                        height: Fill
+                        align: Align{x: 0.0 y: 0.0}
+                        padding: Inset{left: 340 top: 96}
+                        filter_panel := RectView{
+                            width: 300
+                            height: Fit
+                            flow: Down
+                            spacing: 6
+                            padding: Inset{left: 10 right: 10 top: 10 bottom: 10}
+                            draw_bg +: {
+                                color: mod.mpf.bg_dark
+                                border_color: mod.mpf.muted
+                                border_size: 1.0
+                            }
+                            filter_query := MpfInput{
+                                width: Fill
+                                height: 26
+                                empty_text: "name, .ext, >100mb, <7d"
+                            }
+                            View{
+                                width: Fill
+                                height: Fit
+                                flow: Right
+                                spacing: 8
+                                align: Align{y: 0.5}
+                                filter_size_label := Label{
+                                    width: 118
+                                    text: "any size"
+                                    draw_text +: {
+                                        color: mod.mpf.fg_dim
+                                        text_style: theme.font_regular{font_size: 9.0}
+                                    }
+                                }
+                                filter_size := Slider{
+                                    width: Fill
+                                    height: 18
+                                    text: ""
+                                }
+                            }
+                            filter_age_row := View{
+                                width: Fill
+                                height: Fit
+                                flow: Right
+                                spacing: 2
+                                filter_age_hint := Label{
+                                    margin: Inset{right: 4}
+                                    text: "new:"
+                                    draw_text +: {
+                                        color: mod.mpf.fg_dim
+                                        text_style: theme.font_regular{font_size: 9.0}
+                                    }
+                                }
+                                filter_age0 := AgeChip{chip_label +: {text: "any"}}
+                                filter_age1 := AgeChip{chip_label +: {text: "1d"}}
+                                filter_age2 := AgeChip{chip_label +: {text: "3d"}}
+                                filter_age3 := AgeChip{chip_label +: {text: "1w"}}
+                                filter_age4 := AgeChip{chip_label +: {text: "1mo"}}
+                                filter_age5 := AgeChip{chip_label +: {text: "1y"}}
+                            }
+                            Hr{}
+                            filter_kind0 := LegendRow{}
+                            filter_kind1 := LegendRow{}
+                            filter_kind2 := LegendRow{}
+                            filter_kind3 := LegendRow{}
+                            filter_kind4 := LegendRow{}
+                            filter_kind5 := LegendRow{}
+                            filter_kind6 := LegendRow{}
+                            filter_clear := View{
+                                width: Fill
+                                height: 20
+                                align: Align{x: 1.0 y: 0.5}
+                                cursor: MouseCursor.Hand
+                                clear_label := Label{
+                                    text: "clear all"
+                                    draw_text +: {
+                                        color: mod.mpf.accent
+                                        text_style: theme.font_regular{font_size: 9.0}
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -1296,11 +1461,13 @@ const COLUMN_ROWS: [(&[LiveId], model::SortKey); 5] = [
     (ids!(menu_permissions), model::SortKey::Permissions),
 ];
 
-const MODE_BUTTONS: [(&[LiveId], ViewMode); 4] = [
+const MODE_BUTTONS: [(&[LiveId], ViewMode); 6] = [
     (ids!(icons_button), ViewMode::Icons),
     (ids!(list_button), ViewMode::List),
     (ids!(compact_button), ViewMode::Compact),
     (ids!(treemap_button), ViewMode::Treemap),
+    (ids!(treemap25_button), ViewMode::Treemap25),
+    (ids!(treemap3d_button), ViewMode::Treemap3d),
 ];
 
 /// The tab strip's slots. More tabs than this and the strip would be a
@@ -1447,6 +1614,18 @@ pub struct App {
     quick_look_open: bool,
     #[rust]
     column_menu_open: bool,
+    #[rust]
+    filter_popup_open: bool,
+    /// The "modified within" choice: an index into [`AGE_MINUTES`].
+    #[rust]
+    filter_age: usize,
+    /// Which legend kinds are toggled into the filter.
+    #[rust]
+    filter_kinds: [bool; 7],
+    /// Which kind class each legend row currently shows (rows are sorted by
+    /// bytes, so the mapping moves).
+    #[rust]
+    legend_rows: [usize; 7],
     #[rust]
     props_open: bool,
     #[rust]
@@ -1758,7 +1937,7 @@ impl App {
         let display = path.display().to_string();
         self.status(cx, &format!("Loading {}…", display));
         // The treemap is of a folder, so a new folder means a new map.
-        if self.tabs[self.tab].mode == ViewMode::Treemap {
+        if self.tabs[self.tab].mode.is_treemap() {
             let map = self.with_contents(cx, |contents, cx| contents.treemap(cx));
             if let Some(map) = map {
                 map.set_root(cx, &path);
@@ -1877,7 +2056,7 @@ impl App {
         // about the same selection this line is — so they follow it here.
         self.refresh_chat(cx);
         let mode = self.tabs[self.tab].mode;
-        if mode == ViewMode::Treemap {
+        if mode.is_treemap() {
             let text = self
                 .with_contents(cx, |contents, cx| contents.treemap(cx).status())
                 .unwrap_or_default();
@@ -1978,10 +2157,18 @@ impl App {
             let map = contents.treemap(cx);
             // Scanning a tree is expensive: it only runs while the map is the
             // thing on screen.
-            if mode == ViewMode::Treemap {
+            if mode.is_treemap() {
                 if map.root() != dir {
                     map.set_root(cx, &dir);
                 }
+                map.set_projection(
+                    cx,
+                    match mode {
+                        ViewMode::Treemap25 => MapProjection::Ortho,
+                        ViewMode::Treemap3d => MapProjection::Persp,
+                        _ => MapProjection::Flat,
+                    },
+                );
             } else {
                 map.stop(cx);
             }
@@ -1997,7 +2184,7 @@ impl App {
         // finds the same rectangle still ringed.
         self.ui
             .widget(cx, ids!(map_tools))
-            .set_visible(cx, mode == ViewMode::Treemap);
+            .set_visible(cx, mode.is_treemap());
         self.map_tools_note.clear();
         self.refresh_chat(cx);
     }
@@ -2537,7 +2724,7 @@ impl App {
     /// the cache. The one thing that makes a remembered map safe: it is never
     /// more than a keystroke from being made true.
     fn rescan_map(&mut self, cx: &mut Cx) {
-        if self.tabs[self.tab].mode != ViewMode::Treemap {
+        if !self.tabs[self.tab].mode.is_treemap() {
             self.status(cx, "Rescanning is for the map — Cmd+4 shows it");
             return;
         }
@@ -2548,7 +2735,9 @@ impl App {
     /// Show the entry on the map. The map is of the folder we are in, so this
     /// is a view change plus a highlight — not a search.
     fn reveal_in_treemap(&mut self, cx: &mut Cx, entry: Option<FileEntry>) {
-        self.set_mode(cx, ViewMode::Treemap);
+        if !self.tabs[self.tab].mode.is_treemap() {
+            self.set_mode(cx, ViewMode::Treemap);
+        }
         let Some(entry) = entry else {
             return;
         };
@@ -2996,7 +3185,7 @@ impl App {
             .into_iter()
             .map(|e| e.path)
             .collect();
-        if !paths.is_empty() || self.tabs[self.tab].mode != ViewMode::Treemap {
+        if !paths.is_empty() || !self.tabs[self.tab].mode.is_treemap() {
             return paths;
         }
         self.with_contents(cx, |contents, cx| contents.treemap(cx).selection())
@@ -3087,7 +3276,7 @@ impl App {
             0 => self.status(cx, "Select a file first — F2 renames it"),
             1 => {
                 let path = picked[0].path.clone();
-                if self.tabs[self.tab].mode == ViewMode::Treemap {
+                if self.tabs[self.tab].mode.is_treemap() {
                     self.status(cx, "Renaming needs a list view — Cmd+1, 2 or 3");
                     return;
                 }
@@ -3288,7 +3477,7 @@ impl App {
             }
             // A zoomed treemap is one of the things Escape is on top of: it
             // steps back out one folder before Escape means anything else.
-            if self.tabs[self.tab].mode == ViewMode::Treemap
+            if self.tabs[self.tab].mode.is_treemap()
                 && self
                     .with_contents(cx, |contents, cx| contents.treemap(cx).zoom_out(cx))
                     .unwrap_or(false)
@@ -3302,6 +3491,9 @@ impl App {
             }
             if self.batch_open {
                 return self.close_batch(cx);
+            }
+            if self.filter_popup_open {
+                return self.set_filter_popup(cx, false);
             }
             if self.column_menu_open {
                 return self.set_column_menu(cx, false);
@@ -3376,6 +3568,8 @@ impl App {
                 KeyCode::Key2 => return self.set_mode(cx, ViewMode::List),
                 KeyCode::Key3 => return self.set_mode(cx, ViewMode::Compact),
                 KeyCode::Key4 => return self.set_mode(cx, ViewMode::Treemap),
+                KeyCode::Key5 => return self.set_mode(cx, ViewMode::Treemap25),
+                KeyCode::Key6 => return self.set_mode(cx, ViewMode::Treemap3d),
                 _ => {}
             }
         }
@@ -3406,7 +3600,7 @@ impl App {
         // On the map, Enter zooms into the picked folder and Backspace steps
         // back out of one — the same pair the list view uses for open and go
         // up, meaning the same two things one level in.
-        if self.tabs[self.tab].mode == ViewMode::Treemap {
+        if self.tabs[self.tab].mode.is_treemap() {
             match event.key_code {
                 KeyCode::ReturnKey | KeyCode::NumpadEnter => {
                     if self
@@ -3545,34 +3739,19 @@ impl App {
             // on screen and what was picked, which is more than one entry's
             // description and never goes stale behind it.
             FileContentsAction::Selected(entry) => {
-                if self.tabs[self.tab].mode == ViewMode::Treemap {
+                if self.tabs[self.tab].mode.is_treemap() {
                     self.report(cx)
                 } else {
                     self.describe(cx, &entry)
                 }
             }
             FileContentsAction::Sorted | FileContentsAction::Restated => self.report(cx),
+            FileContentsAction::MapFilterCleared => self.reset_filter_controls(cx),
             FileContentsAction::Renamed(path, name) => self.commit_rename(cx, path, name),
             FileContentsAction::RenameCancelled => self.report(cx),
             FileContentsAction::Dropped(paths, at) => self.handle_drop(cx, paths, at),
             FileContentsAction::NeedChildren(folder) => self.request_children(cx, folder),
             FileContentsAction::Context { at, entry } => self.open_menu(cx, at, entry),
-            FileContentsAction::Drill(path) => {
-                let folder = if vfs().is_dir(&path) {
-                    path.clone()
-                } else {
-                    path.parent().map(Path::to_path_buf).unwrap_or_default()
-                };
-                if vfs().is_dir(&folder) {
-                    // Arriving with the file already picked out: the point of
-                    // asking the map to take you somewhere is to look at the
-                    // one thing you were pointing at.
-                    if folder != path {
-                        self.pending_select = vec![path];
-                    }
-                    self.navigate(cx, folder, true);
-                }
-            }
         }
     }
 }
@@ -3770,7 +3949,7 @@ impl App {
             dir.display(),
             mode.label(),
         );
-        if mode == ViewMode::Treemap {
+        if mode.is_treemap() {
             let map = self.with_contents(cx, |contents, cx| {
                 let map = contents.treemap(cx);
                 (map.selection(), map.status())
@@ -3823,7 +4002,7 @@ impl App {
                     .set_text(cx, &about);
             }
         }
-        if mode != ViewMode::Treemap {
+        if !mode.is_treemap() {
             return;
         }
         let note = match &picked {
@@ -3868,7 +4047,7 @@ impl App {
     /// What "this" means right now: the map's pick on the map, the listing's
     /// selection anywhere else.
     fn chat_subject(&mut self, cx: &mut Cx) -> Option<PathBuf> {
-        if self.tabs[self.tab].mode == ViewMode::Treemap {
+        if self.tabs[self.tab].mode.is_treemap() {
             return self
                 .with_contents(cx, |contents, cx| contents.treemap(cx).selection())
                 .flatten();
@@ -4087,11 +4266,29 @@ impl App {
     /// permanent delete included, which still asks once and acts on the second
     /// press.
     fn handle_map_tool_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self.tabs[self.tab].mode != ViewMode::Treemap {
+        if !self.tabs[self.tab].mode.is_treemap() {
             return;
         }
         if self.ui.view(cx, ids!(map_rescan)).finger_down(actions).is_some() {
             return self.rescan_map(cx);
+        }
+        if self.ui.view(cx, ids!(map_filter)).finger_down(actions).is_some() {
+            let open = !self.filter_popup_open;
+            return self.set_filter_popup(cx, open);
+        }
+        if let Some(ignore) = self.ui.check_box(cx, ids!(map_scan_all)).changed(actions) {
+            // Checked means today's behaviour: leave the system folders out.
+            crate::model::set_scan_all(!ignore);
+            self.status(
+                cx,
+                if ignore {
+                    "System folders excluded again — rescanning"
+                } else {
+                    "Measuring system folders too — macOS will ask permission per folder"
+                },
+            );
+            self.with_contents(cx, |contents, cx| contents.treemap(cx).remap(cx));
+            return;
         }
         let trash = self.ui.view(cx, ids!(map_trash)).finger_down(actions).is_some();
         let erase = self.ui.view(cx, ids!(map_erase)).finger_down(actions).is_some();
@@ -4108,6 +4305,258 @@ impl App {
             self.delete_forever(cx);
         }
     }
+
+    // ------------------------------------------------------- the map filter
+
+    fn set_filter_popup(&mut self, cx: &mut Cx, open: bool) {
+        self.filter_popup_open = open;
+        self.ui.widget(cx, ids!(filter_popup)).set_visible(cx, open);
+        if open {
+            self.refresh_filter_popup(cx);
+            self.ui.text_input(cx, ids!(filter_query)).set_key_focus(cx);
+        }
+        self.ui.redraw(cx);
+    }
+
+    /// The legend half of the popup: swatches in the map's own hues, live
+    /// byte totals per kind, heaviest first, zero kinds dimmed but present —
+    /// it doubles as the map's colour key.
+    fn refresh_filter_popup(&mut self, cx: &mut Cx) {
+        let totals = self
+            .with_contents(cx, |contents, cx| contents.treemap(cx).kind_totals(cx))
+            .unwrap_or([0; 16]);
+        let mut classes: Vec<(usize, u64)> = (0..7)
+            .map(|class| {
+                let bytes = class_kind_values(class)
+                    .iter()
+                    .map(|&kind| totals[kind as usize])
+                    .sum();
+                (class, bytes)
+            })
+            .collect();
+        classes.sort_by(|a, b| b.1.cmp(&a.1));
+        let palette = Palette::shared();
+        for (row, &(class, bytes)) in classes.iter().enumerate() {
+            self.legend_rows[row] = class;
+            let mut widget = self.ui.widget(cx, FILTER_KIND_IDS[row]);
+            let selected = self.filter_kinds[class];
+            let swatch = palette.kind_color(class);
+            let row_bg = if selected {
+                let mut tint = Palette::vec4(&palette.accent);
+                tint.w = 0.22;
+                tint
+            } else {
+                Vec4f::default()
+            };
+            let ink = if bytes == 0 && !selected {
+                Palette::vec4(&palette.fg_dim)
+            } else {
+                Palette::vec4(&palette.fg)
+            };
+            script_apply_eval!(cx, widget, {
+                draw_bg +: { color: #(row_bg) }
+            });
+            let mut swatch_view = widget.widget(cx, ids!(lg_swatch));
+            script_apply_eval!(cx, swatch_view, {
+                draw_bg +: { color: #(swatch) }
+            });
+            let mut name = widget.label(cx, ids!(lg_name));
+            name.set_text(cx, CLASS_NAMES[class]);
+            script_apply_eval!(cx, name, {
+                draw_text +: { color: #(ink) }
+            });
+            widget
+                .label(cx, ids!(lg_bytes))
+                .set_text(cx, &treemap::format_bytes(bytes));
+        }
+        self.style_filter_age(cx);
+    }
+
+    fn style_filter_age(&mut self, cx: &mut Cx) {
+        let palette = Palette::shared();
+        for (index, id) in FILTER_AGE_IDS.iter().enumerate() {
+            let mut widget = self.ui.widget(cx, id);
+            let on = index == self.filter_age;
+            let bg = if on {
+                let mut tint = Palette::vec4(&palette.accent);
+                tint.w = 0.22;
+                tint
+            } else {
+                Vec4f::default()
+            };
+            let ink = if on {
+                Palette::vec4(&palette.fg_bright)
+            } else {
+                Palette::vec4(&palette.fg_dim)
+            };
+            script_apply_eval!(cx, widget, {
+                draw_bg +: { color: #(bg) }
+            });
+            let mut label = widget.label(cx, ids!(chip_label));
+            script_apply_eval!(cx, label, {
+                draw_text +: { color: #(ink) }
+            });
+        }
+    }
+
+    /// Everything the popup says, folded into one query and applied live.
+    fn rebuild_filter(&mut self, cx: &mut Cx) {
+        let text = self.ui.text_input(cx, ids!(filter_query)).text();
+        let now_min = now_minutes();
+        let mut query = treemap::Query::parse(&text, now_min);
+        let slid = self.ui.slider(cx, ids!(filter_size)).value().unwrap_or(0.0);
+        match slider_bytes(slid) {
+            Some(bytes) => {
+                query.min_size = Some(query.min_size.map_or(bytes, |q| q.max(bytes)));
+                self.ui.label(cx, ids!(filter_size_label)).set_text(
+                    cx,
+                    &format!("bigger than {}", treemap::format_bytes(bytes)),
+                );
+            }
+            None => {
+                self.ui
+                    .label(cx, ids!(filter_size_label))
+                    .set_text(cx, "any size");
+            }
+        }
+        if self.filter_age > 0 {
+            let cutoff = now_min.saturating_sub(AGE_MINUTES[self.filter_age]);
+            query.newer_than = Some(query.newer_than.map_or(cutoff, |q| q.max(cutoff)));
+        }
+        if self.filter_kinds.iter().any(|&on| on) {
+            let mask = (0..7)
+                .filter(|&class| self.filter_kinds[class])
+                .fold(0u16, |mask, class| mask | class_kinds_mask(class));
+            query.kinds = Some(mask);
+        }
+        self.with_contents(cx, |contents, cx| {
+            contents.treemap(cx).set_filter(cx, Some(query));
+        });
+    }
+
+    /// Show every control cleared — the map itself is already unfiltered.
+    fn reset_filter_controls(&mut self, cx: &mut Cx) {
+        self.filter_age = 0;
+        self.filter_kinds = [false; 7];
+        self.ui.text_input(cx, ids!(filter_query)).set_text(cx, "");
+        self.ui.slider(cx, ids!(filter_size)).set_value(cx, 0.0);
+        self.ui
+            .label(cx, ids!(filter_size_label))
+            .set_text(cx, "any size");
+        if self.filter_popup_open {
+            self.refresh_filter_popup(cx);
+        }
+    }
+
+    fn handle_filter_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if !self.filter_popup_open {
+            return;
+        }
+        let mut dirty = false;
+        if self
+            .ui
+            .text_input(cx, ids!(filter_query))
+            .changed(actions)
+            .is_some()
+        {
+            dirty = true;
+        }
+        if self.ui.slider(cx, ids!(filter_size)).slided(actions).is_some() {
+            dirty = true;
+        }
+        for (index, id) in FILTER_AGE_IDS.iter().enumerate() {
+            if self.ui.view(cx, id).finger_down(actions).is_some() {
+                self.filter_age = index;
+                self.style_filter_age(cx);
+                dirty = true;
+            }
+        }
+        for row in 0..FILTER_KIND_IDS.len() {
+            if self
+                .ui
+                .view(cx, FILTER_KIND_IDS[row])
+                .finger_down(actions)
+                .is_some()
+            {
+                let class = self.legend_rows[row];
+                self.filter_kinds[class] = !self.filter_kinds[class];
+                self.refresh_filter_popup(cx);
+                dirty = true;
+            }
+        }
+        if self.ui.view(cx, ids!(filter_clear)).finger_down(actions).is_some() {
+            self.reset_filter_controls(cx);
+            self.with_contents(cx, |contents, cx| {
+                contents.treemap(cx).set_filter(cx, None);
+            });
+            return;
+        }
+        if dirty {
+            self.rebuild_filter(cx);
+        }
+    }
+}
+
+/// The filter popup's row slots.
+const FILTER_AGE_IDS: [&[LiveId]; 6] = [
+    ids!(filter_age0),
+    ids!(filter_age1),
+    ids!(filter_age2),
+    ids!(filter_age3),
+    ids!(filter_age4),
+    ids!(filter_age5),
+];
+const FILTER_KIND_IDS: [&[LiveId]; 7] = [
+    ids!(filter_kind0),
+    ids!(filter_kind1),
+    ids!(filter_kind2),
+    ids!(filter_kind3),
+    ids!(filter_kind4),
+    ids!(filter_kind5),
+    ids!(filter_kind6),
+];
+/// "modified within", in minutes; index 0 is "any age".
+const AGE_MINUTES: [u32; 6] = [0, 1_440, 4_320, 10_080, 43_200, 525_600];
+const CLASS_NAMES: [&str; 7] =
+    ["Video", "Images", "Audio", "Code", "Docs", "Archives", "Other"];
+
+/// The `FileKind`s behind one legend class — the exact inverse of
+/// `treemap_view::kind_class`, asserted so in a test below.
+fn class_kind_values(class: usize) -> &'static [crate::model::FileKind] {
+    use crate::model::FileKind::*;
+    match class {
+        0 => &[Video],
+        1 => &[Image],
+        2 => &[Audio],
+        3 => &[Code],
+        4 => &[Text, Pdf],
+        5 => &[Archive],
+        _ => &[Generic, Folder],
+    }
+}
+
+fn class_kinds_mask(class: usize) -> u16 {
+    class_kind_values(class)
+        .iter()
+        .fold(0u16, |mask, &kind| mask | 1 << (kind as u16))
+}
+
+/// The size slider's sweep: off at the left edge, then a logarithmic run
+/// from 1 KB to 10 GB — the range disk questions actually live in.
+fn slider_bytes(value: f64) -> Option<u64> {
+    if value <= 0.02 {
+        return None;
+    }
+    let t = ((value - 0.02) / 0.98).clamp(0.0, 1.0);
+    Some((1_000.0 * 10f64.powf(7.0 * t)) as u64)
+}
+
+/// Now, in whole minutes since the epoch — the clock the age filter runs on.
+fn now_minutes() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 60).min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
 }
 
 /// How many times the model may go round the look-then-think loop for one
@@ -4155,6 +4604,11 @@ impl MatchEvent for App {
         // Checked once: a warm-pool instance stays dormant until
         // `WmEvent::Adopted` or a real input wakes it (see `Dormancy`).
         self.dormancy = Dormancy::start(mp_wm_api::warm_start());
+        // The scan-scope checkbox shows the saved choice from the first
+        // frame; checked means the system folders stay out.
+        self.ui
+            .check_box(cx, ids!(map_scan_all))
+            .set_active(cx, !crate::model::scan_all(), Animate::No);
         // `--demo` browses a home that does not exist, so a screen recording
         // can show every feature of this app without showing anybody's disk.
         // It is chosen before anything reads a path, and never afterwards.
@@ -4280,6 +4734,7 @@ impl MatchEvent for App {
             }
         }
         self.handle_map_tool_actions(cx, actions);
+        self.handle_filter_actions(cx, actions);
         for (id, mode) in MODE_BUTTONS {
             if self.ui.view(cx, id).finger_down(actions).is_some() {
                 self.set_mode(cx, mode);
@@ -4506,7 +4961,7 @@ impl AppMain for App {
                 contents.drain_thumbs(cx);
                 contents.treemap(cx).drain(cx)
             });
-            if self.tabs.get(self.tab).map(|t| t.mode) == Some(ViewMode::Treemap) {
+            if self.tabs.get(self.tab).is_some_and(|t| t.mode.is_treemap()) {
                 self.report(cx);
             }
             self.drain_chat(cx);
@@ -4586,5 +5041,31 @@ mod dormancy_tests {
         assert!(is_wake_input(&Event::KeyDown(KeyEvent::default())));
         assert!(dormancy.wake());
         assert!(!dormancy.is_dormant());
+    }
+
+    // The legend's classes and the map's kind_class must be exact inverses,
+    // or a chip would tint tiles it cannot filter.
+    #[test]
+    fn every_kind_belongs_to_the_class_that_claims_it() {
+        use crate::model::FileKind;
+        for kind in [
+            FileKind::Folder,
+            FileKind::Image,
+            FileKind::Text,
+            FileKind::Code,
+            FileKind::Audio,
+            FileKind::Video,
+            FileKind::Archive,
+            FileKind::Pdf,
+            FileKind::Generic,
+        ] {
+            let class = crate::treemap_view::kind_class(kind) as usize;
+            assert!(
+                class_kind_values(class).contains(&kind),
+                "{kind:?} paints as class {class} but the legend chip for it filters {:?}",
+                class_kind_values(class),
+            );
+            assert!(class_kinds_mask(class) & (1 << (kind as u16)) != 0);
+        }
     }
 }

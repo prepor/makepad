@@ -925,6 +925,7 @@ fn scan_vnode(
         }
         Node {
             files: children.iter().map(|c| c.files).sum(),
+            modified: children.iter().map(|c| c.modified).max().unwrap_or(0),
             name: node.name.clone(),
             is_dir: true,
             done: true,
@@ -936,7 +937,7 @@ fn scan_vnode(
     } else {
         total.files += 1;
         total.bytes += node.size;
-        Node::file(node.name.clone(), kind, node.size)
+        Node::file_at(node.name.clone(), kind, node.size, (node.modified_secs / 60) as u32)
     };
     // Reported at most once every `SCAN_PROGRESS_STRIDE` nodes (folders and
     // files both count), the same bounded-rate rule `treemap::scan` keeps —

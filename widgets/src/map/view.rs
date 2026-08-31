@@ -1493,6 +1493,11 @@ impl DrawMapVector {
 
 #[derive(Script, Widget)]
 pub struct MapView {
+    /// The @cam readout in the corner: the exact command to recreate this
+    /// view, drawn over the map. On by default — map work is driven by it —
+    /// and off for an app shipping the map as a face rather than a bench.
+    #[live(true)]
+    debug_cam: bool,
     #[uid]
     uid: WidgetUid,
     #[source]
@@ -2890,8 +2895,11 @@ impl Widget for MapView {
 
         self.update_status_text();
         // Viewport debug readout: the exact @cam command for this view, so
-        // a screenshot alone is enough to recreate the camera.
-        {
+        // a screenshot alone is enough to recreate the camera. On by
+        // default — it is how map work has always been driven — and
+        // gated so an app shipping the map as a face, not a workbench,
+        // can turn it off.
+        if self.debug_cam {
             let center = self.center_norm;
             let lon = center.x * 360.0 - 180.0;
             let lat = (std::f64::consts::PI * (1.0 - 2.0 * center.y))
@@ -3631,7 +3639,7 @@ impl MapView {
 
         let active_path = self.active_mbtiles_path().to_string();
         let mbtiles_path = Path::new(&active_path);
-        if !mbtiles_path.is_file() && !self.local_source_missing_logged {
+        if !mbtiles_path.exists() && !self.local_source_missing_logged {
             log!("MapView: local mbtiles source missing at {} — serving disk tile cache only", active_path);
             self.local_source_missing_logged = true;
         }

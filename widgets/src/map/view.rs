@@ -3957,8 +3957,17 @@ impl MapView {
     }
 
     fn wrap_and_clamp_center(&mut self) {
-        self.center_norm.x = self.center_norm.x.rem_euclid(1.0);
-        self.center_norm.y = self.center_norm.y.clamp(0.0, 1.0);
+        // The renderer draws exactly one world width (visible_tile_keys
+        // dedups wrapped x), so a WRAPPING centre was a lie: panning past
+        // the antimeridian slid the whole world off-centre and showed void
+        // — a drag into nothing that read as a broken pan. The centre is
+        // CLAMPED instead: the viewport never leaves the world, and a world
+        // narrower than the view sits pinned in its middle.
+        let world = tile_world_size_zoom(self.view_zoom()).max(1.0);
+        let half_x = (self.view_rect.size.x * 0.5 / world).min(0.5);
+        let half_y = (self.view_rect.size.y * 0.5 / world).min(0.5);
+        self.center_norm.x = if half_x >= 0.5 { 0.5 } else { self.center_norm.x.clamp(half_x, 1.0 - half_x) };
+        self.center_norm.y = if half_y >= 0.5 { 0.5 } else { self.center_norm.y.clamp(half_y, 1.0 - half_y) };
     }
 
     fn zoom_with_anchor(&mut self, cx: &mut Cx, scroll: f64, anchor_abs: Vec2d) {

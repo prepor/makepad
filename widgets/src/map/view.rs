@@ -2146,7 +2146,19 @@ impl Widget for MapView {
         }
         self.perf_last_frame = Some(perf_start);
 
-        let rect = cx.walk_turtle(walk);
+        // The map's own draw list carries the clip: hosted as a pane beside
+        // other content, every tile/terrain/label draw clamps against
+        // view_clip (the shaders always did — the list just never had a
+        // rect narrower than the window until the map was embedded).
+        cx.begin_turtle(
+            walk,
+            Layout {
+                clip_x: true,
+                clip_y: true,
+                ..Layout::default()
+            },
+        );
+        let rect = cx.turtle().rect();
         self.view_rect = rect;
         self.draw_bg.draw_abs(cx, rect);
         self.ensure_visible_tiles(cx, rect);
@@ -2920,6 +2932,7 @@ impl Widget for MapView {
                 &cam,
             );
         }
+        cx.end_turtle();
         DrawStep::done()
     }
 }

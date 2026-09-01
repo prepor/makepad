@@ -20,6 +20,10 @@ const VEHICLE_KEYS: &[&str] = &[
 ];
 const AIRCRAFT_KEYS: &[&str] = &["orca", "heli", "tran", "a10", "c17"];
 const TURRET_KEYS: &[&str] = &["mtnk", "htnk", "ltnk", "mlrs", "msam"];
+/// Vehicles whose SECOND 32-frame block is an animation rather than a turret.
+/// MTNK's frames 32..64 are its turret; HARV's are its harvesting cycle, and
+/// treating every 64-frame vehicle as a turret unit silently threw them away.
+const HARVEST_KEYS: &[&str] = &["harv"];
 const INFANTRY_KEYS: &[&str] = &[
     "e1", "e2", "e3", "e4", "e5", "e6", "rmbo", "c1", "c2", "c3", "c4", "c5",
     "c6", "c7", "c8", "c9", "moebius", "delphi", "chan",
@@ -779,11 +783,31 @@ fn emit_sprites(
             report.missing_shapes.insert(format!("{}.SHP (needs 32 hull frames)", key.to_ascii_uppercase()));
             continue;
         }
-        let frames = frame_range(&shp, 0, 32, palette, facing_rot);
+        let mut frames = frame_range(&shp, 0, 32, palette, facing_rot);
+        let mut states =
+            vec![SpriteState { name: "idle", first: 0, last: 32, looping: true, fps: 8 }];
+        if HARVEST_KEYS.contains(&key) && shp.frames().len() >= 64 {
+            let first = frames.len();
+            append_harvest_frames(&mut frames, &shp, palette);
+            if frames.len() > first {
+                states.push(SpriteState {
+                    name: "harvest",
+                    first,
+                    last: frames.len(),
+                    looping: true,
+                    fps: 8,
+                });
+            } else {
+                report.missing_shapes.insert(format!(
+                    "{} harvest frames",
+                    key.to_ascii_uppercase()
+                ));
+            }
+        }
         let lines = unit_lines(key, archives, &remap);
         emit_spec(emitter, report, SpriteSpec {
             key: key.into(), role: "unit", facings: 32, frames,
-            states: vec![SpriteState { name: "idle", first: 0, last: 32, looping: true, fps: 8 }],
+            states,
             unit: Some(UnitSpec { manifest_lines: lines }),
             manifest_lines: Vec::new(), tags: vec!["cnc", "unit", "vehicle"],
         })?;
@@ -893,7 +917,6 @@ fn emit_sprites(
             continue;
         }
         let base_count = shp.frames().len();
-        let half = base_count.div_ceil(2);
         let mut frames = frame_range(&shp, 0, base_count, palette, |_| 0);
         let build_first = frames.len();
         let make_stem = format!("{source}make");
@@ -906,14 +929,42 @@ fn emit_sprites(
         }
         let build_last = frames.len();
         let (fw, fh) = structure_footprint(key);
+        let (healthy, damaged_end) = structure_split(base_count);
+        // A building STANDS STILL. Its extra frames are the animation it plays
+        // while it is working — a construction yard building, a refinery taking
+        // a load — not a loop it runs forever. Publishing the whole healthy run
+        // as `idle` made every structure on the map churn through its animation
+        // continuously; the resting picture is frame 0 and the run is its own
+        // clip the engine asks for by name.
         let mut states = vec![
-            SpriteState { name: "idle", first: 0, last: half, looping: true, fps: 6 },
-            SpriteState { name: "damaged", first: half, last: base_count, looping: true, fps: 6 },
+            SpriteState { name: "idle", first: 0, last: 1, looping: false, fps: 6 },
+            SpriteState { name: "damaged", first: healthy, last: healthy + 1, looping: false, fps: 6 },
         ];
+        if healthy > 1 {
+            states.push(SpriteState { name: "active", first: 0, last: healthy, looping: true, fps: 6 });
+        }
+        if damaged_end > healthy + 1 {
+            states.push(SpriteState {
+                name: "damaged_active",
+                first: healthy,
+                last: damaged_end,
+                looping: true,
+                fps: 6,
+            });
+        }
+        if damaged_end < base_count {
+            // The rubble frame, under the name the engine already asks for
+            // when a piece is destroyed.
+            states.push(SpriteState { name: "die", first: damaged_end, last: base_count, looping: false, fps: 6 });
+        }
         if build_last > build_first {
             states.push(SpriteState { name: "build", first: build_first, last: build_last, looping: false, fps: 15 });
         }
-        report.structure_halves.push(format!("{key}: {half}+{}", base_count - half));
+        report.structure_halves.push(format!(
+            "{key}: {healthy}+{}+{}",
+            damaged_end - healthy,
+            base_count - damaged_end
+        ));
         let mut lines = unit_lines(key, archives, &remap);
         lines.push(format!("footprint {fw} {fh}"));
         emit_spec(emitter, report, SpriteSpec {
@@ -947,14 +998,21 @@ fn emit_sprites(
             continue;
         };
         let count = shp.frames().len();
-        let half = count.div_ceil(2);
+        let (healthy, damaged_end) = structure_split(count);
+        let mut states = vec![
+            SpriteState { name: "idle", first: 0, last: 1, looping: false, fps: 6 },
+            SpriteState { name: "damaged", first: healthy, last: healthy + 1, looping: false, fps: 6 },
+        ];
+        if healthy > 1 {
+            states.push(SpriteState { name: "active", first: 0, last: healthy, looping: true, fps: 6 });
+        }
+        if damaged_end < count {
+            states.push(SpriteState { name: "die", first: damaged_end, last: count, looping: false, fps: 6 });
+        }
         emit_spec(emitter, report, SpriteSpec {
             key: key.clone(), role: "structure", facings: 1,
             frames: frame_range(&shp, 0, count, palette, |_| 0),
-            states: vec![
-                SpriteState { name: "idle", first: 0, last: half, looping: true, fps: 6 },
-                SpriteState { name: "damaged", first: half, last: count, looping: true, fps: 6 },
-            ],
+            states,
             unit: None,
             manifest_lines: vec![remap.clone(), "footprint 1 1".into()], tags: vec!["cnc", "structure", "civilian"],
         })?;
@@ -1801,6 +1859,67 @@ fn emit_spec(
 ) -> Result<(), String> {
     *report.roles.entry(spec.role.into()).or_default() += 1;
     emitter.emit_sprite(spec)
+}
+
+/// How a TD building's SHP divides into intact art, damaged art and rubble.
+///
+/// TD stores a building's animation TWICE — once intact, once damaged — with a
+/// single rubble frame after it, so the frame count is `2n + 1`. Measured
+/// straight out of `conquer.mix` by comparing each frame with frame 0: NUKE
+/// 9 = 4+4+1, OBLI 9 = 4+4+1, SILO 11 = 5+5+1 (five tiberium fill stages, each
+/// with a damaged twin), TMPL 11, HPAD/FIX 15 = 7+7+1, PYLE 21 = 10+10+1,
+/// HQ/EYE/AFLD 33 = 16+16+1, FACT 49 = 24+24+1, PROC 61 = 30+30+1, SAM
+/// 129 = 64+64+1, and WEAP/HAND/GTWR/ATWR/BIO/MISS 3 = 1+1+1. An even count
+/// (GUN's 128 facing frames) has no rubble frame and splits in half.
+///
+/// What this replaces: `count.div_ceil(2)`, which put the FIRST DAMAGED frame
+/// at the end of the intact loop. Every animated building therefore cycled
+/// intact→intact→intact→DAMAGED at 6fps — reported live on the power plant,
+/// where 9 frames split 5/4 instead of 4/4/1.
+fn structure_split(count: usize) -> (usize, usize) {
+    if count <= 1 {
+        return (count, count);
+    }
+    let paired = if count % 2 == 1 { count - 1 } else { count };
+    let healthy = (paired / 2).max(1);
+    (healthy, (healthy * 2).min(count))
+}
+
+/// Harvest facings stored in HARV.SHP, against the 32 the hull is drawn at.
+const HARVEST_ANIM_FACINGS: usize = 8;
+/// Steps in one harvesting cycle.
+const HARVEST_ANIM_STEPS: usize = 4;
+
+/// HARV.SHP frames 32..64: the harvesting cycle, 8 facings × 4 steps,
+/// facing-major, where harvest facing `f` is the hull's driving facings
+/// `4f..4f+4` (frame 32 is 2% different from frame 0 — the same facing at the
+/// start of its cycle — and the run repeats in groups of four across eight
+/// facings).
+///
+/// Emitted at ALL 32 rots, each source step repeated across the four driving
+/// facings it covers, because a clip stored at only 8 of the sheet's 32 rots
+/// has no frame for the other 24 and the renderer falls back to rot 1 — a
+/// harvester that snaps to facing north the moment it starts working.
+fn harvest_source(rot: usize, step: usize) -> usize {
+    let per_facing = 32 / HARVEST_ANIM_FACINGS;
+    32 + (rot / per_facing) * HARVEST_ANIM_STEPS + step
+}
+
+fn append_harvest_frames(out: &mut Vec<SpritePixels>, shp: &Shp, palette: &Pal) {
+    for rot in 0..32usize {
+        for step in 0..HARVEST_ANIM_STEPS {
+            let source = harvest_source(rot, step);
+            let Some(pixels) = shp.frames().get(source) else {
+                return;
+            };
+            out.push(SpritePixels {
+                rgba: indexed_transparent(pixels, palette),
+                width: shp.width() as u32,
+                height: shp.height() as u32,
+                rot: facing_rot(rot),
+            });
+        }
+    }
 }
 
 fn frame_range(
@@ -2658,5 +2777,66 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&staged);
+    }
+
+    /// The split measured out of conquer.mix, frame by frame. The old
+    /// `div_ceil(2)` answers are spelled out beside the right ones because
+    /// every one of them put a damaged frame inside the intact loop.
+    #[test]
+    fn structure_split_keeps_damaged_art_out_of_the_intact_loop() {
+        // NUKE (the power plant that flickered): 4 intact + 4 damaged + rubble.
+        assert_eq!(structure_split(9), (4, 8));
+        assert_ne!(structure_split(9).0, 9usize.div_ceil(2));
+        // SILO: five tiberium fill stages, each with a damaged twin.
+        assert_eq!(structure_split(11), (5, 10));
+        // The three-frame buildings: one of each, then rubble.
+        assert_eq!(structure_split(3), (1, 2));
+        // The big animated ones.
+        assert_eq!(structure_split(21), (10, 20));
+        assert_eq!(structure_split(33), (16, 32));
+        assert_eq!(structure_split(49), (24, 48));
+        assert_eq!(structure_split(61), (30, 60));
+        assert_eq!(structure_split(129), (64, 128));
+        // Even counts (GUN's 128 facing frames) carry no rubble frame.
+        assert_eq!(structure_split(128), (64, 128));
+        assert_eq!(structure_split(2), (1, 2));
+        // Degenerate counts must not produce an empty or inverted intact clip.
+        assert_eq!(structure_split(1), (1, 1));
+        assert_eq!(structure_split(0), (0, 0));
+        for count in 1..200usize {
+            let (healthy, damaged_end) = structure_split(count);
+            assert!(healthy >= 1, "count={count}");
+            assert!(healthy <= damaged_end, "count={count}");
+            assert!(damaged_end <= count, "count={count}");
+        }
+    }
+
+    /// The harvesting cycle is stored at 8 facings; the hull is drawn at 32.
+    /// Every rot must map onto a whole four-step cycle, and neighbouring rots
+    /// must share the facing they actually came from, or a working harvester
+    /// snaps to one direction.
+    #[test]
+    fn harvest_source_covers_every_rot_with_a_whole_cycle() {
+        // Every rot resolves inside HARV.SHP's second 32-frame block.
+        for rot in 0..32usize {
+            for step in 0..HARVEST_ANIM_STEPS {
+                let source = harvest_source(rot, step);
+                assert!((32..64).contains(&source), "rot {rot} step {step} -> {source}");
+            }
+        }
+        // Rot 0 is the start of the first facing's cycle, which sits directly
+        // after the 32 hull frames.
+        assert_eq!(harvest_source(0, 0), 32);
+        assert_eq!(harvest_source(0, 3), 35);
+        // Four rots share a source facing; the fifth moves on to the next.
+        for rot in 0..4 {
+            assert_eq!(harvest_source(rot, 0), 32, "rot {rot}");
+        }
+        assert_eq!(harvest_source(4, 0), 36);
+        assert_eq!(harvest_source(31, 3), 63);
+        // Exactly eight distinct cycles are drawn from.
+        let facings: std::collections::BTreeSet<usize> =
+            (0..32).map(|rot| harvest_source(rot, 0)).collect();
+        assert_eq!(facings.len(), HARVEST_ANIM_FACINGS);
     }
 }

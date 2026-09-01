@@ -459,6 +459,8 @@ mod tests {
     /// serve. The dedicated chat node honestly reports `video` in its
     /// capabilities; that must not turn into a picker entry, and its lone
     /// copy of a model must not make that model look fleet-available.
+    /// (`.165` is the ratified dedicated chat box — see the hub's
+    /// `DEFAULT_FLEET_ROLES`.)
     #[test]
     fn a_role_excluded_box_advertises_nothing_for_that_domain() {
         if std::env::var(makepad_ai_hub::fleet::FLEET_ROLES_ENV).is_ok() {
@@ -466,7 +468,7 @@ mod tests {
         }
         let snapshots = vec![
             snapshot(
-                "http://10.0.0.217:8123",
+                "http://10.0.0.165:8123",
                 32 * 1024,
                 vec![
                     model("qwen3.8-27b", "chat", MODEL_STATE_LOADED, 24.0),

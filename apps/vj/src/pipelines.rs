@@ -39,7 +39,7 @@ use makepad_asset_creator::runner::{
 use makepad_asset_creator::pipeline::{
     derive_progress, derive_state, PipelineSpec, RunState, StageSpec, StageState,
 };
-use makepad_asset_importer::coordinator::{
+use makepad_asset_importer::gen_publish::{
     dress_generated_publish, wire_request, GenArtifact, GenRequest,
 };
 use makepad_asset_importer::gen_kinds::kind_of;

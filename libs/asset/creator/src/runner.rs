@@ -17,7 +17,7 @@ use makepad_ai_hub::{discovery, fleet};
 use makepad_asset_client::json::Value;
 use makepad_asset_client::{ApiEndpoints, AssetClient, ClientConfig, PublishRights};
 use makepad_asset_data::AssetAlias;
-use makepad_asset_importer::coordinator::{
+use makepad_asset_importer::gen_publish::{
     dress_generated_publish, wire_request, GenArtifact, GenRequest,
 };
 use makepad_asset_importer::gen_kinds::{kind_of, GenKind};

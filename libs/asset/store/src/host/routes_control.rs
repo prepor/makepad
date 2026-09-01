@@ -33,7 +33,7 @@
 
 use super::assets_query::{CatalogReader, QueryOutput, MAX_QUERY_ROWS};
 use super::api::{
-    body_str, body_u64, parse_capability, parse_job, parse_json_body, parse_limit,
+    body_str, body_u64, parse_capability, parse_json_body, parse_limit,
     parse_principal, principal_str, Fail, RouteResult, TOKEN_PREFIX,
 };
 use super::events::{self, CatalogEvent, EventBody, EventCursor};
@@ -43,10 +43,7 @@ use super::routes::{
     call_state, is_read, method_not_allowed, not_found, read_body, require_cap, secret_of,
     Outcome, RouteCtx,
 };
-use super::state::{
-    envelope_build, envelope_parse, StateCtx, MAX_JOB_NAMESPACES, MAX_PIPELINE_PROMPT_BYTES,
-    MAX_PIPELINE_STAGES, MAX_PIPELINE_TITLE_BYTES, MAX_STAGE_WEIGHT,
-};
+use super::state::StateCtx;
 use super::util::{from_hex_bounded, from_hex_exact, log, now_ms, rand16, rand32, to_hex};
 use crate::search::{kind_name, kind_parse};
 use crate::{

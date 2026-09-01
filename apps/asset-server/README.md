@@ -6,7 +6,7 @@ independently of each other. So the catalog's lifetime must not be any one
 client's lifetime.
 
 Historically the Asset UI *embedded* the server: it took `<root>/server.lock`,
-served the catalog, ran the chat broker and the events hub — and every time
+served the catalog and the events hub — and every time
 that window was closed or rebuilt, every other connected client lost the
 store mid-session (`503 state unavailable`). This binary is the fix: the same
 service, in its own process, that survives every window.
@@ -19,8 +19,7 @@ cargo build --release -p makepad-app-asset-server
 With no flags it serves the checkout's standard store root
 (`local/asset-ui/asset-server`, or `$AI_CONTENT_ASSET_ROOT`) on ephemeral
 ports, announces itself on the LAN beacon, publishes
-`local/ai_content_library`, and coordinates fleet jobs. `--help` lists every
-flag.
+`local/ai_content_library`. `--help` lists every flag.
 
 ---
 
@@ -30,20 +29,21 @@ flag.
 | --- | --- | --- |
 | Catalog + CAS, control/data planes | `AssetServer::start` | search, blobs, ranges/ETags, retire |
 | Auth, tokens, grants | ” | `--root/admin-token` bootstrapped at start |
-| Job queue, worker/lease protocol | ” | plus `GET /v1/job-profiles` |
-| Chat broker (+ client-executed tool parking for game sessions) | ” | `--chat-fleet` / LAN fleet discovery |
-| Games publish path, operations, import routes | ” | |
+| Games publish path, import routes | ” | |
 | Committed events hub (`/v1/events`) | ” | every client's live view |
 | LAN discovery beacon | ” | `--no-beacon` to stay silent |
-| Lease janitor + bounded blob GC | ” | runs whether or not anyone polls |
+| Bounded blob GC | ” | runs whether or not anyone polls |
 | **ai-content library publisher** | `makepad_asset_importer::watch` | `--library` / `--no-library` |
-| **GPU-fleet job coordinator + profile announce** | `makepad_asset_importer::gen_service` | `--no-jobs` / `--no-announce` / `--fleet` |
 
-The last two are the loops the Asset UI used to run *only while it was
-hosting*. They are headless — no `Cx`, no window, no GPU surface — so they
-belong beside the server, and running them here is what makes a UI-less
-deployment a complete fleet citizen. Without the coordinator, jobs any client
-enqueues sit at "waiting for agent" forever.
+The publisher is the one loop the Asset UI used to run *only while it was
+hosting*. It is headless — no `Cx`, no window, no GPU surface — so it
+belongs beside the server.
+
+The job queue, worker protocol, chat broker and fleet coordinator that used
+to live here are gone (aicore: **the store stores, the client creates**).
+Generation and chat run inside the creating apps over their own ai-hub
+fleet connections (`makepad-asset-creator`, `makepad-ai-hub`), and the apps
+publish the results as ordinary clients.
 
 ## What deliberately stays client-side
 
@@ -61,8 +61,9 @@ giving a headless daemon a window.
   wanted.
 - **Stems / lyrics analysis bake** (`analysis.rs`) — a large local model on
   the operator's machine, driven from the surface that asks for it.
-- **Generation pipelines** driven from the Create surface (`pipeline.rs`) —
-  these are *requests*; the queue and the dispatch live server-side.
+- **Generation pipelines** driven from the Create surface (`pipeline.rs`)
+  and every other creator surface — they run in-app over the fleet
+  (`makepad-asset-creator`) and publish the results here.
 
 ## Recommended deployment
 
@@ -114,8 +115,8 @@ Three ways, in order of precedence:
   daemon.
 - **Two daemons on one root** — refused immediately and by name
   (`server root: locked by another server process`). One process per root is
-  a law: the job routing metadata assumes a single enqueuer, and two writers
-  over one WAL catalog would be two sources of recovery truth.
+  a law: two writers over one WAL catalog would be two sources of recovery
+  truth.
 
 ## Bouncing the daemon safely
 
@@ -128,8 +129,7 @@ pkill -TERM -f 'makepad-asset-server'         # clean shutdown: joins every thre
 
 SIGTERM/SIGINT shut down in order: background loops first (so nothing is
 still publishing into a closing catalog), then the planes, then the state
-thread. Startup logs what recovery found — `recovered N cas temps / M leases`
-— which is the honest report of what the previous life left behind.
+thread. Startup logs what recovery found — `recovered N cas temps` — which is the honest report of what the previous life left behind.
 
 ## Isolated instances
 
@@ -138,11 +138,11 @@ Never point a scratch instance at the live root, and never let one beacon:
 ```bash
 ./target/release/makepad-asset-server \
   --root /tmp/scratch-store --work /tmp/scratch-work \
-  --no-beacon --no-jobs --no-library
+  --no-beacon --no-library
 ```
 
 `--no-beacon` keeps peers hunting for the real store from finding the scratch
-one; `--no-jobs` keeps it from claiming the real fleet's queued work.
+one.
 
 ## Tests
 
@@ -151,6 +151,6 @@ the host serves a catalog over real sockets and shuts down cleanly, a second
 host on one root is refused by name, a missing library directory never costs
 the catalog its server, and the defaults are the deployment defaults. The
 parts themselves are covered where they live — `libs/asset/store` (HTTP,
-chat, events, jobs, security, operations suites) and `libs/asset/importer`
-(watch, coordinator, gen-service). The attach/succession contract is in
+events, security suites) and `libs/asset/importer` (watch). The
+attach/succession contract is in
 `apps/asset-ui/src/asset_store_state.rs`.

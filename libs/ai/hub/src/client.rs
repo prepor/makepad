@@ -26,6 +26,7 @@ use crate::registry::Domain;
 use makepad_micro_serde::{DeJson, SerJson};
 
 /// One artifact fetched from a provider.
+#[derive(Clone, Debug)]
 pub struct ArtifactBytes {
     pub content_type: String,
     pub bytes: Vec<u8>,

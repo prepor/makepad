@@ -26,6 +26,7 @@
 //!   is a client that does not close (a headless runner / the machine node),
 //!   never a scheduler in the database.
 
+pub mod engine;
 pub mod pipeline;
 
 pub use makepad_ai_hub;

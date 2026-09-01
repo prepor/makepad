@@ -24,8 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use makepad_ai_hub::local_llm::{arg, ToolSpec};
+
 use crate::{
-    chat_agent::{arg, ToolSpec},
     model::{self, FileEntry},
     vfs::vfs,
 };
@@ -46,28 +47,30 @@ const MEASURE_DEPTH: usize = 10;
 const MEASURE_ENTRIES: usize = 400_000;
 
 /// The tools, exactly as the model is told about them.
-pub const TOOLS: &[ToolSpec] = &[
-    ToolSpec {
-        name: "list_dir",
-        description: "List what is directly inside a folder: each entry's name, whether it is a folder, its kind and its size. Bounded to the first 200 entries. Use this before saying anything about what a folder contains.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"folder path; ~ means the home folder, and a relative path is read from the folder the user is in"}},"required":["path"]}"#,
-    },
-    ToolSpec {
-        name: "read_file",
-        description: "Read the beginning of a text file (at most 16 kB). Binary files are refused with a note of what they are instead. Use this to answer questions about what a file actually says.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer","description":"how much to read, up to 16384"}},"required":["path"]}"#,
-    },
-    ToolSpec {
-        name: "stat",
-        description: "One path's kind, size and modification time. Cheap — use it when you only need to know what something is.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
-    },
-    ToolSpec {
-        name: "treemap_summary",
-        description: "Where a folder's bytes actually are: its heaviest direct children with their recursive sizes and file counts. This is what the treemap draws. Use it for 'what is taking up the space' questions.",
-        parameters: r#"{"type":"object","properties":{"path":{"type":"string"},"top":{"type":"integer","description":"how many children to list, up to 12"}},"required":["path"]}"#,
-    },
-];
+pub fn tools() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec::new(
+            "list_dir",
+            "List what is directly inside a folder: each entry's name, whether it is a folder, its kind and its size. Bounded to the first 200 entries. Use this before saying anything about what a folder contains.",
+            r#"{"type":"object","properties":{"path":{"type":"string","description":"folder path; ~ means the home folder, and a relative path is read from the folder the user is in"}},"required":["path"]}"#,
+        ),
+        ToolSpec::new(
+            "read_file",
+            "Read the beginning of a text file (at most 16 kB). Binary files are refused with a note of what they are instead. Use this to answer questions about what a file actually says.",
+            r#"{"type":"object","properties":{"path":{"type":"string"},"max_bytes":{"type":"integer","description":"how much to read, up to 16384"}},"required":["path"]}"#,
+        ),
+        ToolSpec::new(
+            "stat",
+            "One path's kind, size and modification time. Cheap — use it when you only need to know what something is.",
+            r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#,
+        ),
+        ToolSpec::new(
+            "treemap_summary",
+            "Where a folder's bytes actually are: its heaviest direct children with their recursive sizes and file counts. This is what the treemap draws. Use it for 'what is taking up the space' questions.",
+            r#"{"type":"object","properties":{"path":{"type":"string"},"top":{"type":"integer","description":"how many children to list, up to 12"}},"required":["path"]}"#,
+        ),
+    ]
+}
 
 /// One tool call, as it goes to the worker.
 pub struct ToolJob {
@@ -555,8 +558,9 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_schema_and_a_safe_name() {
-        assert_eq!(TOOLS.len(), 4);
-        for tool in TOOLS {
+        let tools = tools();
+        assert_eq!(tools.len(), 4);
+        for tool in &tools {
             assert!(tool
                 .name
                 .chars()
@@ -568,7 +572,7 @@ mod tests {
         // Nothing that writes, moves, deletes or runs anything.
         for forbidden in ["write", "delete", "move", "rename", "run", "exec", "shell"] {
             assert!(
-                !TOOLS.iter().any(|t| t.name.contains(forbidden)),
+                !tools.iter().any(|t| t.name.contains(forbidden)),
                 "a {forbidden} tool must never exist here"
             );
         }

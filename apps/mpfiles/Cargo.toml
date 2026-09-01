@@ -9,4 +9,4 @@ mp-theme = { path = "../../libs/mp_theme" }
 mp-wm-api = { path = "../../libs/mp_wm_api" }
 # The ask panel's local model: an in-process Qwen GGUF on makepad-ggml, loaded
 # only when the panel is first opened.
-makepad-ai-llm = { path = "../../libs/ai/llm" }
+makepad-ai-hub = { path = "../../libs/ai/hub", default-features = false, features = ["llm"] }

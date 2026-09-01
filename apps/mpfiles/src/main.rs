@@ -4020,8 +4020,11 @@ impl App {
             self.redraw_chat(cx);
             return;
         };
-        let prefix = chat_agent::build_prefix(CHAT_SYSTEM_PROMPT, chat_tools::TOOLS);
-        self.agent = Some(ChatAgent::start(&model, prefix));
+        self.agent = Some(ChatAgent::start(
+            model.clone(),
+            CHAT_SYSTEM_PROMPT.to_string(),
+            chat_tools::tools(),
+        ));
         self.tool_runner = Some(ToolRunner::new());
         self.chat.push(
             ChatVoice::Info,

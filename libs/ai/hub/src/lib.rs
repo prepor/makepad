@@ -42,6 +42,7 @@ pub mod fleet;
 pub mod gpu;
 pub mod home;
 pub mod hub;
+pub mod machine;
 pub mod fast_backend;
 pub mod h3_backend;
 pub mod http_client;

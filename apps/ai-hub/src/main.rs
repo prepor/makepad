@@ -35,6 +35,7 @@ fn run() -> Result<(), AssetAiError> {
     let mut fleet: Option<String> = None;
     let mut cache_dir: Option<PathBuf> = None;
     let mut registry_path: Option<PathBuf> = None;
+    let mut machine = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -69,9 +70,15 @@ fn run() -> Result<(), AssetAiError> {
                     AssetAiError::Io("--registry needs a value".into())
                 })?));
             }
+            // The machine node (aicore §3): loopback-only, registered in
+            // ~/.makepad/run for the apps on this machine, and gone on its
+            // own once nothing needs it — a cache, not a daemon.
+            "--machine" => {
+                machine = true;
+            }
             "--help" | "-h" => {
                 println!(
-                    "{SERVICE_NAME} {SERVICE_VERSION}\nusage: {SERVICE_NAME} [--port N] [--host ADDR] [--fleet NAME] [--cache-dir PATH] [--registry PATH]"
+                    "{SERVICE_NAME} {SERVICE_VERSION}\nusage: {SERVICE_NAME} [--port N] [--host ADDR] [--fleet NAME] [--cache-dir PATH] [--registry PATH] [--machine]"
                 );
                 return Ok(());
             }
@@ -108,6 +115,11 @@ fn run() -> Result<(), AssetAiError> {
         }
     };
 
+    // The machine node is machine-local by definition: loopback bind, no
+    // matter what --host said.
+    if machine {
+        host = "127.0.0.1".to_string();
+    }
     let downloader = Downloader::from_env()?;
     let handle = start_service(ServiceConfig {
         host,
@@ -134,9 +146,56 @@ fn run() -> Result<(), AssetAiError> {
         "  endpoints: /health /models /jobs /loras POST:/generate /job/<id> POST:/job/<id>/cancel /artifact/<id> /v1/model_inventory /v1/model_blob/<sha256> POST:/realtime GET(ws):/realtime/<id>"
     );
 
+    if machine {
+        return run_machine_node(handle);
+    }
+
     // The http listener thread runs until the process is killed.
     let _ = handle.http_thread.join();
     Ok(())
+}
+
+/// The machine node's life: register in ~/.makepad/run so the apps on this
+/// machine find it, then idle down and exit once nothing has needed it for
+/// the TTL — it reads as a cache, not a daemon (aicore §3). Visible in any
+/// process list as makepad-ai-hub.
+fn run_machine_node(handle: makepad_ai_hub::server::ServiceHandle) -> Result<(), AssetAiError> {
+    use makepad_ai_hub::machine::{write_node_entry, NodeEntry};
+    use std::time::{Duration, Instant};
+
+    let ttl_min: u64 = std::env::var("MAKEPAD_AI_HUB_MACHINE_TTL_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
+    let entry = NodeEntry {
+        pid: std::process::id() as u64,
+        port: handle.addr.port(),
+        pipes_hash: 0,
+    };
+    let entry_path = write_node_entry(&handle.shared.node_key, &entry)
+        .map_err(|e| AssetAiError::Io(format!("write node entry: {e}")))?;
+    println!("  machine node: registered {} (ttl {ttl_min}m idle)", entry_path.display());
+
+    let mut idle_since = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_secs(30));
+        // Busy = queued/running work, or a model somebody paid to load.
+        let pending = handle.shared.jobs.with(|store| store.pending_count()) > 0;
+        let resident = handle
+            .shared
+            .models
+            .lock()
+            .unwrap()
+            .values()
+            .any(|track| matches!(track, makepad_ai_hub::server::ModelTrack::Loaded));
+        if pending || resident {
+            idle_since = Instant::now();
+        } else if idle_since.elapsed() > Duration::from_secs(ttl_min * 60) {
+            println!("{SERVICE_NAME}: machine node idle for {ttl_min}m — exiting");
+            let _ = std::fs::remove_file(&entry_path);
+            return Ok(());
+        }
+    }
 }
 
 fn default_cache_dir() -> PathBuf {

@@ -51,6 +51,10 @@ pub struct ServiceHandle {
     /// for the life of the daemon (main.rs never drops its handle). Dropping
     /// the handle releases both locks (tests rely on that for restarts).
     pub singleton: ServiceLock,
+    /// The live service state, for hosts that supervise the service
+    /// in-process (the machine node's idle clock reads job and residency
+    /// facts from here).
+    pub shared: Arc<ServiceShared>,
 }
 
 /// A Windows global named mutex makes the singleton independent of cache
@@ -376,6 +380,7 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
         worker_thread,
         chat_threads,
         singleton,
+        shared,
     })
 }
 

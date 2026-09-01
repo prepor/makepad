@@ -38,6 +38,7 @@ pub mod control_image;
 pub mod depth_backend;
 pub mod download;
 pub mod error;
+pub mod fabric;
 pub mod fleet;
 pub mod gpu;
 pub mod home;

@@ -53,10 +53,41 @@ pub fn machine_token() -> io::Result<String> {
     Ok(token)
 }
 
-/// 32 hex chars of OS randomness. `/dev/urandom` on unix; on other platforms
+/// 32 hex chars of OS randomness.
+fn mint_token() -> io::Result<String> {
+    Ok(to_hex(&rand16()?))
+}
+
+/// Load or mint a persisted 16-byte identity in the runtime dir (the
+/// store's `server-id` pattern). Public value, stable across restarts.
+pub(crate) fn load_or_create_id(name: &str) -> io::Result<[u8; 16]> {
+    let path = home::run_dir().join(name);
+    if let Ok(text) = fs::read_to_string(&path) {
+        if let Some(id) = from_hex16(text.trim()) {
+            return Ok(id);
+        }
+    }
+    let id = rand16()?;
+    fs::write(&path, to_hex(&id))?;
+    Ok(id)
+}
+
+fn from_hex16(text: &str) -> Option<[u8; 16]> {
+    if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, chunk) in text.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// 16 bytes of OS randomness. `/dev/urandom` on unix; on other platforms
 /// entropy is gathered from time, pid and allocation addresses and hashed —
 /// weaker, and marked so a future windows FFI can replace it.
-fn mint_token() -> io::Result<String> {
+fn rand16() -> io::Result<[u8; 16]> {
     let mut bytes = [0u8; 16];
     #[cfg(unix)]
     {
@@ -75,7 +106,7 @@ fn mint_token() -> io::Result<String> {
         hasher.update(&(&*probe as *const u64 as usize).to_le_bytes());
         bytes.copy_from_slice(&hasher.finish()[..16]);
     }
-    Ok(to_hex(&bytes))
+    Ok(bytes)
 }
 
 // ------------------------------------------------------------ node entries

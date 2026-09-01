@@ -356,6 +356,12 @@ pub fn assemble_chat_prompt_with_think(
 #[derive(Clone, Debug, Default, SerJson, DeJson)]
 pub struct GenerateRequestJson {
     pub model: String,
+    /// Lease origin (aicore §8): the submitter's durable node key. Absent on
+    /// every legacy client — no origin, no lease, exactly today's behavior.
+    pub origin_key: Option<String>,
+    /// The origin's per-start epoch; with `origin_key`, a new epoch under
+    /// the same key cancels the previous incarnation's jobs.
+    pub origin_epoch: Option<u64>,
     pub prompt: Option<String>,
     pub negative_prompt: Option<String>,
     pub width: Option<u32>,
@@ -1167,4 +1173,32 @@ mod think_mode_tests {
         // nobody measured.
         assert_eq!(think_prefill_for_model("qwen3.5-9b"), CHAT_THINK_PREFILL);
     }
+}
+
+
+/// `POST /job/<id>/keepalive` body: one origin beat (aicore §8).
+#[derive(Clone, Debug, SerJson, DeJson)]
+pub struct KeepaliveRequestJson {
+    pub origin_key: String,
+    pub origin_epoch: u64,
+}
+
+/// `POST /job/<id>/keepalive` response. `renewed: false` is an ordinary
+/// outcome telling the origin to re-pick, never an HTTP error.
+#[derive(Clone, Debug, SerJson, DeJson)]
+pub struct KeepaliveResponseJson {
+    pub renewed: bool,
+    pub reason: Option<String>,
+}
+
+/// `POST /bye` body: graceful origin departure.
+#[derive(Clone, Debug, SerJson, DeJson)]
+pub struct ByeRequestJson {
+    pub origin_key: String,
+}
+
+/// `POST /bye` response: how many jobs the goodbye released and cancelled.
+#[derive(Clone, Debug, SerJson, DeJson)]
+pub struct ByeResponseJson {
+    pub cancelled: u64,
 }

@@ -197,6 +197,10 @@ pub struct ServiceShared {
     /// Peer-assisted model distribution state: transfer secret, serve
     /// bounds, in-flight serve leases, operator-injected sources.
     pub peer: crate::peer_serve::PeerRuntime,
+    /// Remote-owned job leases: work lives only while its origin renews
+    /// (aicore §8). Origin-less submits (every legacy client) take no lease
+    /// and behave exactly as before — absence is the compatibility story.
+    pub leases: Mutex<crate::lease::LeaseTable>,
     /// Live/realtime sessions currently running, keyed by job id. Reachable
     /// from both the worker thread (`server::execute_live_job`, which
     /// inserts/removes) and `route_loop` (which feeds it websocket traffic).
@@ -291,6 +295,7 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
         peer.env_sources.len()
     );
     let shared = Arc::new(ServiceShared {
+        leases: Mutex::new(crate::lease::LeaseTable::new()),
         registry: config.registry,
         cache_dir: config.cache_dir,
         downloader: config.downloader.with_serve_leases(peer.leases.clone()),
@@ -331,6 +336,14 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
     let route_thread = std::thread::spawn(move || route_loop(route_shared, request_rx));
     let worker_shared = shared.clone();
     let worker_thread = std::thread::spawn(move || worker_loop(worker_shared));
+    let reaper_shared = shared.clone();
+    std::thread::Builder::new()
+        .name("ai-hub-lease-reaper".into())
+        .spawn(move || loop {
+            std::thread::sleep(crate::lease::KEEPALIVE_INTERVAL);
+            let _ = reap_lapsed_leases(&reaper_shared);
+        })
+        .expect("spawn lease reaper");
 
     // One chat worker per lane. The store admits exactly this many chat turns,
     // so the two numbers are the same number by construction rather than by
@@ -551,7 +564,108 @@ fn route_get(shared: &Arc<ServiceShared>, path: &str) -> HttpServerResponse {
     error_json(404, format!("no such endpoint: GET {path}"))
 }
 
+/// Cancel one job and, when it was still queued, tear down the realtime
+/// session no worker ever ran. Shared by the cancel route and the lease
+/// reaper — a lapsed lease must behave exactly like an explicit cancel.
+fn cancel_job_with_teardown(
+    shared: &Arc<ServiceShared>,
+    job_id: &str,
+) -> crate::jobs::CancelOutcome {
+    use crate::jobs::CancelOutcome;
+    let outcome = shared.jobs.with(|store| store.cancel(job_id));
+    if outcome == CancelOutcome::Cancelled {
+        // A queued (not yet running) job was dropped outright — if it
+        // was a live session, its `RealtimeSession` was created back at
+        // `POST /realtime` time and no worker thread ever ran
+        // `execute_live_job` to tear it down. Do that here instead: any
+        // socket a client opened while the session sat queued still
+        // gets its `stopped` notice and a clean close.
+        if let Some(session) = shared.realtime_sessions.lock().unwrap().remove(job_id) {
+            session.push_bytes(
+                crate::realtime_wire::encode_stopped_message("cancelled").into_bytes(),
+            );
+            session.close_all_sockets();
+        }
+    }
+    outcome
+}
+
+/// The lease reaper tick: cancel everything whose origin went silent.
+/// Called every ~2s from the reaper thread; also directly from tests.
+pub(crate) fn reap_lapsed_leases(shared: &Arc<ServiceShared>) -> usize {
+    let lapsed = shared
+        .leases
+        .lock()
+        .unwrap()
+        .reap(crate::jobs::now_ms());
+    for (job_id, why) in &lapsed {
+        eprintln!("[lease] {job_id}: origin lapsed ({why:?}) — cancelling");
+        let _ = cancel_job_with_teardown(shared, job_id);
+    }
+    lapsed.len()
+}
+
 fn route_post(shared: &Arc<ServiceShared>, path: &str, body: &[u8]) -> HttpServerResponse {
+    // POST /job/<id>/keepalive — one origin beat (aicore §8). 200 with
+    // renewed:false + a reason tells the origin to re-pick rather than 404:
+    // an already-reaped job is an ordinary outcome, not an error.
+    if let Some(job_id) = path
+        .strip_prefix("/job/")
+        .and_then(|rest| rest.strip_suffix("/keepalive"))
+    {
+        let Ok(text) = std::str::from_utf8(body) else {
+            return error_json(400, "request body is not utf-8".to_string());
+        };
+        let Ok(req) = KeepaliveRequestJson::deserialize_json(text) else {
+            return error_json(400, "malformed keepalive body".to_string());
+        };
+        let origin = crate::lease::Origin {
+            node_key: req.origin_key,
+            epoch: req.origin_epoch,
+        };
+        // A known key under a new epoch is the restart signal: the previous
+        // incarnation's jobs die now, before this renewal is considered.
+        let restarted = shared
+            .leases
+            .lock()
+            .unwrap()
+            .owner_restarted(&origin.node_key, origin.epoch);
+        for (job_id, _) in &restarted {
+            let _ = cancel_job_with_teardown(shared, job_id);
+        }
+        let outcome = shared
+            .leases
+            .lock()
+            .unwrap()
+            .renew(job_id, &origin, crate::jobs::now_ms());
+        let (renewed, reason) = match outcome {
+            crate::lease::Renew::Renewed => (true, None),
+            crate::lease::Renew::UnknownJob => (false, Some("unknown-job".to_string())),
+            crate::lease::Renew::WrongOwner => (false, Some("wrong-owner".to_string())),
+        };
+        return ok_json(KeepaliveResponseJson { renewed, reason }.serialize_json());
+    }
+    // POST /bye — graceful origin departure: release and cancel everything
+    // this origin owns, immediately, instead of waiting out ~8s of silence.
+    if path == "/bye" {
+        let Ok(text) = std::str::from_utf8(body) else {
+            return error_json(400, "request body is not utf-8".to_string());
+        };
+        let Ok(req) = ByeRequestJson::deserialize_json(text) else {
+            return error_json(400, "malformed bye body".to_string());
+        };
+        let lapsed = shared.leases.lock().unwrap().bye(&req.origin_key);
+        for (job_id, _) in &lapsed {
+            let _ = cancel_job_with_teardown(shared, job_id);
+        }
+        return ok_json(
+            ByeResponseJson {
+                cancelled: lapsed.len() as u64,
+            }
+            .serialize_json(),
+        );
+    }
+
     // POST /job/<id>/cancel — queued: dropped immediately; running: raises
     // the job's cancel flag (the backend unwinds at the next step/tile
     // boundary, usually within seconds). 409 only for finished jobs.
@@ -560,19 +674,7 @@ fn route_post(shared: &Arc<ServiceShared>, path: &str, body: &[u8]) -> HttpServe
         .and_then(|rest| rest.strip_suffix("/cancel"))
     {
         use crate::jobs::CancelOutcome;
-        let outcome = shared.jobs.with(|store| store.cancel(job_id));
-        if outcome == CancelOutcome::Cancelled {
-            // A queued (not yet running) job was dropped outright — if it
-            // was a live session, its `RealtimeSession` was created back at
-            // `POST /realtime` time and no worker thread ever ran
-            // `execute_live_job` to tear it down. Do that here instead: any
-            // socket a client opened while the session sat queued still
-            // gets its `stopped` notice and a clean close.
-            if let Some(session) = shared.realtime_sessions.lock().unwrap().remove(job_id) {
-                session.push_bytes(crate::realtime_wire::encode_stopped_message("cancelled").into_bytes());
-                session.close_all_sockets();
-            }
-        }
+        let outcome = cancel_job_with_teardown(shared, job_id);
         return match outcome {
             CancelOutcome::Cancelled | CancelOutcome::Cancelling => {
                 match shared.jobs.with(|store| store.status_json(job_id)) {
@@ -657,17 +759,30 @@ fn route_post(shared: &Arc<ServiceShared>, path: &str, body: &[u8]) -> HttpServe
     } else {
         crate::jobs::JobClass::Heavy
     };
+    let origin = request.origin_key.clone().map(|node_key| crate::lease::Origin {
+        node_key,
+        epoch: request.origin_epoch.unwrap_or(0),
+    });
     match shared
         .jobs
         .submit_as(JobParams::Generate(params), policy, class)
     {
-        Ok(job_id) => ok_json(
-            GenerateResponseJson {
-                job_id: Some(job_id),
-                error: None,
+        Ok(job_id) => {
+            if let Some(origin) = origin {
+                let _ = shared.leases.lock().unwrap().register(
+                    &job_id,
+                    origin,
+                    crate::jobs::now_ms(),
+                );
             }
-            .serialize_json(),
-        ),
+            ok_json(
+                GenerateResponseJson {
+                    job_id: Some(job_id),
+                    error: None,
+                }
+                .serialize_json(),
+            )
+        }
         Err(refused @ (AssetAiError::Busy | AssetAiError::QueueFull(_))) => {
             generate_refused(&refused)
         }
@@ -2197,6 +2312,7 @@ mod lifecycle_tests {
             residency,
             last_used: Mutex::new(HashMap::new()),
             fleet: crate::discovery::DEFAULT_FLEET.to_string(),
+            leases: Mutex::new(crate::lease::LeaseTable::new()),
             peer: crate::peer_serve::PeerRuntime::resolve(
                 &peer_options,
                 &std::env::temp_dir(),
@@ -2297,6 +2413,67 @@ mod lifecycle_tests {
         let models = shared.models.lock().unwrap();
         assert!(matches!(models.get("old-a"), Some(ModelTrack::Ready)));
         assert!(matches!(models.get("old-b"), Some(ModelTrack::Ready)));
+    }
+
+    /// The lease lifecycle over the wire (aicore §8): a renewed job stays,
+    /// silence is reaped through the same teardown as an explicit cancel, a
+    /// restarted origin kills its previous incarnation's leases, and bye
+    /// releases everything at once.
+    #[test]
+    fn leases_renew_reap_restart_and_bye_over_the_routes() {
+        use crate::lease::Origin;
+        let shared = fixture_shared(&[]);
+        let now = crate::jobs::now_ms();
+        let origin = Origin { node_key: "origin-a".into(), epoch: 1 };
+        shared.leases.lock().unwrap().register("job-1", origin, now);
+
+        // One beat: renewed.
+        let ok = route_post(
+            &shared,
+            "/job/job-1/keepalive",
+            br#"{"origin_key":"origin-a","origin_epoch":1}"#,
+        );
+        let body = String::from_utf8(ok.body).unwrap();
+        assert!(body.contains("\"renewed\":true"), "{body}");
+
+        // Unknown job: an ordinary re-pick signal, not an HTTP error.
+        let unknown = route_post(
+            &shared,
+            "/job/job-zz/keepalive",
+            br#"{"origin_key":"origin-a","origin_epoch":1}"#,
+        );
+        let body = String::from_utf8(unknown.body).unwrap();
+        assert!(body.contains("unknown-job"), "{body}");
+
+        // A new epoch under the same key is the restart signal: the old
+        // incarnation's lease dies before the new beat is considered.
+        let restarted = route_post(
+            &shared,
+            "/job/job-1/keepalive",
+            br#"{"origin_key":"origin-a","origin_epoch":2}"#,
+        );
+        let body = String::from_utf8(restarted.body).unwrap();
+        assert!(body.contains("unknown-job"), "{body}");
+        assert!(shared.leases.lock().unwrap().is_empty());
+
+        // Bye releases everything the origin still owns, immediately.
+        let origin2 = Origin { node_key: "origin-a".into(), epoch: 2 };
+        shared.leases.lock().unwrap().register("job-2", origin2, now);
+        let bye = route_post(&shared, "/bye", br#"{"origin_key":"origin-a"}"#);
+        let body = String::from_utf8(bye.body).unwrap();
+        assert!(body.contains("\"cancelled\":1"), "{body}");
+        assert!(shared.leases.lock().unwrap().is_empty());
+
+        // The reaper cancels what silence leaves behind. Register in the
+        // past so the deadline has already lapsed.
+        let origin3 = Origin { node_key: "origin-b".into(), epoch: 1 };
+        shared
+            .leases
+            .lock()
+            .unwrap()
+            .register("job-3", origin3, now.saturating_sub(60_000));
+        assert_eq!(reap_lapsed_leases(&shared), 1);
+        assert!(shared.leases.lock().unwrap().is_empty());
     }
 
     /// What several agents talking at once are entitled to when the box fills

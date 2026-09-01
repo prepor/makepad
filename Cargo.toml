@@ -37,6 +37,7 @@ workspace.members = [
     "libs/sim",
     "libs/sim/math",
     "libs/show_control",
+    "libs/asset/creator",
     "libs/strict_json",
     # === remesh (FaithC port) / xatlas (jpcy port) ===
     "libs/remesh",

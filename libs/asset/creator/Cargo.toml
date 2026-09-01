@@ -1,0 +1,14 @@
+[package]
+name = "makepad-asset-creator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The pipeline library drives compute through the hub…
+makepad-ai-hub = { path = "../../ai/hub", default-features = false }
+# …speaks strict JSON on every wire…
+makepad-strict-json = { path = "../../strict_json" }
+# …and publishes finished assets through the client. The hub itself never
+# sees this dependency: creation is the app's side of the boundary.
+makepad-asset-client = { path = "../client" }

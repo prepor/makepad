@@ -1,4 +1,5 @@
 pub mod claude;
+pub mod claude_api;
 pub mod cli;
 pub mod codex_cli;
 pub mod fleet_http;

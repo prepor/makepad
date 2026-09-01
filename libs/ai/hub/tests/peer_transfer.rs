@@ -4,15 +4,15 @@
 //! fallback, atomic install, and inventory registration. Everything runs on
 //! localhost sockets with per-test cache dirs; no network, no GPUs.
 
-use makepad_asset_ai::backend::CancelToken;
-use makepad_asset_ai::client::{ContentProvider, LocalService};
-use makepad_asset_ai::download::{part_path, source_file_is_verified, Downloader};
-use makepad_asset_ai::http_client::{http_fetch, HttpClientRequest};
-use makepad_asset_ai::peer::{build_inventory, now_unix, PeerPlan, PeerTicket, TransferSecret};
-use makepad_asset_ai::peer_serve::PeerOptions;
-use makepad_asset_ai::protocol::{GenerateRequestJson, ModelInventoryJson};
-use makepad_asset_ai::registry::{Domain, FileSpec, Registry};
-use makepad_asset_ai::server::{start_service, ServiceConfig, ServiceHandle};
+use makepad_ai_hub::backend::CancelToken;
+use makepad_ai_hub::client::{ContentProvider, LocalService};
+use makepad_ai_hub::download::{part_path, source_file_is_verified, Downloader};
+use makepad_ai_hub::http_client::{http_fetch, HttpClientRequest};
+use makepad_ai_hub::peer::{build_inventory, now_unix, PeerPlan, PeerTicket, TransferSecret};
+use makepad_ai_hub::peer_serve::PeerOptions;
+use makepad_ai_hub::protocol::{GenerateRequestJson, ModelInventoryJson};
+use makepad_ai_hub::registry::{Domain, FileSpec, Registry};
+use makepad_ai_hub::server::{start_service, ServiceConfig, ServiceHandle};
 use makepad_micro_serde::DeJson;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -103,7 +103,7 @@ fn start_box(
             mbps,
             sources: Some(sources),
         },
-        fleet: makepad_asset_ai::discovery::DEFAULT_FLEET.to_string(),
+        fleet: makepad_ai_hub::discovery::DEFAULT_FLEET.to_string(),
     })
     .unwrap();
     let base = format!("http://{}", handle.addr);
@@ -186,9 +186,9 @@ fn plan_with_secret(sources: Vec<String>, receiver: &str) -> Arc<PeerPlan> {
 #[test]
 fn blob_endpoint_auth_allowlist_and_ranges() {
     let bytes = test_bytes(200_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let unverified = test_bytes(500);
-    let unverified_digest = makepad_asset_ai::sha256::sha256_hex(&unverified);
+    let unverified_digest = makepad_ai_hub::sha256::sha256_hex(&unverified);
     let registry = Registry::parse(&registry_json(
         &digest,
         bytes.len() as u64,
@@ -221,7 +221,7 @@ fn blob_endpoint_auth_allowlist_and_ranges() {
                 mbps: None,
                 sources: Some(Vec::new()),
             },
-            fleet: makepad_asset_ai::discovery::DEFAULT_FLEET.to_string(),
+            fleet: makepad_ai_hub::discovery::DEFAULT_FLEET.to_string(),
         })
         .unwrap();
         let base = format!("http://{}", handle.addr);
@@ -377,7 +377,7 @@ fn fetch_inventory(base: &str) -> ModelInventoryJson {
 #[test]
 fn serving_fails_closed_without_a_secret() {
     let bytes = test_bytes(4_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let cache = test_dir("no-secret");
     seed_verified(&cache, &registry.find("peer-model").unwrap().files[0], &bytes);
@@ -397,7 +397,7 @@ fn serving_fails_closed_without_a_secret() {
             mbps: None,
             sources: Some(Vec::new()),
         },
-        fleet: makepad_asset_ai::discovery::DEFAULT_FLEET.to_string(),
+        fleet: makepad_ai_hub::discovery::DEFAULT_FLEET.to_string(),
     })
     .unwrap();
     let base = format!("http://{}", handle.addr);
@@ -419,7 +419,7 @@ fn serving_fails_closed_without_a_secret() {
 #[test]
 fn receiver_fetches_from_peer_resumes_and_installs_atomically() {
     let bytes = test_bytes(300_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -717,7 +717,7 @@ fn spawn_oversized_range_peer(total: u64, digest: &str) -> LyingPeer {
 #[test]
 fn corrupt_peer_quarantines_then_next_peer_serves() {
     let bytes = test_bytes(150_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -743,7 +743,7 @@ fn corrupt_peer_quarantines_then_next_peer_serves() {
 #[test]
 fn corrupt_peer_falls_back_to_hugging_face() {
     let bytes = test_bytes(90_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -768,7 +768,7 @@ fn corrupt_peer_falls_back_to_hugging_face() {
 #[test]
 fn failed_peer_full_chunk_is_rolled_back_before_ranged_hf_fallback() {
     let bytes = test_bytes(180_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -838,7 +838,7 @@ fn cross_origin_redirect_never_forwards_a_ticket() {
 
 #[test]
 fn hostile_content_range_is_rejected_before_body_allocation() {
-    let total = makepad_asset_ai::peer_fetch::MAX_RECEIVE_CHUNK + 1;
+    let total = makepad_ai_hub::peer_fetch::MAX_RECEIVE_CHUNK + 1;
     let digest = "a".repeat(64);
     let registry = Registry::parse(&registry_json(&digest, total, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
@@ -863,7 +863,7 @@ fn hostile_content_range_is_rejected_before_body_allocation() {
 #[test]
 fn broken_and_dead_peers_are_skipped_fast() {
     let bytes = test_bytes(120_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -902,7 +902,7 @@ fn broken_and_dead_peers_are_skipped_fast() {
 #[test]
 fn pull_job_uses_coordinator_peer_source_and_registers_inventory() {
     let bytes = test_bytes(250_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -972,7 +972,7 @@ fn coordinator_tickets_work_without_a_receiver_secret() {
     // Coordinator mode: the receiver holds NO transfer secret; it can only
     // use explicitly minted tickets (and cannot serve).
     let bytes = test_bytes(80_000);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -1016,7 +1016,7 @@ fn coordinator_tickets_work_without_a_receiver_secret() {
 #[test]
 fn concurrent_serves_beyond_the_bound_get_503() {
     let bytes = test_bytes(128 * 1024);
-    let digest = makepad_asset_ai::sha256::sha256_hex(&bytes);
+    let digest = makepad_ai_hub::sha256::sha256_hex(&bytes);
     let registry = Registry::parse(&registry_json(&digest, bytes.len() as u64, None)).unwrap();
     let spec = registry.find("peer-model").unwrap().files[0].clone();
 
@@ -1041,7 +1041,7 @@ fn concurrent_serves_beyond_the_bound_get_503() {
     std::thread::sleep(Duration::from_millis(200));
     let reply = blob_get(
         &source.base,
-        &makepad_asset_ai::sha256::sha256_hex(&bytes),
+        &makepad_ai_hub::sha256::sha256_hex(&bytes),
         Some(&ticket),
         Some(&receiver),
         None,

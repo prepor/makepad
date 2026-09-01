@@ -15,8 +15,8 @@
 //! (`text`, whose expander a pipeline names and no picker shows).
 
 use crate::gen_kinds::{GenKind, GEN_KINDS};
-use makepad_asset_ai::fleet::BoxSnapshot;
-use makepad_asset_ai::protocol::{ModelInfoJson, MODEL_STATE_LOADED, MODEL_STATE_READY};
+use makepad_ai_hub::fleet::BoxSnapshot;
+use makepad_ai_hub::protocol::{ModelInfoJson, MODEL_STATE_LOADED, MODEL_STATE_READY};
 use makepad_asset_client::json::{obj, s, Value};
 use makepad_asset_client::JobProfileDto;
 
@@ -125,7 +125,7 @@ fn is_advertisable(model: &ModelInfoJson) -> bool {
 /// the profile — the job just waits).
 fn hardware_fits(snapshots: &[BoxSnapshot], model_id: &str) -> bool {
     snapshots.iter().any(|snapshot| {
-        makepad_asset_ai::fleet::model_admission(snapshot, model_id)
+        makepad_ai_hub::fleet::model_admission(snapshot, model_id)
             .is_some_and(|a| a.is_hardware_compatible())
     })
 }
@@ -180,7 +180,7 @@ fn executable_models(snapshots: &[BoxSnapshot], row: &GenKind) -> Vec<(String, S
         // A box outside its role does not serve this domain, so its copy of
         // the weights is not a capability the fleet can offer.
         if !snapshot.is_up()
-            || !makepad_asset_ai::fleet::role_allows(&snapshot.base_url, row.domain)
+            || !makepad_ai_hub::fleet::role_allows(&snapshot.base_url, row.domain)
         {
             continue;
         }
@@ -200,7 +200,7 @@ fn executable_models(snapshots: &[BoxSnapshot], row: &GenKind) -> Vec<(String, S
     // its discovery order.
     let (preferred, rest): (Vec<_>, Vec<_>) = out
         .into_iter()
-        .partition(|(_, backend)| makepad_asset_ai::fleet::is_preferred_domain_backend(row.domain, backend));
+        .partition(|(_, backend)| makepad_ai_hub::fleet::is_preferred_domain_backend(row.domain, backend));
     preferred.into_iter().chain(rest).collect()
 }
 
@@ -247,7 +247,7 @@ fn profile_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use makepad_asset_ai::protocol::{HealthJson, MODEL_STATE_ABSENT};
+    use makepad_ai_hub::protocol::{HealthJson, MODEL_STATE_ABSENT};
 
     fn model(id: &str, domain: &str, state: &str, vram_gb: f64) -> ModelInfoJson {
         ModelInfoJson {
@@ -461,7 +461,7 @@ mod tests {
     /// copy of a model must not make that model look fleet-available.
     #[test]
     fn a_role_excluded_box_advertises_nothing_for_that_domain() {
-        if std::env::var(makepad_asset_ai::fleet::FLEET_ROLES_ENV).is_ok() {
+        if std::env::var(makepad_ai_hub::fleet::FLEET_ROLES_ENV).is_ok() {
             return;
         }
         let snapshots = vec![

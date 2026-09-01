@@ -22947,7 +22947,7 @@ impl MatchEvent for App {
         // Tool chips in the chat expand/collapse on click.
         self.ui
             .widget(cx, ids!(chat_list))
-            .borrow_mut::<makepad_asset_chat_ui::AssetChatList>()
+            .borrow_mut::<makepad_chat_ui::AssetChatList>()
             .map(|mut list| list.handle_actions(cx, actions));
         if self.ui.button(cx, ids!(gen_clear)).clicked(actions) {
             // Clearing the queue also disarms the loop: otherwise the next
@@ -23834,7 +23834,7 @@ impl AppMain for App {
         makepad_render::script_mod(vm);
         makepad_xr::script_mod(vm);
         makepad_asset_widgets::script_mod(vm);
-        makepad_asset_chat_ui::script_mod(vm);
+        makepad_chat_ui::script_mod(vm);
         crate::views::script_mod(vm);
         crate::mesh_view::script_mod(vm);
         crate::flow_warp::script_mod(vm);

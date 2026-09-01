@@ -3,14 +3,14 @@
 //! http_client the sandbox will use): health, models, generate with the
 //! testpattern backend, job polling, artifact fetch, queue/reject policy.
 
-use makepad_asset_ai::client::{ContentProvider, LocalService};
-use makepad_asset_ai::download::Downloader;
-use makepad_asset_ai::error::AssetAiError;
-use makepad_asset_ai::http_client::{http_fetch, HttpClientRequest};
-use makepad_asset_ai::protocol::{GenerateRequestJson, RealtimeRequestJson, RealtimeResponseJson};
-use makepad_asset_ai::realtime_wire::{self, FrameHeader, FrameKind};
-use makepad_asset_ai::registry::{Domain, Registry};
-use makepad_asset_ai::server::{start_service, ServiceConfig};
+use makepad_ai_hub::client::{ContentProvider, LocalService};
+use makepad_ai_hub::download::Downloader;
+use makepad_ai_hub::error::AssetAiError;
+use makepad_ai_hub::http_client::{http_fetch, HttpClientRequest};
+use makepad_ai_hub::protocol::{GenerateRequestJson, RealtimeRequestJson, RealtimeResponseJson};
+use makepad_ai_hub::realtime_wire::{self, FrameHeader, FrameKind};
+use makepad_ai_hub::registry::{Domain, Registry};
+use makepad_ai_hub::server::{start_service, ServiceConfig};
 use makepad_live_id::LiveId;
 use makepad_micro_serde::{DeJson, SerJson};
 use makepad_network::plain_web_socket::PlainWebSocket;
@@ -29,10 +29,10 @@ fn test_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn peer_off() -> makepad_asset_ai::peer_serve::PeerOptions {
+fn peer_off() -> makepad_ai_hub::peer_serve::PeerOptions {
     // Tests must not race on process-global env: pin the peer lane off with
     // explicit options unless a test opts in.
-    makepad_asset_ai::peer_serve::PeerOptions {
+    makepad_ai_hub::peer_serve::PeerOptions {
         serve: Some(false),
         sources: Some(Vec::new()),
         ..Default::default()
@@ -47,7 +47,7 @@ fn start_test_service(name: &str) -> LocalService {
         registry: Registry::embedded().unwrap(),
         downloader: Downloader::new("http://127.0.0.1:1", None).unwrap(),
         peer: peer_off(),
-        fleet: makepad_asset_ai::discovery::DEFAULT_FLEET.to_string(),
+        fleet: makepad_ai_hub::discovery::DEFAULT_FLEET.to_string(),
     })
     .unwrap();
     let provider = LocalService::new(&format!("http://{}", handle.addr));
@@ -110,7 +110,7 @@ fn health_and_models() {
     // CPU/Metal fallback, so a mac/CI test run with `--features flux` must
     // still list flux unavailable, fail-closed.
     let expect_flux =
-        cfg!(feature = "flux") && makepad_asset_ai::backend::backend_provisioned("flux");
+        cfg!(feature = "flux") && makepad_ai_hub::backend::backend_provisioned("flux");
     let schnell = models.iter().find(|m| m.id == "flux1-schnell").unwrap();
     assert_eq!(schnell.state, "absent");
     assert_eq!(schnell.available, expect_flux);
@@ -445,12 +445,12 @@ fn artifact_handoff_is_hash_verified() {
         // then the JSON-level verifier must agree on the same bytes.
         let fetched = provider.fetch_artifact(&artifact.id).unwrap();
         assert_eq!(fetched.bytes.len() as u64, len);
-        makepad_asset_ai::client::verify_artifact_bytes(&fetched.bytes, artifact).unwrap();
+        makepad_ai_hub::client::verify_artifact_bytes(&fetched.bytes, artifact).unwrap();
 
         // A corrupted relay is refused explicitly.
         let mut corrupted = fetched.bytes.clone();
         corrupted[0] ^= 0xff;
-        let refused = makepad_asset_ai::client::verify_artifact_bytes(&corrupted, artifact);
+        let refused = makepad_ai_hub::client::verify_artifact_bytes(&corrupted, artifact);
         assert!(refused.is_err(), "corrupted bytes must not verify");
     }
 
@@ -478,7 +478,7 @@ fn node_identity_is_durable_and_capabilities_are_honest() {
             registry: Registry::embedded().unwrap(),
             downloader: Downloader::new("http://127.0.0.1:1", None).unwrap(),
             peer: peer_off(),
-            fleet: makepad_asset_ai::discovery::DEFAULT_FLEET.to_string(),
+            fleet: makepad_ai_hub::discovery::DEFAULT_FLEET.to_string(),
         })
         .unwrap();
         // Dropping the handle releases the per-cache-dir singleton lock —
@@ -523,7 +523,7 @@ fn models_report_revision_and_explicit_unavailable_reason() {
     // capability -> "not provisioned"). Only a CUDA box with the feature
     // shows it available with no reason.
     let flux = models.iter().find(|m| m.id == "flux1-schnell").unwrap();
-    if cfg!(feature = "flux") && makepad_asset_ai::backend::backend_provisioned("flux") {
+    if cfg!(feature = "flux") && makepad_ai_hub::backend::backend_provisioned("flux") {
         assert!(flux.available);
         assert!(flux.unavailable_reason.is_none());
     } else {
@@ -787,7 +787,7 @@ fn realtime_post_admission_errors_match_generate_semantics() {
 
     // A registered-but-unavailable model 503s before the live-support check
     // even runs — same admission order as POST /generate.
-    let expect_flux = cfg!(feature = "flux") && makepad_asset_ai::backend::backend_provisioned("flux");
+    let expect_flux = cfg!(feature = "flux") && makepad_ai_hub::backend::backend_provisioned("flux");
     let (status, response) = post_realtime(
         &base_url,
         &RealtimeRequestJson {

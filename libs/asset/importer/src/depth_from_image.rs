@@ -373,14 +373,14 @@ fn thumbnail_for(png: &[u8]) -> (Vec<u8>, &'static str, (u32, u32)) {
 
 pub struct AssetAiDepthFleet {
     boxes: Vec<String>,
-    discovered: Option<makepad_asset_ai::discovery::Discovered>,
+    discovered: Option<makepad_ai_hub::discovery::Discovered>,
     routes: std::collections::HashMap<String, String>,
     log: bool,
 }
 
 impl AssetAiDepthFleet {
     pub fn from_fleet_file(path: &std::path::Path, log: bool) -> Result<Self, String> {
-        let config = makepad_asset_ai::fleet::FleetConfig::load_file(path)
+        let config = makepad_ai_hub::fleet::FleetConfig::load_file(path)
             .map_err(|e| format!("fleet config {}: {e}", path.display()))?;
         let boxes = config.boxes.clone();
         if boxes.is_empty() {
@@ -397,7 +397,7 @@ impl AssetAiDepthFleet {
     pub fn from_lan(log: bool) -> Self {
         Self {
             boxes: Vec::new(),
-            discovered: Some(makepad_asset_ai::discovery::start_listener()),
+            discovered: Some(makepad_ai_hub::discovery::start_listener()),
             routes: std::collections::HashMap::new(),
             log,
         }
@@ -415,9 +415,9 @@ impl AssetAiDepthFleet {
         boxes
     }
 
-    fn snapshots(&self) -> Vec<makepad_asset_ai::fleet::BoxSnapshot> {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
-        use makepad_asset_ai::fleet::BoxSnapshot;
+    fn snapshots(&self) -> Vec<makepad_ai_hub::fleet::BoxSnapshot> {
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::fleet::BoxSnapshot;
         let boxes = self.boxes();
         let mut snapshots = Vec::with_capacity(boxes.len());
         for url in &boxes {
@@ -441,10 +441,10 @@ impl AssetAiDepthFleet {
 
 impl DepthFleet for AssetAiDepthFleet {
     fn dispatch(&mut self, request: &DepthRequest) -> Result<DepthDispatch, String> {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
-        use makepad_asset_ai::fleet::pick_for_domain_admitted_scored;
-        use makepad_asset_ai::protocol::GenerateRequestJson;
-        use makepad_asset_ai::registry::Domain;
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::fleet::pick_for_domain_admitted_scored;
+        use makepad_ai_hub::protocol::GenerateRequestJson;
+        use makepad_ai_hub::registry::Domain;
         if request.content_type != "image/png" {
             return Err(format!(
                 "da3-metric-large requires PNG input (got {})",
@@ -476,8 +476,8 @@ impl DepthFleet for AssetAiDepthFleet {
                     version: "registry".to_string(),
                 })
             }
-            Err(makepad_asset_ai::AssetAiError::Busy)
-            | Err(makepad_asset_ai::AssetAiError::QueueFull(_)) => Ok(DepthDispatch::Waiting {
+            Err(makepad_ai_hub::AssetAiError::Busy)
+            | Err(makepad_ai_hub::AssetAiError::QueueFull(_)) => Ok(DepthDispatch::Waiting {
                 stage: "waiting-for-fleet: box busy".to_string(),
             }),
             Err(error) => Err(scrub(&error.to_string(), &base_url)),
@@ -485,8 +485,8 @@ impl DepthFleet for AssetAiDepthFleet {
     }
 
     fn poll(&mut self, fleet_job: &str) -> Result<DepthPoll, String> {
-        use makepad_asset_ai::client::{verify_artifact_bytes, ContentProvider, LocalService};
-        use makepad_asset_ai::protocol::{JOB_STATE_CANCELLED, JOB_STATE_DONE, JOB_STATE_ERROR};
+        use makepad_ai_hub::client::{verify_artifact_bytes, ContentProvider, LocalService};
+        use makepad_ai_hub::protocol::{JOB_STATE_CANCELLED, JOB_STATE_DONE, JOB_STATE_ERROR};
         let Some(base_url) = self.routes.get(fleet_job).cloned() else {
             return Err("unknown fleet job".to_string());
         };
@@ -545,7 +545,7 @@ impl DepthFleet for AssetAiDepthFleet {
     }
 
     fn cancel(&mut self, fleet_job: &str) {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
         if let Some(base_url) = self.routes.get(fleet_job) {
             let provider = LocalService::new(base_url);
             let _ = provider.cancel(fleet_job);

@@ -1,8 +1,8 @@
-//! makepad-asset-ai service binary. Runs on each GPU box; wraps all AI
+//! makepad-ai-hub service binary. Runs on each GPU box; wraps all AI
 //! content generation behind a port.
 //!
 //! ```text
-//! makepad-asset-ai [--port N] [--host ADDR] [--cache-dir PATH] [--registry PATH]
+//! makepad-ai-hub [--port N] [--host ADDR] [--cache-dir PATH] [--registry PATH]
 //!
 //!   --port      listen port          (env MAKEPAD_ASSET_AI_PORT, default 8765)
 //!   --host      bind address         (default 0.0.0.0)
@@ -16,10 +16,10 @@
 //!   env MAKEPAD_ASSET_AI_HF_BASE   alternate HF endpoint / LAN mirror
 //! ```
 
-use makepad_asset_ai::download::Downloader;
-use makepad_asset_ai::registry::Registry;
-use makepad_asset_ai::server::{start_service, ServiceConfig};
-use makepad_asset_ai::{AssetAiError, DEFAULT_PORT, SERVICE_NAME, SERVICE_VERSION};
+use makepad_ai_hub::download::Downloader;
+use makepad_ai_hub::registry::Registry;
+use makepad_ai_hub::server::{start_service, ServiceConfig};
+use makepad_ai_hub::{AssetAiError, DEFAULT_PORT, SERVICE_NAME, SERVICE_VERSION};
 use std::path::PathBuf;
 
 fn main() {
@@ -91,8 +91,8 @@ fn run() -> Result<(), AssetAiError> {
         },
     };
     let cache_dir = cache_dir.unwrap_or_else(default_cache_dir);
-    let fleet = makepad_asset_ai::discovery::normalize_fleet(
-        &fleet.unwrap_or_else(makepad_asset_ai::discovery::fleet_from_env),
+    let fleet = makepad_ai_hub::discovery::normalize_fleet(
+        &fleet.unwrap_or_else(makepad_ai_hub::discovery::fleet_from_env),
     );
 
     // Registry: explicit path > registry.json dropped into the cache dir

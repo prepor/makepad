@@ -13,8 +13,8 @@
 //! the rate meter reads the serving box's own token counts, and that
 //! Escape's cancel really ends a turn in flight.
 
-use makepad_asset_chat_ui::feed::{ChatFeed, FeedConfig, NoClientTools};
-use makepad_asset_chat_ui::transcript::{ChatData, ChatRole, CHAT};
+use makepad_chat_ui::feed::{ChatFeed, FeedConfig, NoClientTools};
+use makepad_chat_ui::transcript::{ChatData, ChatRole, CHAT};
 use makepad_asset_client::ApiEndpoints;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};

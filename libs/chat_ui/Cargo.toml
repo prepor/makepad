@@ -18,19 +18,19 @@
 # into the server.
 
 [package]
-name = "makepad-asset-chat-ui"
+name = "makepad-chat-ui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Shared chat pane for Makepad apps: broker session transport, transcript + rate meter, and the transcript widget"
 
 [dependencies]
-makepad-widgets = { path = "../../../widgets" }
-makepad-asset-chat = { path = "../chat" }
-makepad-asset-client = { path = "../client" }
+makepad-widgets = { path = "../../widgets" }
+makepad-asset-chat = { path = "../asset/chat" }
+makepad-asset-client = { path = "../asset/client" }
 
 [dev-dependencies]
 # The e2e proof runs against a REAL Asset Server with a scripted serving
 # lane: session create, the worker channel, the event stream and the
 # client-tool park are all the real code paths — only the GPU is a fixture.
-makepad-asset-store = { path = "../store" }
+makepad-asset-store = { path = "../asset/store" }

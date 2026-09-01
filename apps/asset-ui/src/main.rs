@@ -5,7 +5,7 @@
 //!
 //! - FLEET: GPU boxes announce themselves on the LAN UDP beacon; the app
 //!   joins whatever is live. Capabilities come from /health + /models, jobs
-//!   are routed by the model-affinity scheduler in `makepad_asset_ai::fleet`
+//!   are routed by the model-affinity scheduler in `makepad_ai_hub::fleet`
 //!   — observable (per-stage "affinity: loaded") and overridable (pin a
 //!   model and/or a box from the dropdowns).
 //! - PIPELINE: one-click preset chains (prompt → expand → image → mesh,
@@ -252,7 +252,7 @@ use makepad_micro_serde::SerJson;
 use makepad_widgets::*;
 use makepad_xr::obj::ViewSplat;
 use std::collections::{HashMap, HashSet, VecDeque};
-use makepad_asset_ai::fleet::BoxSnapshot;
+use makepad_ai_hub::fleet::BoxSnapshot;
 use std::path::{Path, PathBuf};
 
 app_main!(App);
@@ -4027,7 +4027,7 @@ pub struct App {
     fleet_timer: Timer,
     /// LAN beacon listener; polled on the fleet timer.
     #[rust]
-    discovered: Option<makepad_asset_ai::discovery::Discovered>,
+    discovered: Option<makepad_ai_hub::discovery::Discovered>,
     #[rust]
     job_timer: Timer,
     #[rust]
@@ -4362,7 +4362,7 @@ impl App {
         }
         log!(
             "fleet: listening for '{}' beacons (MAKEPAD_AI_FLEET)",
-            makepad_asset_ai::discovery::wanted_fleet()
+            makepad_ai_hub::discovery::wanted_fleet()
         );
         // The store hosts the embedded Asset Server; hand it the library it
         // must publish. Library::open ran above, so the product backfill is
@@ -4381,7 +4381,7 @@ impl App {
         // empty library changes nothing.
         self.refresh_gallery(cx, true);
 
-        self.discovered = Some(makepad_asset_ai::discovery::start_listener());
+        self.discovered = Some(makepad_ai_hub::discovery::start_listener());
         self.fleet = Some(FleetPoll::new());
         self.maybe_connect_chat(cx);
         self.fleet_timer = cx.start_interval(3.0);
@@ -4795,7 +4795,7 @@ impl App {
                 };
             }
         }
-        if let Some(license) = makepad_asset_ai::registry::license_for_model(model_id) {
+        if let Some(license) = makepad_ai_hub::registry::license_for_model(model_id) {
             let identity = license.identity();
             return LicensePrompt {
                 model_id: model_id.to_string(),
@@ -5119,7 +5119,7 @@ impl App {
         };
         self.ui.label(cx, ids!(fleet_box_status)).set_text(cx, &status);
         // Live jobs (running first, then queued) — other clients' included.
-        let jobs: Vec<makepad_asset_ai::protocol::JobStatusJson> = self
+        let jobs: Vec<makepad_ai_hub::protocol::JobStatusJson> = self
             .fleet
             .as_ref()
             .and_then(|fleet| {
@@ -5889,7 +5889,7 @@ impl App {
             return;
         };
         let first_domain = PRESETS[preset_index].domains[0];
-        if makepad_asset_ai::fleet::pick_for_domain(&self.routing_snapshots(), first_domain).is_none() {
+        if makepad_ai_hub::fleet::pick_for_domain(&self.routing_snapshots(), first_domain).is_none() {
             return; // wait for discovery
         }
         self.auto.fired = true;
@@ -6194,7 +6194,7 @@ impl App {
             self.open_license_modal(cx, prompt);
             return;
         }
-        let request = makepad_asset_ai::protocol::GenerateRequestJson {
+        let request = makepad_ai_hub::protocol::GenerateRequestJson {
             model: model.clone(),
             pull_only: Some(true),
             queue_policy: Some("queue".to_string()),
@@ -6352,8 +6352,8 @@ impl App {
                 // A big-enough occupied GPU remains a capable queue target;
                 // a physically undersized GPU does not.
                 let admission = match &pinned_model {
-                    Some(model) => makepad_asset_ai::fleet::model_admission(snapshot, model),
-                    None => makepad_asset_ai::fleet::domain_admission(snapshot, &domain),
+                    Some(model) => makepad_ai_hub::fleet::model_admission(snapshot, model),
+                    None => makepad_ai_hub::fleet::domain_admission(snapshot, &domain),
                 };
                 let capable = admission.is_some_and(|state| state.is_hardware_compatible());
                 let vram_waiting = admission.is_some_and(|state| state.is_waiting());
@@ -8305,7 +8305,7 @@ impl App {
             return;
         };
         let rgba = webcam::bgra_to_rgba8(&frame.bgra);
-        let Ok(png) = makepad_asset_ai::testpattern::encode_png_rgba(&rgba, frame.width, frame.height)
+        let Ok(png) = makepad_ai_hub::testpattern::encode_png_rgba(&rgba, frame.width, frame.height)
         else {
             self.set_webcam_status(cx, "snapshot PNG encode failed");
             return;
@@ -8408,7 +8408,7 @@ impl App {
                         (px >> 24) as u8,
                     ]);
                 }
-                makepad_asset_ai::testpattern::encode_png_rgba(&rgba, image.width, image.height)
+                makepad_ai_hub::testpattern::encode_png_rgba(&rgba, image.width, image.height)
                     .ok()
             }) {
                 Some(png) => png,
@@ -8752,7 +8752,7 @@ impl App {
                     .count();
                 if differing * 200 > width * height {
                     if let Ok(png) =
-                        makepad_asset_ai::testpattern::encode_png_rgba(&bgra, width, height)
+                        makepad_ai_hub::testpattern::encode_png_rgba(&bgra, width, height)
                     {
                         match self
                             .library
@@ -13505,7 +13505,7 @@ impl MatchEvent for App {
         // Tool chips in the chat expand/collapse on click.
         self.ui
             .widget(cx, ids!(chat_list))
-            .borrow_mut::<makepad_asset_chat_ui::AssetChatList>()
+            .borrow_mut::<makepad_chat_ui::AssetChatList>()
             .map(|mut list| list.handle_actions(cx, actions));
         // Library filters re-run on every keystroke / dropdown pick and go
         // straight onto the server query.
@@ -14571,7 +14571,7 @@ impl AppMain for App {
         crate::thumbnail_renderer::script_mod(vm);
         // The shared chat pane (also the sandbox's): transcript list,
         // tool chips, think dots.
-        makepad_asset_chat_ui::script_mod(vm);
+        makepad_chat_ui::script_mod(vm);
         self::script_mod(vm)
     }
 

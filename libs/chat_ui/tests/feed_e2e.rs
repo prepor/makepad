@@ -9,8 +9,8 @@
 //! scripted.
 
 use makepad_asset_chat::wire::ToolOutcome;
-use makepad_asset_chat_ui::feed::{ChatFeed, ClientTools, FeedConfig};
-use makepad_asset_chat_ui::transcript::{ChatData, ChatRole, CHAT};
+use makepad_chat_ui::feed::{ChatFeed, ClientTools, FeedConfig};
+use makepad_chat_ui::transcript::{ChatData, ChatRole, CHAT};
 use makepad_asset_client::json::{self, Value};
 use makepad_asset_client::{ApiEndpoints, ChatProviderKind};
 use makepad_asset_store::{

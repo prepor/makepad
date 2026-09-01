@@ -170,13 +170,13 @@ fn run(args: &[String]) -> i32 {
         },
         None => flag(args, "--prompt").map(|p| if p == "text" { "" } else { p }).unwrap_or("").to_string(),
     };
-    let prompt = makepad_asset_ai::ocr_backend::OcrPrompt::from_wire(&prompt_text);
+    let prompt = makepad_ai_hub::ocr_backend::OcrPrompt::from_wire(&prompt_text);
     let max_new_tokens: u32 = flag(args, "--max-tokens")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(makepad_asset_ai::ocr_backend::DEFAULT_NEW_TOKENS);
+        .unwrap_or(makepad_ai_hub::ocr_backend::DEFAULT_NEW_TOKENS);
     let retries: u32 = flag(args, "--retries")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(makepad_asset_ai::ocr_backend::DEFAULT_RETRIES);
+        .unwrap_or(makepad_ai_hub::ocr_backend::DEFAULT_RETRIES);
     let resume = has_flag(args, "--resume");
     let lanes: usize = flag(args, "--lanes")
         .and_then(|v| v.parse().ok())
@@ -191,9 +191,9 @@ fn run(args: &[String]) -> i32 {
         .max(lanes);
     let lane_driver = has_flag(args, "--lane-driver") || lanes > 1;
 
-    use makepad_asset_ai::backend::CancelToken;
-    use makepad_asset_ai::ocr_backend::{page_fit, OcrBackend, OcrRequest, MAX_INPUT_PIXELS};
-    use makepad_asset_ai::vision_backend::decode_image_rgb8_within;
+    use makepad_ai_hub::backend::CancelToken;
+    use makepad_ai_hub::ocr_backend::{page_fit, OcrBackend, OcrRequest, MAX_INPUT_PIXELS};
+    use makepad_ai_hub::vision_backend::decode_image_rgb8_within;
 
     let mut pages = collect_pages(&pages_dir);
     if pages.is_empty() {
@@ -240,8 +240,8 @@ fn run(args: &[String]) -> i32 {
     eprintln!(
         "[bench] loaded in {:.1}s: {lanes} lane(s) x {} tokens",
         t_load.elapsed().as_secs_f64(),
-        makepad_asset_ai::ocr_backend::context_for_lanes(
-            makepad_asset_ai::ocr_backend::MAX_CONTEXT,
+        makepad_ai_hub::ocr_backend::context_for_lanes(
+            makepad_ai_hub::ocr_backend::MAX_CONTEXT,
             lanes
         )
     );
@@ -410,18 +410,18 @@ fn run(args: &[String]) -> i32 {
 /// Returns false when the batch failed outright, which ends the run.
 #[allow(clippy::too_many_arguments)]
 fn lane_run(
-    backend: &makepad_asset_ai::ocr_backend::OcrBackend,
+    backend: &makepad_ai_hub::ocr_backend::OcrBackend,
     decoded: &[((usize, usize), PathBuf, String, String)],
-    prompt: &makepad_asset_ai::ocr_backend::OcrPrompt,
+    prompt: &makepad_ai_hub::ocr_backend::OcrPrompt,
     max_new_tokens: u32,
     retries: u32,
     batch: usize,
     total: usize,
     tally: &mut Tally,
 ) -> bool {
-    use makepad_asset_ai::backend::CancelToken;
-    use makepad_asset_ai::ocr_backend::{OcrRequest, MAX_INPUT_PIXELS};
-    use makepad_asset_ai::vision_backend::decode_image_rgb8_within;
+    use makepad_ai_hub::backend::CancelToken;
+    use makepad_ai_hub::ocr_backend::{OcrRequest, MAX_INPUT_PIXELS};
+    use makepad_ai_hub::vision_backend::decode_image_rgb8_within;
 
     for (group_index, group) in decoded.chunks(batch).enumerate() {
         let mut requests = Vec::with_capacity(group.len());
@@ -511,7 +511,7 @@ impl Tally {
         stem: &str,
         w: usize,
         h: usize,
-        page: &makepad_asset_ai::ocr_backend::OcrPage,
+        page: &makepad_ai_hub::ocr_backend::OcrPage,
         total_s: f64,
     ) {
         let class_dir = self.out_dir.join(class);
@@ -611,8 +611,8 @@ fn reference_kernels(on: bool, keep: &[String]) {
 /// configuration that encode is supposed to be measuring.
 fn vision_parity(args: &[String]) -> i32 {
     use makepad_ai_llm::{preprocess_rgb8, GgufFile, VisionConfig, VisionTower};
-    use makepad_asset_ai::ocr_backend::{page_fit, resample_rgb8, MAX_INPUT_PIXELS};
-    use makepad_asset_ai::vision_backend::decode_image_rgb8_within;
+    use makepad_ai_hub::ocr_backend::{page_fit, resample_rgb8, MAX_INPUT_PIXELS};
+    use makepad_ai_hub::vision_backend::decode_image_rgb8_within;
 
     let Some(mmproj) = flag(args, "--mmproj") else {
         eprintln!("vision-parity: --mmproj <mmproj.gguf> is required");

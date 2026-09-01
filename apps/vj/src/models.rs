@@ -15,9 +15,9 @@
 //! are MIT, so no acknowledgement is recorded — the dialog is information,
 //! not a gate ceremony.
 
-use makepad_asset_ai::backend::CancelToken;
-use makepad_asset_ai::download::{DownloadProgress, Downloader};
-use makepad_asset_ai::registry::FileSpec;
+use makepad_ai_hub::backend::CancelToken;
+use makepad_ai_hub::download::{DownloadProgress, Downloader};
+use makepad_ai_hub::registry::FileSpec;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
@@ -202,7 +202,7 @@ pub fn start_install(models: Vec<&'static VjModel>) -> InstallHandle {
                         );
                         let _ = out.send(InstallMsg::Done { short: model.short });
                     }
-                    Err(makepad_asset_ai::error::AssetAiError::Cancelled) => {
+                    Err(makepad_ai_hub::error::AssetAiError::Cancelled) => {
                         let _ = out.send(InstallMsg::Cancelled);
                         break;
                     }

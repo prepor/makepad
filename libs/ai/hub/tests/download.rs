@@ -2,11 +2,11 @@
 //! download, Range resume, redirect following, servers that ignore Range,
 //! and sha256 verification.
 
-use makepad_asset_ai::backend::CancelToken;
-use makepad_asset_ai::download::{part_path, Downloader};
-use makepad_asset_ai::error::AssetAiError;
-use makepad_asset_ai::registry::FileSpec;
-use makepad_asset_ai::sha256::sha256_hex;
+use makepad_ai_hub::backend::CancelToken;
+use makepad_ai_hub::download::{part_path, Downloader};
+use makepad_ai_hub::error::AssetAiError;
+use makepad_ai_hub::registry::FileSpec;
+use makepad_ai_hub::sha256::sha256_hex;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;

@@ -1663,7 +1663,7 @@ fn start_embedded_asset_server_at(
     // The chat broker listens for the SAME fleet this app's panel shows
     // (`MAKEPAD_AI_FLEET`, defaulted in `setup` before this runs). Left
     // empty it followed its own default and heard none of the `gen` boxes.
-    cfg.chat.fleet = makepad_asset_ai::discovery::wanted_fleet();
+    cfg.chat.fleet = makepad_ai_hub::discovery::wanted_fleet();
     cfg.log = true;
     let server = makepad_asset_store::AssetServer::start(cfg)
         .map_err(|e| format!("embedded asset server: {e}"))?;

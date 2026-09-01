@@ -2417,7 +2417,7 @@ frame 1 A 2 64 64 trooper_a2.png
         let dir = TestDir::new("audio-provenance");
         let mut library = Library::open(&dir.0);
         let samples: Vec<f32> = (0..64).map(|i| (i as f32 / 8.0).sin() * 0.5).collect();
-        let wav_bytes = makepad_asset_ai::wav::encode_wav_pcm16_mono(&samples, 24_000);
+        let wav_bytes = makepad_ai_hub::wav::encode_wav_pcm16_mono(&samples, 24_000);
 
         // A poisoned caller thumbnail (e.g. the upstream pipeline image) is
         // DISCARDED; the sidecar is the payload's own waveform strip.

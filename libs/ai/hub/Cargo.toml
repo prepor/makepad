@@ -1,5 +1,5 @@
 [package]
-name = "makepad-asset-ai"
+name = "makepad-ai-hub"
 version = "0.2.0"
 edition = "2021"
 description = "AI content generation service: wraps local GPU model runtimes (image/mesh/video/audio) behind an HTTP port, with on-demand HuggingFace model download"
@@ -92,7 +92,7 @@ makepad-base64 = { path = "../../base64" }
 makepad-network = { path = "../../../platform/network" }
 # Reuse-group UDP bind for the fleet beacon listener (several apps on one
 # machine listen at once); the client crate owns that socket helper.
-makepad-asset-client = { path = "../client" }
+makepad-asset-client = { path = "../../asset/client" }
 makepad-zune-core = { path = "../../zune/zune-core" }
 makepad-zune-png = { path = "../../zune/zune-png" }
 # Vision-domain request images arrive as PNG or JPEG.
@@ -134,10 +134,6 @@ makepad-live-id = { path = "../../live_id" }
 # encoding/decoding with the same hardware codec seam the service uses
 # internally (behind the crate's own optional/default `video` feature).
 makepad-video = { path = "../../../platform/video" }
-
-[[bin]]
-name = "makepad-asset-ai"
-path = "src/main.rs"
 
 # The standing "is chat slow right now?" check. Its own code is std-only —
 # no HTTP or JSON crate — so what it measures is the box, not a client

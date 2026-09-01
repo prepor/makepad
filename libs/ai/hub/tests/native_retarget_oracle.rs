@@ -1,6 +1,6 @@
 #![cfg(feature = "motion-native")]
 
-use makepad_asset_ai::motion_retarget::{
+use makepad_ai_hub::motion_retarget::{
     retarget_hy_motion_glb_with_report, HyMotionClipRef, RetargetOptions,
 };
 use makepad_ai_motion::hy_motion_decode::HyMotionDecoded;

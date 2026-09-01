@@ -9,14 +9,14 @@
 //! - every fetched artifact also routes to the matching viewer.
 //!
 //! Box choice per stage = the fleet affinity scheduler
-//! (`makepad_asset_ai::fleet`): loaded > ready > downloading > absent,
+//! (`makepad_ai_hub::fleet`): loaded > ready > downloading > absent,
 //! tiebreak queue depth, evaluated at stage START (a chain's later stages
 //! see fresh snapshots). Text expansion has one deliberate policy layer:
 //! a ready Qwen3.8-27B outranks the smaller fallback, but an absent or still
 //! downloading 3.8 never displaces the already-ready qwen3.5-9b lane.
 
-use makepad_asset_ai::fleet::{self, BoxSnapshot};
-use makepad_asset_ai::protocol::{
+use makepad_ai_hub::fleet::{self, BoxSnapshot};
+use makepad_ai_hub::protocol::{
     ArtifactRefJson, GenerateRequestJson, GenerateResponseJson, JobStatusJson, NamedInputJson, LoraRefJson};
 use makepad_micro_serde::{DeJson, SerJson};
 use makepad_widgets::*;
@@ -355,8 +355,8 @@ fn pick_ready_model_target(
                     model.available
                         && matches!(
                             model.state.as_str(),
-                            makepad_asset_ai::protocol::MODEL_STATE_READY
-                                | makepad_asset_ai::protocol::MODEL_STATE_LOADED
+                            makepad_ai_hub::protocol::MODEL_STATE_READY
+                                | makepad_ai_hub::protocol::MODEL_STATE_LOADED
                         )
                 })
         })
@@ -1642,7 +1642,7 @@ impl Pipeline {
             // Music3 can stop earlier when it emits its end-of-audio token.
             "music" => {
                 let (description, lyrics) =
-                    makepad_asset_ai::music3_backend::split_music_prompt(&prompt);
+                    makepad_ai_hub::music3_backend::split_music_prompt(&prompt);
                 // An expansion stage promises the template's `Lyrics:`
                 // section (instrumental requests still carry it, holding
                 // only [Instrumental]). Its absence means the expander
@@ -3432,7 +3432,7 @@ impl Pipeline {
                     );
                 };
                 if let Err(error) =
-                    makepad_asset_ai::client::verify_artifact_bytes(&bytes, &artifact)
+                    makepad_ai_hub::client::verify_artifact_bytes(&bytes, &artifact)
                 {
                     return self.candidate_failed(
                         cx,
@@ -3985,7 +3985,7 @@ mod tests {
     }
 
     fn image_snapshot(url: &str, node_key: &str) -> BoxSnapshot {
-        use makepad_asset_ai::protocol::{HealthJson, ModelInfoJson, MODEL_STATE_LOADED};
+        use makepad_ai_hub::protocol::{HealthJson, ModelInfoJson, MODEL_STATE_LOADED};
         BoxSnapshot {
             base_url: url.to_string(),
             health: Some(HealthJson {
@@ -4030,7 +4030,7 @@ mod tests {
     }
 
     fn text_snapshot(url: &str, models: &[(&str, &str)]) -> BoxSnapshot {
-        use makepad_asset_ai::protocol::{HealthJson, ModelInfoJson, MODEL_STATE_LOADED};
+        use makepad_ai_hub::protocol::{HealthJson, ModelInfoJson, MODEL_STATE_LOADED};
         BoxSnapshot {
             base_url: url.to_string(),
             health: Some(HealthJson {
@@ -4087,7 +4087,7 @@ mod tests {
 
     #[test]
     fn qwen38_expand_preference_is_ready_gated_and_falls_back() {
-        use makepad_asset_ai::protocol::{
+        use makepad_ai_hub::protocol::{
             MODEL_STATE_ABSENT, MODEL_STATE_DOWNLOADING, MODEL_STATE_LOADED, MODEL_STATE_READY,
         };
 
@@ -4938,13 +4938,13 @@ Arrangement: Pulsing bass, gated drums and widening analog pads."
             .contains("dropped identity anchor"));
     }
 
-    fn registry() -> makepad_asset_ai::registry::Registry {
+    fn registry() -> makepad_ai_hub::registry::Registry {
         let text = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../libs/asset/ai/registry.json"
         ))
             .expect("registry.json readable");
-        makepad_asset_ai::registry::Registry::parse(&text).expect("registry parses")
+        makepad_ai_hub::registry::Registry::parse(&text).expect("registry parses")
     }
 
     #[test]

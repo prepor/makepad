@@ -2,12 +2,12 @@
 //! their fail-closed selection machinery. Hermetic: registry data + pure
 //! decision functions only — no GPU, no network, no model files.
 
-use makepad_asset_ai::gpu::GpuInfo;
-use makepad_asset_ai::h3_backend::{
+use makepad_ai_hub::gpu::GpuInfo;
+use makepad_ai_hub::h3_backend::{
     check_canvas_within_tier, check_gpu_requirements, tier_plan_for_spec, H3TierKind,
 };
-use makepad_asset_ai::registry::Registry;
-use makepad_asset_ai::residency::{estimated_peak_mb, DEFAULT_RESERVE_MB};
+use makepad_ai_hub::registry::Registry;
+use makepad_ai_hub::residency::{estimated_peak_mb, DEFAULT_RESERVE_MB};
 
 fn gpu(vram_total_mb: u64, compute_cap: f64) -> GpuInfo {
     GpuInfo {
@@ -59,7 +59,7 @@ fn tier_manifests_place_on_the_fleet_exactly() {
     let rtx4090 = gpu(24_564, 8.9); // .123
     let rtx5090 = gpu(32_607, 12.0); // .217
     let rtx6000 = gpu(97_887, 12.0); // .169
-    let gate = |spec: &makepad_asset_ai::registry::ModelSpec, gpu: &GpuInfo| {
+    let gate = |spec: &makepad_ai_hub::registry::ModelSpec, gpu: &GpuInfo| {
         check_gpu_requirements(&spec.id, spec.min_vram_gb, spec.min_compute_cap, gpu)
     };
     assert!(gate(q4, &rtx4090).is_ok());
@@ -84,7 +84,7 @@ fn tier_manifests_place_on_the_fleet_exactly() {
     // `vram_gb`. Pin this second gate against the actual NVML totals: the
     // named quant tiers must remain routable on their real cards, not merely
     // pass the backend's independent min-VRAM/compute-cap checks above.
-    let required = |spec: &makepad_asset_ai::registry::ModelSpec| {
+    let required = |spec: &makepad_ai_hub::registry::ModelSpec| {
         estimated_peak_mb(spec).saturating_add(DEFAULT_RESERVE_MB)
     };
     assert_eq!(required(q4), 22 * 1024);

@@ -2259,7 +2259,7 @@ fn sleep_sliced(total: Duration, stop: &AtomicBool) {
 /// without any cross-worker coordination.
 pub struct AssetAiFleet {
     boxes: Vec<String>,
-    discovered: Option<makepad_asset_ai::discovery::Discovered>,
+    discovered: Option<makepad_ai_hub::discovery::Discovered>,
     log: bool,
     /// The box a dispatched job lives on: `fleet_job -> base_url`.
     routes: std::collections::HashMap<String, String>,
@@ -2326,9 +2326,9 @@ fn provisioning() -> &'static std::sync::Mutex<
 /// provisions is minted for the LAN; without it the pull still happens, it
 /// just cannot be ticketed and the node falls back to its own sources
 /// (`MAKEPAD_AI_PEER_SOURCES`) or Hugging Face.
-fn coordinator_peer_secret() -> Option<makepad_asset_ai::peer::TransferSecret> {
+fn coordinator_peer_secret() -> Option<makepad_ai_hub::peer::TransferSecret> {
     let text = std::env::var("MAKEPAD_AI_PEER_SECRET").ok()?;
-    makepad_asset_ai::peer::TransferSecret::new(text.as_bytes())
+    makepad_ai_hub::peer::TransferSecret::new(text.as_bytes())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2347,7 +2347,7 @@ enum GenRoute {
 
 impl AssetAiFleet {
     pub fn from_fleet_file(path: &std::path::Path, log: bool) -> Result<AssetAiFleet, String> {
-        let config = makepad_asset_ai::fleet::FleetConfig::load_file(path)
+        let config = makepad_ai_hub::fleet::FleetConfig::load_file(path)
             .map_err(|e| format!("fleet file {}: {e}", path.display()))?;
         if config.boxes.is_empty() {
             return Err(format!("fleet file {} lists no boxes", path.display()));
@@ -2366,7 +2366,7 @@ impl AssetAiFleet {
     pub fn from_lan(log: bool) -> AssetAiFleet {
         AssetAiFleet {
             boxes: Vec::new(),
-            discovered: Some(makepad_asset_ai::discovery::start_listener()),
+            discovered: Some(makepad_ai_hub::discovery::start_listener()),
             log,
             routes: Default::default(),
             overflow: None,
@@ -2437,13 +2437,13 @@ impl AssetAiFleet {
     }
 
     /// Health + model snapshot of every box this adapter can reach.
-    pub fn snapshots(&self) -> (Vec<makepad_asset_ai::fleet::BoxSnapshot>, bool) {
+    pub fn snapshots(&self) -> (Vec<makepad_ai_hub::fleet::BoxSnapshot>, bool) {
         self.snapshots_of(&self.boxes())
     }
 
-    fn snapshots_of(&self, boxes: &[String]) -> (Vec<makepad_asset_ai::fleet::BoxSnapshot>, bool) {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
-        use makepad_asset_ai::fleet::BoxSnapshot;
+    fn snapshots_of(&self, boxes: &[String]) -> (Vec<makepad_ai_hub::fleet::BoxSnapshot>, bool) {
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::fleet::BoxSnapshot;
         let mut snapshots = Vec::with_capacity(boxes.len());
         let mut probe_incomplete = false;
         for url in boxes {
@@ -2486,7 +2486,7 @@ impl AssetAiFleet {
         for snapshot in &snapshots {
             let Some(health) = snapshot.health.as_ref() else { continue };
             for domain in health.capabilities.iter().flatten() {
-                if !makepad_asset_ai::fleet::role_allows(&snapshot.base_url, domain) {
+                if !makepad_ai_hub::fleet::role_allows(&snapshot.base_url, domain) {
                     continue;
                 }
                 if !out.contains(domain) {
@@ -2526,8 +2526,8 @@ impl AssetAiFleet {
     /// work is NOT moved onto it: it keeps waiting for a box that can run it
     /// now, and ordinary dispatch picks the new copy up the moment it lands.
     fn provision_for_demand(&mut self, request: &GenRequest) -> Option<String> {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
-        use makepad_asset_ai::registry::Domain;
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::registry::Domain;
         let mut boxes = self.boxes();
         for url in self.overflow_boxes() {
             if !boxes.contains(&url) {
@@ -2556,7 +2556,7 @@ impl AssetAiFleet {
             .map(|index| snapshots[*index].base_url.clone())
             .collect();
         let tickets = self.peer_tickets_for(&snapshots, &plan, target);
-        let wire = makepad_asset_ai::protocol::GenerateRequestJson {
+        let wire = makepad_ai_hub::protocol::GenerateRequestJson {
             model: plan.model.clone(),
             pull_only: Some(true),
             peer_sources: (!sources.is_empty()).then(|| sources.clone()),
@@ -2605,12 +2605,12 @@ impl AssetAiFleet {
     /// configured sources or Hugging Face.
     fn peer_tickets_for(
         &self,
-        snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+        snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
         plan: &ProvisionPlan,
-        target: &makepad_asset_ai::fleet::BoxSnapshot,
+        target: &makepad_ai_hub::fleet::BoxSnapshot,
     ) -> Vec<String> {
-        use makepad_asset_ai::peer::PeerTicket;
-        use makepad_asset_ai::registry::Registry;
+        use makepad_ai_hub::peer::PeerTicket;
+        use makepad_ai_hub::registry::Registry;
         let Some(secret) = coordinator_peer_secret() else {
             return Vec::new();
         };
@@ -2648,9 +2648,9 @@ impl AssetAiFleet {
     /// long gone), so the fleet can provision that model again later.
     fn forget_finished_provisioning(
         &self,
-        snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+        snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     ) {
-        use makepad_asset_ai::fleet::affinity;
+        use makepad_ai_hub::fleet::affinity;
         let Ok(mut map) = provisioning().lock() else {
             return;
         };
@@ -2671,7 +2671,7 @@ impl AssetAiFleet {
     /// Throttled: a queued job polls every second or so and the answer only
     /// changes when a run ends. `None` = the box did not say.
     fn runs_ahead(&mut self, base_url: &str) -> Option<u64> {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
         if let Some((at, depth)) = self.queue_depth.get(base_url) {
             if at.elapsed() < QUEUE_DEPTH_EVERY {
                 return Some(*depth);
@@ -2689,7 +2689,7 @@ impl AssetAiFleet {
 /// Affinity score of a model whose weights are already ON the box
 /// (`ready`), the threshold between "run it now" and "pull gigabytes
 /// first". `loaded` scores above it; `downloading`/`absent` below.
-/// See `makepad_asset_ai::fleet::affinity_reason`.
+/// See `makepad_ai_hub::fleet::affinity_reason`.
 const WARM_AFFINITY: u32 = 3;
 
 /// Route one request: an explicit model pin is honoured whenever a
@@ -2715,11 +2715,11 @@ const WARM_AFFINITY: u32 = 3;
 /// start: weights it already holds (`ready` or better), never a download,
 /// and never a synthetic test backend.
 fn select_route(
-    snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+    snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     domain: &str,
     want_model: &str,
 ) -> Result<GenRoute, String> {
-    use makepad_asset_ai::fleet::{affinity, is_synthetic_backend};
+    use makepad_ai_hub::fleet::{affinity, is_synthetic_backend};
     // A DOWNLOAD NEVER STEALS FROM A BOX THAT HAS THE WEIGHTS — not even
     // from a busy one. Checked first, because it outranks idleness.
     let route = hold_for_weights(
@@ -2739,7 +2739,7 @@ fn select_route(
     if !busy {
         return Ok(route);
     }
-    let idle: Vec<makepad_asset_ai::fleet::BoxSnapshot> = snapshots
+    let idle: Vec<makepad_ai_hub::fleet::BoxSnapshot> = snapshots
         .iter()
         .map(|snapshot| {
             if is_idle(snapshot) {
@@ -2779,12 +2779,12 @@ fn select_route(
 /// A cold route survives only when nothing in the fleet holds anything for
 /// this work: the weights have to be acquired sometime.
 fn hold_for_weights(
-    snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+    snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     domain: &str,
     want_model: &str,
     route: GenRoute,
 ) -> GenRoute {
-    use makepad_asset_ai::fleet::affinity;
+    use makepad_ai_hub::fleet::affinity;
     let GenRoute::Admitted { index, ref model, .. } = route else {
         return route;
     };
@@ -2805,11 +2805,11 @@ fn hold_for_weights(
 /// `*_admitted_scored` ones: a box busy with a run is exactly the box this
 /// rule protects.
 fn warm_holder(
-    snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+    snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     domain: &str,
     want_model: &str,
 ) -> Option<(usize, String)> {
-    use makepad_asset_ai::fleet::{pick_box_scored, pick_for_domain_scored};
+    use makepad_ai_hub::fleet::{pick_box_scored, pick_for_domain_scored};
     if !want_model.is_empty() {
         if let Some((index, score)) = pick_box_scored(snapshots, want_model) {
             if score >= WARM_AFFINITY {
@@ -2860,12 +2860,12 @@ struct ProvisionPlan {
 ///   is not ours to fill);
 /// - a provisioning of this model is already in flight (`in_flight`).
 fn provision_plan(
-    snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+    snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     domain: &str,
     want_model: &str,
     in_flight: &dyn Fn(&str) -> bool,
 ) -> Option<ProvisionPlan> {
-    use makepad_asset_ai::fleet::{
+    use makepad_ai_hub::fleet::{
         affinity, gpu_rank, is_synthetic_backend, role_allows, role_names,
     };
     // What would run this work: the pin when the fleet holds it, else the
@@ -2903,7 +2903,7 @@ fn provision_plan(
             continue;
         };
         if is_synthetic_backend(&spec.backend)
-            || !makepad_asset_ai::fleet::model_admission(snapshot, &model)
+            || !makepad_ai_hub::fleet::model_admission(snapshot, &model)
                 .is_some_and(|admission| admission.is_hardware_compatible())
         {
             continue;
@@ -2924,17 +2924,17 @@ fn provision_plan(
 /// fastest place to start (the service evicts to admit), while a box
 /// mid-clip has plenty of free memory between steps and none of it for
 /// anyone else.
-fn is_idle(snapshot: &makepad_asset_ai::fleet::BoxSnapshot) -> bool {
+fn is_idle(snapshot: &makepad_ai_hub::fleet::BoxSnapshot) -> bool {
     snapshot.is_up() && snapshot.jobs_pending() == 0
 }
 
 /// The warm/cold pin rules, over whatever set of boxes it is given.
 fn warm_route(
-    snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+    snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     domain: &str,
     want_model: &str,
 ) -> Result<GenRoute, String> {
-    use makepad_asset_ai::fleet::{
+    use makepad_ai_hub::fleet::{
         model_admission, pick_box_admitted_scored, pick_box_scored,
         pick_for_domain_admitted_scored, pick_for_domain_scored,
     };
@@ -3016,7 +3016,7 @@ fn short_label(base_url: &str) -> String {
 /// queue behind that box's own runs, not a memory wait — and about WHICH
 /// box, because the person watching has a fleet, not a machine.
 fn queued_note(stage: &str, ahead: Option<u64>, tag: Option<&str>) -> String {
-    use makepad_asset_ai::protocol::JOB_STATE_QUEUED;
+    use makepad_ai_hub::protocol::JOB_STATE_QUEUED;
     let note = match ahead {
         Some(ahead) if ahead > 0 => {
             format!("queued behind {ahead} run{}", if ahead == 1 { "" } else { "s" })
@@ -3034,10 +3034,10 @@ fn queued_note(stage: &str, ahead: Option<u64>, tag: Option<&str>) -> String {
 
 fn waiting_stage(
     model: &str,
-    admission: Option<makepad_asset_ai::fleet::VramAdmission>,
+    admission: Option<makepad_ai_hub::fleet::VramAdmission>,
     on: &str,
 ) -> String {
-    use makepad_asset_ai::fleet::VramAdmission;
+    use makepad_ai_hub::fleet::VramAdmission;
     match admission {
         Some(VramAdmission::Waiting { required_free_mb, free_mb }) => format!(
             "waiting-for-vram: model {model} on {on} has {free_mb} MiB free, \
@@ -3048,7 +3048,7 @@ fn waiting_stage(
 }
 
 fn admitted_route(
-    snapshots: &[makepad_asset_ai::fleet::BoxSnapshot],
+    snapshots: &[makepad_ai_hub::fleet::BoxSnapshot],
     index: usize,
     model: String,
 ) -> GenRoute {
@@ -3074,8 +3074,8 @@ fn admitted_route(
 fn wire_request(
     request: &GenRequest,
     model: String,
-) -> makepad_asset_ai::protocol::GenerateRequestJson {
-    use makepad_asset_ai::protocol::GenerateRequestJson;
+) -> makepad_ai_hub::protocol::GenerateRequestJson {
+    use makepad_ai_hub::protocol::GenerateRequestJson;
     let body = &request.body;
     let u32_of = |key: &str| body.get(key).and_then(Value::as_u64).map(|v| v as u32);
     // JSON numbers reach us as either variant; a client writing `30` for a
@@ -3156,7 +3156,7 @@ fn wire_request(
 /// meant. The prompt itself is recorded separately and in full; the input
 /// payload is named by size and type, never by its base64.
 fn stage_params(
-    wire: &makepad_asset_ai::protocol::GenerateRequestJson,
+    wire: &makepad_ai_hub::protocol::GenerateRequestJson,
     request: &GenRequest,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
@@ -3244,8 +3244,8 @@ impl GenFleet for AssetAiFleet {
     }
 
     fn dispatch(&mut self, request: &GenRequest) -> Result<FleetDispatch, String> {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
-        use makepad_asset_ai::registry::Domain;
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::registry::Domain;
         // ONE list, chosen once: the index a route carries points into it,
         // and a box joining mid-decision must not shift what it means.
         let boxes = self.dispatch_boxes();
@@ -3281,8 +3281,8 @@ impl GenFleet for AssetAiFleet {
         let fleet_job = match provider.request(domain, &wire) {
             Ok(job) => job,
             Err(
-                makepad_asset_ai::error::AssetAiError::Busy
-                | makepad_asset_ai::error::AssetAiError::QueueFull(_),
+                makepad_ai_hub::error::AssetAiError::Busy
+                | makepad_ai_hub::error::AssetAiError::QueueFull(_),
             ) => {
                 return Ok(FleetDispatch::Waiting {
                     stage: "waiting-for-fleet: selected node queue is full".to_string(),
@@ -3309,8 +3309,8 @@ impl GenFleet for AssetAiFleet {
     }
 
     fn poll(&mut self, fleet_job: &str) -> Result<FleetPoll, String> {
-        use makepad_asset_ai::client::{verify_artifact_bytes, ContentProvider, LocalService};
-        use makepad_asset_ai::protocol::{JOB_STATE_DONE, JOB_STATE_ERROR};
+        use makepad_ai_hub::client::{verify_artifact_bytes, ContentProvider, LocalService};
+        use makepad_ai_hub::protocol::{JOB_STATE_DONE, JOB_STATE_ERROR};
         let base_url = self.routes.get(fleet_job).ok_or("unknown fleet job")?.clone();
         let provider = LocalService::new(&base_url);
         let status = provider.poll(fleet_job).map_err(|e| format!("{e:?}"))?;
@@ -3348,7 +3348,7 @@ impl GenFleet for AssetAiFleet {
                 error: status.error.unwrap_or_else(|| status.state.clone()),
             });
         }
-        if status.state == makepad_asset_ai::protocol::JOB_STATE_QUEUED {
+        if status.state == makepad_ai_hub::protocol::JOB_STATE_QUEUED {
             // Accepted, not started. Ask the box how much of its own work is
             // in front of this job, so the note can say so.
             let ahead = self.runs_ahead(&base_url);
@@ -3364,7 +3364,7 @@ impl GenFleet for AssetAiFleet {
     }
 
     fn widen_to_idle(&mut self, request: &GenRequest) -> Option<String> {
-        use makepad_asset_ai::fleet::{affinity, is_synthetic_backend};
+        use makepad_ai_hub::fleet::{affinity, is_synthetic_backend};
         let own = self.boxes();
         let mut wider = own.clone();
         for url in self.overflow_boxes() {
@@ -3380,7 +3380,7 @@ impl GenFleet for AssetAiFleet {
         let (snapshots, _) = self.snapshots_of(&wider);
         // Only boxes that are somewhere ELSE and idle: the box this job is
         // already stuck on has had its turn.
-        let elsewhere: Vec<makepad_asset_ai::fleet::BoxSnapshot> = snapshots
+        let elsewhere: Vec<makepad_ai_hub::fleet::BoxSnapshot> = snapshots
             .iter()
             .map(|snapshot| {
                 if !own.contains(&snapshot.base_url) && is_idle(snapshot) {
@@ -3417,7 +3417,7 @@ impl GenFleet for AssetAiFleet {
     }
 
     fn cancel(&mut self, fleet_job: &str) {
-        use makepad_asset_ai::client::{ContentProvider, LocalService};
+        use makepad_ai_hub::client::{ContentProvider, LocalService};
         let Some(base_url) = self.routes.get(fleet_job).cloned() else {
             return;
         };
@@ -3437,8 +3437,8 @@ impl GenFleet for AssetAiFleet {
 mod tests {
     use super::*;
     use crate::gen_kinds::kind_of;
-    use makepad_asset_ai::fleet::BoxSnapshot;
-    use makepad_asset_ai::protocol::{
+    use makepad_ai_hub::fleet::BoxSnapshot;
+    use makepad_ai_hub::protocol::{
         HealthJson, ModelInfoJson, MODEL_STATE_ABSENT, MODEL_STATE_DOWNLOADING,
         MODEL_STATE_LOADED, MODEL_STATE_READY,
     };
@@ -5049,7 +5049,7 @@ mod tests {
         // And a VRAM wait is a VRAM wait — a different sentence entirely.
         let stage = waiting_stage(
             "minimax-h3-q4-24g",
-            Some(makepad_asset_ai::fleet::VramAdmission::Waiting {
+            Some(makepad_ai_hub::fleet::VramAdmission::Waiting {
                 required_free_mb: 21_504,
                 free_mb: 9_821,
             }),
@@ -5501,7 +5501,7 @@ mod tests {
         assert!(!wants_loop(&obj(vec![("loop", Value::Bool(false))])));
         // And the writer exists for that name.
         assert!(
-            makepad_asset_ai::llm_backend::default_system_prompt("music_loop")
+            makepad_ai_hub::llm_backend::default_system_prompt("music_loop")
                 .contains("[Instrumental]")
         );
     }

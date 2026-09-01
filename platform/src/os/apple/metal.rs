@@ -4286,6 +4286,26 @@ fn present_gpu_time(seconds: f64) {
     GPU_MAX_US.fetch_max(us, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// MPPRESENT=1: stamp when an input event arrived; the next present logs
+/// the input→glass latency. THE number behind "the first letter hangs".
+static INPUT_AT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_input_event() {
+    if std::env::var_os("MPPRESENT").is_none() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let _ = INPUT_AT_US.compare_exchange(
+        0,
+        now,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn present_pulse() {
     use std::cell::Cell;
     thread_local! {
@@ -4297,6 +4317,14 @@ fn present_pulse() {
     }
     if !ON.with(|v| *v) {
         return;
+    }
+    let input_at = INPUT_AT_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if input_at > 0 {
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        crate::log!("MPINPUT input→present {:.1}ms", (now_us.saturating_sub(input_at)) as f64 / 1000.0);
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

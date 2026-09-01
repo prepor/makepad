@@ -516,6 +516,19 @@ const GPU_SPEED_RANK: &[(&str, u32)] = &[
     ("rtx 4090", 1),
 ];
 
+/// Relative execution throughput used by the ETA model, normalized to the
+/// RTX 4090. Matching follows [`GPU_SPEED_RANK`]: lowercase substring, first
+/// hit wins. Unknown cards use [`UNKNOWN_GPU_RELATIVE_THROUGHPUT`].
+const GPU_RELATIVE_THROUGHPUT: &[(&str, f64)] = &[
+    ("rtx pro 6000", 1.6),
+    ("rtx 5090", 1.3),
+    ("rtx 4090", 1.0),
+];
+
+/// Conservative ETA throughput for an unlisted or unreported GPU. It stays
+/// schedulable, but cannot look faster than any card in the table.
+const UNKNOWN_GPU_RELATIVE_THROUGHPUT: f64 = 0.7;
+
 /// Speed rank of a GPU by its reported name (see [`GPU_SPEED_RANK`]).
 pub fn gpu_speed(name: &str) -> u32 {
     let name = name.to_ascii_lowercase();
@@ -535,6 +548,168 @@ pub fn gpu_rank(snapshot: &BoxSnapshot) -> u32 {
         .and_then(|health| health.gpu.as_deref())
         .map(gpu_speed)
         .unwrap_or(0)
+}
+
+/// Relative ETA throughput of a GPU by its reported name.
+pub fn gpu_throughput(name: &str) -> f64 {
+    let name = name.to_ascii_lowercase();
+    GPU_RELATIVE_THROUGHPUT
+        .iter()
+        .find(|(needle, _)| name.contains(needle))
+        .map(|(_, throughput)| *throughput)
+        .unwrap_or(UNKNOWN_GPU_RELATIVE_THROUGHPUT)
+}
+
+/// Relative ETA throughput of the GPU reported by a box. Missing GPU data
+/// uses the same conservative floor as an unlisted card.
+pub fn gpu_throughput_of(snapshot: &BoxSnapshot) -> f64 {
+    snapshot
+        .health
+        .as_ref()
+        .and_then(|health| health.gpu.as_deref())
+        .map(gpu_throughput)
+        .unwrap_or(UNKNOWN_GPU_RELATIVE_THROUGHPUT)
+}
+
+/// First-cut §6 disk-to-VRAM bandwidth estimate: 2 GB/s.
+pub const ETA_DISK_TO_VRAM_BYTES_PER_SEC: u64 = 2_000_000_000;
+/// First-cut §6 peer/LAN acquisition bandwidth estimate: 100 MB/s.
+pub const ETA_LAN_BYTES_PER_SEC: u64 = 100_000_000;
+/// First-cut §6 registry/WAN acquisition bandwidth estimate: 10 MB/s.
+pub const ETA_WAN_BYTES_PER_SEC: u64 = 10_000_000;
+
+/// Inputs to aicore §6's estimated-time-to-finish placement model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EtaInputs {
+    /// §6 acquisition term: time to obtain weights not already on disk.
+    pub acquire_ms: u64,
+    /// §6 load term: time to move on-disk weights into VRAM.
+    pub load_ms: u64,
+    /// §6 queue term: jobs expected to execute before this one.
+    pub queue_jobs: u64,
+    /// §6 queue term: observed mean duration of one queued job.
+    pub mean_job_ms: u64,
+    /// §6 execute term numerator: normalized work required by this job.
+    pub job_cost_units: f64,
+    /// §6 execute term denominator: relative throughput of this device.
+    pub throughput: f64,
+    /// §6 contention term: work already active in parallel lanes.
+    pub lanes_active: u64,
+    /// §6 contention term: retained efficiency for each active lane.
+    pub lane_efficiency: f64,
+}
+
+/// ETA denominators never fall below one percent of the baseline device.
+const MIN_ETA_THROUGHPUT: f64 = 0.01;
+/// A contended lane retains at least one percent efficiency per active lane.
+const MIN_ETA_LANE_EFFICIENCY: f64 = 0.01;
+
+fn sane_positive(value: f64, floor: f64) -> f64 {
+    if value.is_finite() {
+        value.max(floor)
+    } else {
+        floor
+    }
+}
+
+fn saturating_ceil_ms(value: f64) -> u64 {
+    if value.is_nan() || value <= 0.0 {
+        0
+    } else if value.is_infinite() || value >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        value.ceil() as u64
+    }
+}
+
+fn estimate_execute_ms(inputs: &EtaInputs) -> u64 {
+    let job_cost_units = if inputs.job_cost_units.is_nan() || inputs.job_cost_units <= 0.0 {
+        return 0;
+    } else if inputs.job_cost_units.is_infinite() {
+        return u64::MAX;
+    } else {
+        inputs.job_cost_units
+    };
+    let throughput = sane_positive(inputs.throughput, MIN_ETA_THROUGHPUT);
+    let lane_efficiency = sane_positive(inputs.lane_efficiency, MIN_ETA_LANE_EFFICIENCY);
+    let contention = lane_efficiency.powf(inputs.lanes_active as f64);
+    saturating_ceil_ms(job_cost_units / (throughput * contention))
+}
+
+/// Estimate aicore §6 time to finish:
+///
+/// `acquire + load + queue_jobs * mean_job_ms +`
+/// `job_cost_units / (throughput * lane_efficiency^lanes_active)`.
+///
+/// Integer terms and the final sum saturate. Invalid floating-point inputs
+/// are replaced with conservative finite floors (or a saturated cost), so no
+/// NaN or infinity can escape into a placement result.
+pub fn estimate_eta_ms(inputs: &EtaInputs) -> u64 {
+    let queue_ms = inputs.queue_jobs.saturating_mul(inputs.mean_job_ms);
+    inputs
+        .acquire_ms
+        .saturating_add(inputs.load_ms)
+        .saturating_add(queue_ms)
+        .saturating_add(estimate_execute_ms(inputs))
+}
+
+fn transfer_time_ms(model_bytes: Option<u64>, bytes_per_sec: u64) -> u64 {
+    let bytes = u128::from(model_bytes.unwrap_or(0));
+    let rate = u128::from(bytes_per_sec);
+    let millis = (bytes * 1_000 + rate - 1) / rate;
+    millis.min(u128::from(u64::MAX)) as u64
+}
+
+/// Map the current affinity/readiness state to aicore §6 acquisition and
+/// load estimates. `model_bytes == None` contributes zero until size metadata
+/// is available. Loaded weights need neither step; ready weights only load;
+/// downloading/capable weights acquire over LAN when a peer has them and WAN
+/// otherwise, then load from disk into VRAM.
+pub fn readiness_to_acquire_load_ms(
+    affinity_score: u32,
+    model_bytes: Option<u64>,
+    peer_available: bool,
+) -> (u64, u64) {
+    match affinity_score {
+        4 => (0, 0),
+        3 => (
+            0,
+            transfer_time_ms(model_bytes, ETA_DISK_TO_VRAM_BYTES_PER_SEC),
+        ),
+        _ => {
+            let acquisition_rate = if peer_available {
+                ETA_LAN_BYTES_PER_SEC
+            } else {
+                ETA_WAN_BYTES_PER_SEC
+            };
+            (
+                transfer_time_ms(model_bytes, acquisition_rate),
+                transfer_time_ms(model_bytes, ETA_DISK_TO_VRAM_BYTES_PER_SEC),
+            )
+        }
+    }
+}
+
+fn format_eta_duration(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms % 1_000 == 0 {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    }
+}
+
+/// One-line observable account of every aicore §6 ETA term.
+pub fn eta_breakdown_label(inputs: &EtaInputs) -> String {
+    format!(
+        "acquire {} · load {} · queue {}×{} · exec {}",
+        format_eta_duration(inputs.acquire_ms),
+        format_eta_duration(inputs.load_ms),
+        inputs.queue_jobs,
+        format_eta_duration(inputs.mean_job_ms),
+        format_eta_duration(estimate_execute_ms(inputs)),
+    )
 }
 
 /// Picks the best hardware-compatible box for `model_id`: highest affinity,
@@ -1135,6 +1310,157 @@ mod tests {
         // Nor a role: the chat box stays a chat box, whatever card it has.
         let roles = FleetRoles::parse("b=chat");
         assert!(!roles.allows("http://b", "image"));
+    }
+
+    #[test]
+    fn gpu_eta_throughput_has_a_conservative_unknown_floor() {
+        assert_eq!(
+            gpu_throughput("NVIDIA RTX PRO 6000 Blackwell Workstation Edition"),
+            1.6
+        );
+        assert_eq!(gpu_throughput("NVIDIA GeForce RTX 5090"), 1.3);
+        assert_eq!(gpu_throughput("NVIDIA GeForce RTX 4090"), 1.0);
+        assert_eq!(gpu_throughput("NVIDIA RTX 6000 Ada Generation"), 0.7);
+        assert_eq!(gpu_throughput(""), 0.7);
+        assert_eq!(
+            gpu_throughput_of(&snapshot("http://quiet", 0, Vec::new())),
+            0.7
+        );
+        assert_eq!(
+            gpu_throughput_of(&with_gpu(
+                snapshot("http://fast", 0, Vec::new()),
+                "NVIDIA GeForce RTX 5090",
+            )),
+            1.3
+        );
+    }
+
+    #[test]
+    fn eta_is_monotonic_in_every_input_term() {
+        let inputs = EtaInputs {
+            acquire_ms: 100,
+            load_ms: 200,
+            queue_jobs: 2,
+            mean_job_ms: 1_000,
+            job_cost_units: 10_000.0,
+            throughput: 1.0,
+            lanes_active: 1,
+            lane_efficiency: 0.8,
+        };
+        let eta = estimate_eta_ms(&inputs);
+
+        assert!(estimate_eta_ms(&EtaInputs { acquire_ms: 101, ..inputs }) > eta);
+        assert!(estimate_eta_ms(&EtaInputs { load_ms: 201, ..inputs }) > eta);
+        assert!(estimate_eta_ms(&EtaInputs { queue_jobs: 3, ..inputs }) > eta);
+        assert!(estimate_eta_ms(&EtaInputs { mean_job_ms: 1_001, ..inputs }) > eta);
+        assert!(
+            estimate_eta_ms(&EtaInputs {
+                job_cost_units: 10_001.0,
+                ..inputs
+            }) > eta
+        );
+        assert!(estimate_eta_ms(&EtaInputs { throughput: 1.1, ..inputs }) < eta);
+        assert!(
+            estimate_eta_ms(&EtaInputs {
+                lane_efficiency: 0.7,
+                ..inputs
+            }) > eta
+        );
+    }
+
+    #[test]
+    fn readiness_maps_loaded_ready_and_acquisition_bandwidths() {
+        let bytes = Some(20_000_000_000);
+        assert_eq!(readiness_to_acquire_load_ms(4, bytes, false), (0, 0));
+        assert_eq!(readiness_to_acquire_load_ms(3, bytes, false), (0, 10_000));
+        assert_eq!(
+            readiness_to_acquire_load_ms(2, bytes, true),
+            (200_000, 10_000)
+        );
+        assert_eq!(
+            readiness_to_acquire_load_ms(1, bytes, false),
+            (2_000_000, 10_000)
+        );
+        assert_eq!(readiness_to_acquire_load_ms(3, Some(1), false), (0, 1));
+        assert_eq!(readiness_to_acquire_load_ms(3, None, false), (0, 0));
+    }
+
+    #[test]
+    fn ready_fast_box_wins_big_jobs_but_loaded_slow_box_wins_tiny_jobs() {
+        let ready_fast = |job_cost_units| EtaInputs {
+            acquire_ms: 0,
+            load_ms: 20_000,
+            queue_jobs: 0,
+            mean_job_ms: 0,
+            job_cost_units,
+            throughput: 1.6,
+            lanes_active: 0,
+            lane_efficiency: 1.0,
+        };
+        let loaded_slow = |job_cost_units| EtaInputs {
+            load_ms: 0,
+            throughput: 0.7,
+            ..ready_fast(job_cost_units)
+        };
+
+        assert!(estimate_eta_ms(&ready_fast(100_000.0)) < estimate_eta_ms(&loaded_slow(100_000.0)));
+        assert!(estimate_eta_ms(&ready_fast(1_000.0)) > estimate_eta_ms(&loaded_slow(1_000.0)));
+    }
+
+    #[test]
+    fn lane_contention_raises_eta_and_invalid_floats_stay_bounded() {
+        let idle = EtaInputs {
+            acquire_ms: 0,
+            load_ms: 0,
+            queue_jobs: 0,
+            mean_job_ms: 0,
+            job_cost_units: 10_000.0,
+            throughput: 1.0,
+            lanes_active: 0,
+            lane_efficiency: 0.8,
+        };
+        assert!(
+            estimate_eta_ms(&EtaInputs {
+                lanes_active: 1,
+                ..idle
+            }) > estimate_eta_ms(&idle)
+        );
+        assert!(
+            estimate_eta_ms(&EtaInputs {
+                lanes_active: 2,
+                ..idle
+            }) > estimate_eta_ms(&EtaInputs {
+                lanes_active: 1,
+                ..idle
+            })
+        );
+        assert_eq!(
+            estimate_eta_ms(&EtaInputs {
+                job_cost_units: f64::INFINITY,
+                throughput: f64::NAN,
+                lane_efficiency: f64::NEG_INFINITY,
+                ..idle
+            }),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn eta_breakdown_is_one_observable_line() {
+        let inputs = EtaInputs {
+            acquire_ms: 0,
+            load_ms: 4_200,
+            queue_jobs: 2,
+            mean_job_ms: 30_000,
+            job_cost_units: 8_100.0,
+            throughput: 1.0,
+            lanes_active: 0,
+            lane_efficiency: 0.8,
+        };
+        assert_eq!(
+            eta_breakdown_label(&inputs),
+            "acquire 0ms · load 4.2s · queue 2×30s · exec 8.1s"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! Route's thin `makepad_ai::Agent` adapter to the shared local chat engine.
+//! Route's thin `agent_seam Agent` adapter to the shared local chat engine.
 
-use makepad_ai::*;
+use makepad_converse::agent_seam::*;
 use makepad_ai_hub::{
     hub::{AiHub, ChatConfig},
     local_llm::{ChatEvent, LocalLlmConfig, LocalLlmSession, ToolSpec},
@@ -200,7 +200,7 @@ impl Agent for LocalAgent {
     }
 }
 
-/// The shared engine exposes parsed key/value pairs; `makepad_ai::Agent`
+/// The shared engine exposes parsed key/value pairs; `agent_seam Agent`
 /// carries one JSON object. Preserve Route's numeric/bool/object coercion so
 /// its typed tool broker sees the same inputs as before.
 fn tool_args_json(args: Vec<(String, String)>) -> String {

@@ -11,10 +11,11 @@
 
 pub use ::makepad_widgets;
 
-use makepad_ai::*;
+use makepad_converse::agent_seam::*;
 use makepad_widgets::*;
 
 mod broker;
+mod claude_agent;
 mod ddg;
 mod history;
 mod layers;
@@ -1154,12 +1155,7 @@ impl App {
     fn make_claude(api_key: String) -> Box<dyn Agent> {
         let model = std::env::var("MAKEPAD_ROUTE_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-5".to_string());
-        let backend = ClaudeBackend::new(BackendConfig::Claude {
-            api_key: Some(api_key),
-            oauth_token: None,
-            model,
-        });
-        Box::new(StatelessBackendAdapter::new(Box::new(backend)))
+        Box::new(claude_agent::ClaudeAgent::new(model, api_key))
     }
 
     /// Dispatcher: the in-process local model by default (pure-Rust ggml,

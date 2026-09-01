@@ -268,6 +268,18 @@ const CHARACTER_RIG_MODEL: &str = "skintokens";
 const CHARACTER_MOTION_MODEL: &str = "hy-motion";
 /// Instruction image editing (reference image + "change …" prompt).
 const EDIT_MODEL: &str = "flux2-klein-4b";
+/// Sprite enhancement runs on the 32B dev DiT, NOT the 4-step distilled
+/// klein that `EDIT_MODEL` pins for interactive edits. Measured on the Doom
+/// imp hero frame (2026-08-31): klein 4-step renders a smoothed version of
+/// the original; dev at 20-30 steps redraws it with real anatomy, claws and
+/// teeth. The distillation, not the prompt, was the ceiling.
+///
+/// `flux2-dev-q4-24g` is the same DiT quantized for the 24GB class. It is a
+/// DIFFERENT numerics class ("expect its own look at the same seed"), so a
+/// single asset must be enhanced entirely on one tier or its cells will not
+/// match each other.
+const SPRITE_ENHANCE_MODEL: &str = "flux2-dev";
+pub const SPRITE_ENHANCE_MODEL_24G: &str = "flux2-dev-q4-24g";
 /// General image 4x upscaling (RealESRGAN x4plus). Pinned — the domain has
 /// exactly one model, so no dropdown.
 const UPSCALE_MODEL: &str = "realesrgan-x4plus";
@@ -525,6 +537,14 @@ pub const PRESETS: &[Preset] = &[
         &[("enhance", "video-enhance")],
     ),
     Preset::linear("edit selected image (instruction)", &["edit"], &[("edit", EDIT_MODEL)]),
+    // Classic sprite enhancement: re-render an old game's artwork at modern
+    // quality. Pinned to the 32B dev tier because the distilled klein only
+    // smooths (see SPRITE_ENHANCE_MODEL).
+    Preset::linear(
+        "sprite → enhance (hi-res)",
+        &["edit"],
+        &[("edit", SPRITE_ENHANCE_MODEL)],
+    ),
     // Native RealESRGAN x4plus: select a picture, get it back at 4x
     // resolution. Consumer-only like `edit` — no prompt-only mode, refused
     // without a selected image.

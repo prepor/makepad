@@ -3039,7 +3039,7 @@ impl ChatProviderKind {
     /// Human label for a picker.
     pub fn label(self) -> &'static str {
         match self {
-            Self::FleetQwen => "Qwen · asset-ai fleet",
+            Self::FleetQwen => "Qwen · ai-hub fleet",
             Self::OpenAi => "OpenAI · API",
             Self::Grok => "Grok · API",
             Self::ClaudeCli => "Claude Code · CLI on server",
@@ -3059,7 +3059,7 @@ impl ChatProviderKind {
 }
 
 /// Where a provider's model runs — the server's word, carried per row.
-/// `Local` = the asset-ai fleet on the LAN; `Cloud` = a vendor, whether by
+/// `Local` = the ai-hub fleet on the LAN; `Cloud` = a vendor, whether by
 /// API key or by a CLI logged in on the server host. A "local AI only"
 /// lock filters on this and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

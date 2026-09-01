@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 pub const DISCOVERY_PORT: u16 = 41830;
 /// Backend/frontend partition. Empty or omitted fleet is this value, so an
 /// unscoped box (today's asset-ui / .169) stays on its own lane.
-pub const DEFAULT_FLEET: &str = "default";
+/// The one fleet every real deployment runs ("gen"): frontends with no
+/// `MAKEPAD_AI_FLEET` and nodes with no `--fleet` meet here by default,
+/// so an app hears the LAN GPU fleet without per-app env plumbing.
+pub const DEFAULT_FLEET: &str = "gen";
 
 /// Lowercase trimmed fleet name. Empty becomes [`DEFAULT_FLEET`].
 pub fn normalize_fleet(name: &str) -> String {

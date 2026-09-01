@@ -91,7 +91,7 @@ pub enum ProviderKind {
     GrokCli,
 }
 
-/// Where the model actually runs. `Local` = our own asset-ai fleet on the
+/// Where the model actually runs. `Local` = our own ai-hub fleet on the
 /// LAN; `Cloud` = a frontier vendor, reached either by API key (OpenAi,
 /// Grok) or through a logged-in CLI on the broker host. Frontends that
 /// promise "local AI only" filter on this, and the wire carries it per

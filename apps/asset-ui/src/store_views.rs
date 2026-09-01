@@ -2035,7 +2035,7 @@ pub fn runs_rows(
     rows.push(StoreRow::Section("FLEET WORKERS · LAN".into()));
     if fleet.is_empty() {
         rows.push(StoreRow::Note(
-            "No GPU boxes on the LAN — start a makepad-asset-ai fleet service.".into(),
+            "No GPU boxes on the LAN — start a makepad-ai-hub fleet service.".into(),
         ));
     }
     // One row per PHYSICAL host; several service instances on one box list

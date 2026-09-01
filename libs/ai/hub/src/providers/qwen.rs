@@ -270,7 +270,10 @@ impl<T: FleetTransport> FleetQwenChatProvider<T> {
             return Ok(pick);
         }
         if self.bases.is_empty() {
-            return Err("no fleet nodes configured".to_string());
+            return Err(format!(
+                "no fleet nodes heard on the LAN yet (listening for fleet '{}')",
+                crate::discovery::wanted_fleet()
+            ));
         }
         let mut reasons = Vec::new();
         let mut order = self.bases.clone();

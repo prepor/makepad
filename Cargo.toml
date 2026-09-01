@@ -142,7 +142,6 @@ workspace.exclude = [
     # like a subdirectory. Not a required member so a clean makepad tree
     # still loads.
     "apps/sandbox",
-    "apps/sandbox/tools/sandbox-eval",
     # Private Source Library picture wall. Same shape as sandbox: clone into
     # apps/source-library; path deps stay ../../.
     "apps/source-library",

@@ -1068,8 +1068,12 @@ impl Cx {
     }
 
     pub fn text_ime_was_dismissed(&mut self) {
+        // The keyboard is already down — that is why we are here. Re-issuing
+        // a HideTextIME op makes some IMEs (Samsung's insets controller)
+        // briefly re-present the keyboard just to replay the hide animation:
+        // the user sees their dismissal "close twice". The latch alone is
+        // the point; the next explicit hide still resets it.
         self.keyboard.set_text_ime_dismissed();
-        self.platform_ops.push_back(CxOsOp::HideTextIME);
     }
 
     /// Set or clear a window's `dpi_override` at runtime.

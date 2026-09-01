@@ -2503,6 +2503,11 @@ impl Widget for TextInput {
                 ..
             }) if device.is_primary_hit() && !scrollbar_captured => {
                 self.reset_blink_timer(cx);
+                // A deliberate tap on a text field always means "I want the
+                // keyboard" — clear the user-dismissed latch, or the
+                // draw-time show stays swallowed and a re-tap on an
+                // already-focused field can never bring the keyboard back.
+                cx.keyboard.reset_text_ime_dismissed();
                 self.set_key_focus(cx);
                 let rel = abs - self.text_area.rect(cx).pos;
                 let Ok(cursor) =

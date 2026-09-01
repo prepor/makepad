@@ -577,6 +577,10 @@ pub const ETA_DISK_TO_VRAM_BYTES_PER_SEC: u64 = 2_000_000_000;
 pub const ETA_LAN_BYTES_PER_SEC: u64 = 100_000_000;
 /// First-cut §6 registry/WAN acquisition bandwidth estimate: 10 MB/s.
 pub const ETA_WAN_BYTES_PER_SEC: u64 = 10_000_000;
+/// First-cut §6 duration estimate for each job already in a box's queue.
+pub const ETA_FIRST_CUT_MEAN_JOB_MS: u64 = 30_000;
+/// First-cut §6 throughput retained for each concurrently active lane.
+pub const ETA_FIRST_CUT_LANE_EFFICIENCY: f64 = 0.85;
 
 /// Inputs to aicore §6's estimated-time-to-finish placement model.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -842,6 +846,64 @@ fn is_explicit_only(model: &ModelInfoJson) -> bool {
     model.backend.ends_with("-oracle")
 }
 
+#[derive(Clone, Copy)]
+struct AdmittedDomainCandidate<'a> {
+    index: usize,
+    snapshot: &'a BoxSnapshot,
+    model: &'a ModelInfoJson,
+    affinity: u32,
+}
+
+/// Apply the common dispatch gates for automatic domain routing. The legacy
+/// admitted picker retains its synthetic-only fallback; ETA placement never
+/// returns a synthetic backend.
+fn admitted_domain_candidates<'a>(
+    snapshots: &'a [BoxSnapshot],
+    domain: &str,
+    allow_synthetic_fallback: bool,
+) -> Vec<AdmittedDomainCandidate<'a>> {
+    let has_compatible_real = snapshots.iter().any(|snapshot| {
+        snapshot.is_up()
+            && role_allows(&snapshot.base_url, domain)
+            && snapshot.models.iter().any(|model| {
+                model.domain == domain
+                    && !is_synthetic_fallback(model)
+                    && !is_explicit_only(model)
+                    && affinity_of_model(model).is_some()
+                    && vram_admission_for_model(snapshot, model).is_hardware_compatible()
+            })
+    });
+    let mut candidates = Vec::new();
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if !snapshot.is_up() || !role_allows(&snapshot.base_url, domain) {
+            continue;
+        }
+        for model in &snapshot.models {
+            if model.domain != domain || is_explicit_only(model) {
+                continue;
+            }
+            if is_synthetic_fallback(model)
+                && (!allow_synthetic_fallback || has_compatible_real)
+            {
+                continue;
+            }
+            let Some(affinity) = affinity_of_model(model) else {
+                continue;
+            };
+            if !vram_admission_for_model(snapshot, model).is_admitted() {
+                continue;
+            }
+            candidates.push(AdmittedDomainCandidate {
+                index,
+                snapshot,
+                model,
+                affinity,
+            });
+        }
+    }
+    candidates
+}
+
 /// [`pick_for_domain`] plus the winning affinity score.
 pub fn pick_for_domain_scored(
     snapshots: &[BoxSnapshot],
@@ -926,49 +988,42 @@ pub fn pick_for_domain_admitted_scored(
     snapshots: &[BoxSnapshot],
     domain: &str,
 ) -> Option<(usize, String, u32)> {
-    let has_compatible_real = snapshots.iter().any(|snapshot| {
-        snapshot.is_up()
-            && role_allows(&snapshot.base_url, domain)
-            && snapshot.models.iter().any(|model| {
-                model.domain == domain
-                    && !is_synthetic_fallback(model)
-                    && !is_explicit_only(model)
-                    && affinity_of_model(model).is_some()
-                    && vram_admission_for_model(snapshot, model).is_hardware_compatible()
-            })
-    });
     let mut best: Option<(bool, bool, u32, u32, u64, usize, &str)> = None;
-    for (i, snapshot) in snapshots.iter().enumerate() {
-        if !snapshot.is_up() || !role_allows(&snapshot.base_url, domain) {
-            continue;
-        }
-        for model in &snapshot.models {
-            if model.domain != domain || is_explicit_only(model) {
-                continue;
+    for candidate in admitted_domain_candidates(snapshots, domain, true) {
+        let real = !is_synthetic_fallback(candidate.model);
+        let preferred = preferred_on_disk(candidate.model, candidate.affinity);
+        let pending = candidate.snapshot.jobs_pending();
+        let speed = gpu_rank(candidate.snapshot);
+        let better = match &best {
+            None => true,
+            Some((br, bf, bs, bg, bp, bi, _)) => {
+                (
+                    real,
+                    preferred,
+                    candidate.affinity,
+                    speed,
+                    std::cmp::Reverse(pending),
+                    std::cmp::Reverse(candidate.index),
+                ) > (
+                    *br,
+                    *bf,
+                    *bs,
+                    *bg,
+                    std::cmp::Reverse(*bp),
+                    std::cmp::Reverse(*bi),
+                )
             }
-            let real = !is_synthetic_fallback(model);
-            if has_compatible_real && !real {
-                continue;
-            }
-            let Some(score) = affinity_of_model(model) else {
-                continue;
-            };
-            if !vram_admission_for_model(snapshot, model).is_admitted() {
-                continue;
-            }
-            let preferred = preferred_on_disk(model, score);
-            let pending = snapshot.jobs_pending();
-            let speed = gpu_rank(snapshot);
-            let better = match &best {
-                None => true,
-                Some((br, bf, bs, bg, bp, bi, _)) => {
-                    (real, preferred, score, speed, std::cmp::Reverse(pending), std::cmp::Reverse(i))
-                        > (*br, *bf, *bs, *bg, std::cmp::Reverse(*bp), std::cmp::Reverse(*bi))
-                }
-            };
-            if better {
-                best = Some((real, preferred, score, speed, pending, i, model.id.as_str()));
-            }
+        };
+        if better {
+            best = Some((
+                real,
+                preferred,
+                candidate.affinity,
+                speed,
+                pending,
+                candidate.index,
+                candidate.model.id.as_str(),
+            ));
         }
     }
     best.map(|(_, _, score, _, _, i, id)| (i, id.to_string(), score))
@@ -979,6 +1034,109 @@ pub fn pick_for_domain_admitted(
     domain: &str,
 ) -> Option<(usize, String)> {
     pick_for_domain_admitted_scored(snapshots, domain).map(|(i, model, _)| (i, model))
+}
+
+fn eta_inputs_for_candidate(
+    candidate: AdmittedDomainCandidate<'_>,
+    job_cost_units: f64,
+) -> EtaInputs {
+    let (acquire_ms, load_ms) = readiness_to_acquire_load_ms(
+        candidate.affinity,
+        candidate.model.progress_total,
+        false,
+    );
+    let lanes_active = candidate
+        .snapshot
+        .health
+        .as_ref()
+        .and_then(|health| health.lanes.as_ref())
+        .map(|lanes| lanes.lanes_active)
+        .unwrap_or(0);
+    EtaInputs {
+        acquire_ms,
+        load_ms,
+        queue_jobs: candidate.snapshot.jobs_pending(),
+        mean_job_ms: ETA_FIRST_CUT_MEAN_JOB_MS,
+        job_cost_units,
+        throughput: gpu_throughput_of(candidate.snapshot),
+        lanes_active,
+        lane_efficiency: ETA_FIRST_CUT_LANE_EFFICIENCY,
+    }
+}
+
+fn pick_for_domain_eta_inputs(
+    snapshots: &[BoxSnapshot],
+    domain: &str,
+    job_cost_units: f64,
+) -> Option<(usize, String, u64, EtaInputs)> {
+    let mut best: Option<(bool, u64, u32, u32, u64, usize, &str, EtaInputs)> = None;
+    for candidate in admitted_domain_candidates(snapshots, domain, false) {
+        let inputs = eta_inputs_for_candidate(candidate, job_cost_units);
+        let eta_ms = estimate_eta_ms(&inputs);
+        let preferred = preferred_on_disk(candidate.model, candidate.affinity);
+        let pending = candidate.snapshot.jobs_pending();
+        let speed = gpu_rank(candidate.snapshot);
+        let better = match &best {
+            None => true,
+            Some((best_preferred, best_eta, best_affinity, best_speed, best_pending, best_i, _, _)) => {
+                preferred > *best_preferred
+                    || (preferred == *best_preferred
+                        && (eta_ms < *best_eta
+                            || (eta_ms == *best_eta
+                                && (
+                                    candidate.affinity,
+                                    speed,
+                                    std::cmp::Reverse(pending),
+                                    std::cmp::Reverse(candidate.index),
+                                ) > (
+                                    *best_affinity,
+                                    *best_speed,
+                                    std::cmp::Reverse(*best_pending),
+                                    std::cmp::Reverse(*best_i),
+                                ))))
+            }
+        };
+        if better {
+            best = Some((
+                preferred,
+                eta_ms,
+                candidate.affinity,
+                speed,
+                pending,
+                candidate.index,
+                candidate.model.id.as_str(),
+                inputs,
+            ));
+        }
+    }
+    best.map(|(_, eta_ms, _, _, _, index, id, inputs)| {
+        (index, id.to_string(), eta_ms, inputs)
+    })
+}
+
+/// Pick an admitted real backend by estimated time to finish. A preferred
+/// domain backend whose weights are on disk forms the first partition; ETA
+/// ranks within that partition, with the legacy affinity order breaking ties.
+pub fn pick_for_domain_eta(
+    snapshots: &[BoxSnapshot],
+    domain: &str,
+    job_cost_units: f64,
+) -> Option<(usize, String, u64)> {
+    pick_for_domain_eta_inputs(snapshots, domain, job_cost_units)
+        .map(|(index, model, eta_ms, _)| (index, model, eta_ms))
+}
+
+/// [`pick_for_domain_eta`] plus the winning ETA term breakdown for logs/UIs.
+pub fn pick_for_domain_eta_label(
+    snapshots: &[BoxSnapshot],
+    domain: &str,
+    job_cost_units: f64,
+) -> Option<(usize, String, u64, String)> {
+    pick_for_domain_eta_inputs(snapshots, domain, job_cost_units).map(
+        |(index, model, eta_ms, inputs)| {
+            (index, model, eta_ms, eta_breakdown_label(&inputs))
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1461,6 +1619,87 @@ mod tests {
             eta_breakdown_label(&inputs),
             "acquire 0ms · load 4.2s · queue 2×30s · exec 8.1s"
         );
+    }
+
+    #[test]
+    fn eta_pick_crosses_over_between_ready_fast_and_loaded_slow_boxes() {
+        let mut ready = model("m", "image", MODEL_STATE_READY, true);
+        ready.progress_total = Some(20_000_000_000);
+        let fleet = vec![
+            with_gpu(
+                snapshot("http://ready-fast", 0, vec![ready]),
+                "NVIDIA RTX PRO 6000",
+            ),
+            with_gpu(
+                snapshot(
+                    "http://loaded-slow",
+                    0,
+                    vec![model("m", "image", MODEL_STATE_LOADED, true)],
+                ),
+                "unlisted slow GPU",
+            ),
+        ];
+
+        assert_eq!(pick_for_domain_eta(&fleet, "image", 100_000.0).unwrap().0, 0);
+        assert_eq!(pick_for_domain_eta(&fleet, "image", 1_000.0).unwrap().0, 1);
+        let (_, model, eta_ms, label) =
+            pick_for_domain_eta_label(&fleet, "image", 100_000.0).unwrap();
+        assert_eq!(model, "m");
+        assert!(eta_ms > 0);
+        assert!(label.contains("load 10s"));
+    }
+
+    #[test]
+    fn eta_pick_keeps_preferred_on_disk_as_the_first_partition() {
+        let mut h3 = model("h3", "video", MODEL_STATE_LOADED, true);
+        h3.backend = "h3".to_string();
+        let mut fast = model("fast", "video", MODEL_STATE_READY, true);
+        fast.backend = "fast".to_string();
+        fast.progress_total = Some(80_000_000_000);
+        let fleet = vec![
+            snapshot("http://warm-h3", 0, vec![h3]),
+            snapshot("http://cold-fast", 0, vec![fast]),
+        ];
+
+        assert_eq!(
+            pick_for_domain_eta(&fleet, "video", 1.0).map(|(i, model, _)| (i, model)),
+            Some((1, "fast".to_string()))
+        );
+    }
+
+    #[test]
+    fn eta_pick_never_returns_a_synthetic_backend() {
+        let mut synthetic = model("testpattern", "image", MODEL_STATE_LOADED, true);
+        synthetic.backend = "testpattern".to_string();
+        let fleet = vec![snapshot("http://synthetic", 0, vec![synthetic])];
+
+        assert_eq!(pick_for_domain_eta(&fleet, "image", 1.0), None);
+    }
+
+    #[test]
+    fn eta_pick_prefers_idle_lanes_at_equal_warmth() {
+        let mut busy = snapshot(
+            "http://busy",
+            0,
+            vec![model("m", "chat", MODEL_STATE_LOADED, true)],
+        );
+        busy.health.as_mut().unwrap().lanes = Some(LanesJson {
+            model: "m".to_string(),
+            slots_total: 4,
+            slots_claimed: 2,
+            slots_free: 2,
+            lanes_active: 2,
+            context_per_slot: 4_096,
+            queue_depth: 0,
+            queue_max: 8,
+        });
+        let idle = snapshot(
+            "http://idle",
+            0,
+            vec![model("m", "chat", MODEL_STATE_LOADED, true)],
+        );
+
+        assert_eq!(pick_for_domain_eta(&[busy, idle], "chat", 10_000.0).unwrap().0, 1);
     }
 
     #[test]

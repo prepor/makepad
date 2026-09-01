@@ -1729,11 +1729,19 @@ impl TextInput {
         self.history.force_new_edit_group();
     }
 
-    fn handle_focus_lost(&mut self, cx: &mut Cx, uid: WidgetUid) {
+    fn handle_focus_lost(&mut self, cx: &mut Cx, uid: WidgetUid, focus_moved_to: Area) {
         self.animator_play(cx, ids!(focus.off));
         self.animator_play(cx, ids!(blink.on));
         cx.stop_timer(self.blink_timer);
-        cx.hide_text_ime();
+        // Hide the IME only when focus is actually cleared. When it moves to
+        // another widget, leave the keyboard alone: a TextInput taking over
+        // re-shows (and re-configures) on its next draw — hiding here makes
+        // the soft keyboard visibly close and reopen on every field-to-field
+        // move (the mobile "next" key). A non-text widget that wants it gone
+        // hides it explicitly.
+        if focus_moved_to == Area::Empty {
+            cx.hide_text_ime();
+        }
         self.composition_start = 0;
         self.composition_end = 0;
         self.pending_outside_focus_loss_touch = None;
@@ -2374,7 +2382,7 @@ impl Widget for TextInput {
                 // Update focus state in cx
                 cx.set_key_focus(Area::Empty);
                 // Handle focus loss locally
-                self.handle_focus_lost(cx, uid);
+                self.handle_focus_lost(cx, uid, Area::Empty);
             }
         }
 
@@ -2469,8 +2477,8 @@ impl Widget for TextInput {
                 self.last_sent_ime_sel_end = self.selection.end().index;
                 cx.widget_action(uid, TextInputAction::KeyFocus);
             }
-            Hit::KeyFocusLost(_) => {
-                self.handle_focus_lost(cx, uid);
+            Hit::KeyFocusLost(kf) => {
+                self.handle_focus_lost(cx, uid, kf.focus);
             }
             Hit::KeyDown(event) if self.handle_navigation_key(cx, uid, event) => {}
             Hit::KeyDown(KeyEvent {

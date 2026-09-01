@@ -12,3 +12,8 @@ makepad-strict-json = { path = "../../strict_json" }
 # …and publishes finished assets through the client. The hub itself never
 # sees this dependency: creation is the app's side of the boundary.
 makepad-asset-client = { path = "../client" }
+
+# The detached client: a long run is a client that does not close.
+[[bin]]
+name = "makepad-creator-run"
+path = "src/bin/creator_run.rs"

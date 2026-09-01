@@ -71,6 +71,22 @@ pub enum RunEvent {
     RunFinished { state: RunState },
 }
 
+/// Chooses the node a stage executes on, at DISPATCH time — so a chain's
+/// later stages see fresh fleet state (the asset-ui chain engine's law).
+/// A single-node caller returns clones of one base URL every time.
+pub trait ProviderPick {
+    fn pick(&self, stage: &StageSpec) -> Result<Box<dyn ContentProvider>, AssetAiError>;
+}
+
+/// One fixed provider for every stage (tests, the single-box runner).
+pub struct SingleProvider<F: Fn() -> Box<dyn ContentProvider>>(pub F);
+
+impl<F: Fn() -> Box<dyn ContentProvider>> ProviderPick for SingleProvider<F> {
+    fn pick(&self, _stage: &StageSpec) -> Result<Box<dyn ContentProvider>, AssetAiError> {
+        Ok((self.0)())
+    }
+}
+
 /// Engine pacing.
 pub struct EngineConfig {
     pub poll_interval: Duration,
@@ -88,7 +104,7 @@ impl Default for EngineConfig {
 pub fn run(
     spec: &PipelineSpec,
     orders: &[StageOrder],
-    provider: &dyn ContentProvider,
+    providers: &dyn ProviderPick,
     config: &EngineConfig,
     events: &Sender<RunEvent>,
     cancel: &Arc<AtomicBool>,
@@ -104,11 +120,11 @@ pub fn run(
     }
     let mut states = vec![StageState::Pending; spec.stages.len()];
     let mut outputs: HashMap<String, StageOutput> = HashMap::new();
-    let mut jobs: HashMap<usize, String> = HashMap::new();
+    let mut jobs: HashMap<usize, (String, Box<dyn ContentProvider>)> = HashMap::new();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
-            for (i, job_id) in &jobs {
+            for (i, (job_id, provider)) in &jobs {
                 if states[*i] == StageState::Running {
                     let _ = provider.cancel(job_id);
                     states[*i] = StageState::Cancelled;
@@ -129,13 +145,24 @@ pub fn run(
             let mut request = order.request.clone();
             apply_splices(&mut request, &order.splices, &outputs);
             let domain = parse_domain(&order.spec.domain)?;
+            let provider = match providers.pick(&order.spec) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    states[i] = StageState::Failed;
+                    let _ = events.send(RunEvent::StageFailed {
+                        key: order.spec.key.clone(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             match provider.request(domain, &request) {
                 Ok(job_id) => {
                     let _ = events.send(RunEvent::StageStarted {
                         key: order.spec.key.clone(),
                         job_id: job_id.clone(),
                     });
-                    jobs.insert(i, job_id);
+                    jobs.insert(i, (job_id, provider));
                     states[i] = StageState::Running;
                 }
                 Err(error) => {
@@ -149,10 +176,13 @@ pub fn run(
         }
 
         // Poll the running set.
-        for (i, job_id) in jobs.clone() {
+        let running: Vec<usize> = jobs.keys().copied().collect();
+        for i in running {
             if states[i] != StageState::Running {
                 continue;
             }
+            let (job_id, provider) = jobs.get(&i).unwrap();
+            let job_id = job_id.clone();
             let key = spec.stages[i].key.clone();
             let status = match provider.poll(&job_id) {
                 Ok(status) => status,
@@ -330,6 +360,40 @@ mod tests {
         }
     }
 
+    struct PickArc(std::sync::Arc<FakeProvider>);
+
+    impl ProviderPick for PickArc {
+        fn pick(&self, _stage: &StageSpec) -> Result<Box<dyn ContentProvider>, AssetAiError> {
+            Ok(Box::new(Shim(self.0.clone())))
+        }
+    }
+
+    /// Orphan-rule shim: a local wrapper so the shared fake can be handed
+    /// out as many boxed providers over one state.
+    struct Shim(std::sync::Arc<FakeProvider>);
+
+    impl ContentProvider for Shim {
+        fn health(&self) -> Result<HealthJson, AssetAiError> {
+            self.0.health()
+        }
+        fn list_models(&self) -> Result<Vec<ModelInfoJson>, AssetAiError> {
+            self.0.list_models()
+        }
+        fn request(
+            &self,
+            domain: Domain,
+            request: &GenerateRequestJson,
+        ) -> Result<String, AssetAiError> {
+            self.0.request(domain, request)
+        }
+        fn poll(&self, job_id: &str) -> Result<JobStatusJson, AssetAiError> {
+            self.0.poll(job_id)
+        }
+        fn fetch_artifact(&self, artifact_id: &str) -> Result<ArtifactBytes, AssetAiError> {
+            self.0.fetch_artifact(artifact_id)
+        }
+    }
+
     impl ContentProvider for FakeProvider {
         fn health(&self) -> Result<HealthJson, AssetAiError> {
             Err(AssetAiError::Unavailable("fake".into()))
@@ -389,7 +453,7 @@ mod tests {
             name: "expand-image".into(),
             stages: vec![stage("expand", "text", &[]), stage("image", "image", &["expand"])],
         };
-        let provider = FakeProvider::new();
+        let provider = std::sync::Arc::new(FakeProvider::new());
         // Stage 1 (job-1) finishes with a text artifact.
         provider.scripts.lock().unwrap().insert(
             "job-1".into(),
@@ -412,7 +476,7 @@ mod tests {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let config = EngineConfig { poll_interval: Duration::from_millis(1) };
-        let outputs = run(&spec, &orders, &provider, &config, &tx, &cancel).unwrap();
+        let outputs = run(&spec, &orders, &PickArc(provider.clone()), &config, &tx, &cancel).unwrap();
         assert!(outputs.contains_key("expand") && outputs.contains_key("image"));
         // The image stage's submitted request carries the expanded prompt.
         let submitted = provider.submitted.lock().unwrap();
@@ -427,7 +491,7 @@ mod tests {
             name: "expand-image".into(),
             stages: vec![stage("expand", "text", &[]), stage("image", "image", &["expand"])],
         };
-        let provider = FakeProvider::new();
+        let provider = std::sync::Arc::new(FakeProvider::new());
         provider.scripts.lock().unwrap().insert(
             "job-1".into(),
             vec![FakeProvider::done_status("job-1", None)],
@@ -445,7 +509,7 @@ mod tests {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let config = EngineConfig { poll_interval: Duration::from_millis(1) };
-        let outputs = run(&spec, &orders, &provider, &config, &tx, &cancel).unwrap();
+        let outputs = run(&spec, &orders, &PickArc(provider.clone()), &config, &tx, &cancel).unwrap();
         assert!(outputs.contains_key("expand"), "finished work survives");
         let failed = rx
             .try_iter()
@@ -459,7 +523,7 @@ mod tests {
             name: "one".into(),
             stages: vec![stage("expand", "text", &[])],
         };
-        let provider = FakeProvider::new();
+        let provider = std::sync::Arc::new(FakeProvider::new());
         // The stage never finishes on its own.
         provider.scripts.lock().unwrap().insert("job-1".into(), {
             let mut running = FakeProvider::done_status("job-1", None);
@@ -470,7 +534,7 @@ mod tests {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(true));
         let config = EngineConfig { poll_interval: Duration::from_millis(1) };
-        let _ = run(&spec, &orders, &provider, &config, &tx, &cancel).unwrap();
+        let _ = run(&spec, &orders, &PickArc(provider.clone()), &config, &tx, &cancel).unwrap();
         let cancelled = rx
             .try_iter()
             .any(|e| matches!(e, RunEvent::RunFinished { state: RunState::Cancelled }));

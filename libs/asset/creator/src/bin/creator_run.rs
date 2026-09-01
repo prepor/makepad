@@ -112,7 +112,10 @@ fn run_cli() -> Result<(), String> {
         })
         .collect();
 
-    let provider = LocalService::new(&base);
+    let base_url = base.clone();
+    let provider = makepad_asset_creator::engine::SingleProvider(move || {
+        Box::new(LocalService::new(&base_url)) as Box<_>
+    });
     let (events_tx, events_rx) = channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let printer = std::thread::spawn(move || {

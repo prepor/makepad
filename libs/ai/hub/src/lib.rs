@@ -75,6 +75,7 @@ pub mod peer_serve;
 pub mod protocol;
 pub mod realtime;
 pub mod realtime_wire;
+pub mod ram;
 pub mod registry;
 pub mod resample;
 pub mod residency;

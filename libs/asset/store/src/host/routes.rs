@@ -51,11 +51,8 @@ pub struct RouteCtx {
     pub op_event_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Chat broker actor. None only if the broker failed to spawn; routes
     /// then refuse with 503 rather than inventing a session.
-    pub chat: Option<super::chat::ChatHandle>,
-    pub chat_event_waiters: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Live worker announcements of what the GPU fleet can execute NOW,
     /// merged over `cfg.job_profiles` by `GET /v1/job-profiles`.
-    pub profiles: std::sync::Arc<super::profiles::ProfileRegistry>,
     /// Live game rooms — who is playing what, right now, and how to reach
     /// them. In memory and leased: a room is a process on somebody's desk,
     /// not a catalog entry.

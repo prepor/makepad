@@ -6,7 +6,8 @@
 use super::http::Resp;
 use super::json::{self, obj, s, Value};
 use super::util::{from_hex_exact, to_hex};
-use crate::{Capability, JobId, PrincipalId, ServerError};
+use crate::variants::JobId;
+use crate::{Capability, PrincipalId, ServerError};
 use makepad_asset_data::{
     AssetFile, AssetKind, AssetManifest, DeviceTier, FileRole, GameRevisionManifest,
 };
@@ -130,15 +131,6 @@ pub fn pipeline_str(p: &super::state::PipelineId) -> String {
 pub fn parse_pipeline(s: &str) -> Option<super::state::PipelineId> {
     let hex = s.strip_prefix(PIPELINE_PREFIX)?;
     Some(super::state::PipelineId(from_hex_exact::<16>(hex)?))
-}
-
-pub fn operation_str(o: &crate::OperationId) -> String {
-    format!("{}{}", OPERATION_PREFIX, to_hex(&o.0))
-}
-
-pub fn parse_operation(s: &str) -> Option<crate::OperationId> {
-    let hex = s.strip_prefix(OPERATION_PREFIX)?;
-    Some(crate::OperationId(from_hex_exact::<16>(hex)?))
 }
 
 // ---- capability names ------------------------------------------------------

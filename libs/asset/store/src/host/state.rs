@@ -23,8 +23,9 @@
 use super::appdb::Db;
 use super::json::{self, obj, s, Value};
 use super::util::{from_hex_exact, log, now_ms, to_hex};
+use crate::variants::JobId;
 use crate::{
-    AssetServerCore, Budgets, JobId, PrincipalId, RecoverReport, ServerError, ServerResult,
+    AssetServerCore, Budgets, PrincipalId, RecoverReport, ServerError, ServerResult,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

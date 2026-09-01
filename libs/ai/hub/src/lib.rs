@@ -41,6 +41,7 @@ pub mod error;
 pub mod fleet;
 pub mod gpu;
 pub mod home;
+pub mod hub;
 pub mod fast_backend;
 pub mod h3_backend;
 pub mod http_client;
@@ -49,6 +50,8 @@ pub mod lane_advert;
 pub mod indextts_backend;
 pub mod kokoro_backend;
 pub mod llm_backend;
+#[cfg(feature = "llm")]
+pub mod local_llm;
 pub mod matte_backend;
 pub mod segment_backend;
 pub mod upscale_backend;
@@ -63,6 +66,7 @@ pub mod motion_retarget;
 #[cfg(feature = "paint")]
 pub mod paint_backend;
 pub mod peer;
+pub mod pipe;
 pub mod peer_fetch;
 pub mod peer_serve;
 pub mod protocol;

@@ -939,7 +939,7 @@ mod tests {
     fn snap(url: &str, domain: &str, id: &str, state: &str) -> BoxSnapshot {
         BoxSnapshot {
             base_url: url.into(),
-            health: Some(HealthJson {
+            health: Some(HealthJson { realtime: None,
                 service: "makepad-asset-ai".into(),
                 version: "t".into(),
                 gpu: Some("RTX".into()),

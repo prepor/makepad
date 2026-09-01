@@ -3988,7 +3988,7 @@ mod tests {
         use makepad_ai_hub::protocol::{HealthJson, ModelInfoJson, MODEL_STATE_LOADED};
         BoxSnapshot {
             base_url: url.to_string(),
-            health: Some(HealthJson {
+            health: Some(HealthJson { realtime: None,
                 service: "test".to_string(),
                 version: "1".to_string(),
                 gpu: Some("GPU".to_string()),
@@ -4033,7 +4033,7 @@ mod tests {
         use makepad_ai_hub::protocol::{HealthJson, ModelInfoJson, MODEL_STATE_LOADED};
         BoxSnapshot {
             base_url: url.to_string(),
-            health: Some(HealthJson {
+            health: Some(HealthJson { realtime: None,
                 service: "test".to_string(),
                 version: "1".to_string(),
                 gpu: Some("24 GB GPU".to_string()),

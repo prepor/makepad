@@ -23,6 +23,7 @@ makepad-xr = { path = "../../xr" }
 # retry), catalog runtimes, committed-event subscriber, verified cache. The
 # VJ worker owns these crates; this app consumes the public API only.
 makepad-asset-client = { path = "../../libs/asset/client" }
+makepad-asset-creator = { path = "../../libs/asset/creator" }
 # Shared preview/viewer widgets: the pool every host draws catalog content
 # with (VJ and the DJ surface adopt the same set).
 # The renderer feature brings the 3D faces (mesh turntable, world walker).

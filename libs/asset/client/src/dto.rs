@@ -1370,10 +1370,6 @@ impl JobStateDto {
         })
     }
 
-    /// Crate-facing strict parse (worker finish responses).
-    pub(crate) fn parse_pub(s: &str) -> Option<Self> {
-        Self::parse(s)
-    }
 }
 
 /// One job's visible state. `result_asset`/`result_revision` are parsed

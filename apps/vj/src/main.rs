@@ -3843,10 +3843,6 @@ enum CatPurpose {
     /// then rides the ordinary `Thumb` purpose into the shared thumbnail
     /// cache, so the row costs no second decode path.
     DreamThumb { revision: AssetRevisionId },
-    JobProfiles { domain: &'static str },
-    JobEnqueue { tag: GenTag },
-    JobStatus { job: JobId },
-    JobCancel { job: JobId },
     /// Offering this machine's locally computed stems/lyrics back to the
     /// store. Fire and forget: one line either way, never a dialog.
     SideChannelPublish { asset: AssetId },
@@ -12971,20 +12967,6 @@ p2 {}
                             self.fx_slot_reloading[slot.index()] = false;
                             log!("fx slot {slot:?}: hot reload failed: {error}");
                         }
-                        CatPurpose::JobProfiles { .. } => {
-                            self.gen.profiles_failed(error.to_string());
-                        }
-                        CatPurpose::JobEnqueue { tag } => {
-                            self.gen.enqueue_failed_at(tag, error.to_string(), Some(now_ms()));
-                        }
-                        CatPurpose::JobStatus { job } => {
-                            self.gen.status_failed_at(
-                                job,
-                                error.to_string(),
-                                Some(now_ms()),
-                            );
-                        }
-                        CatPurpose::JobCancel { .. } => {}
                         CatPurpose::SideChannelPublish { asset } => {
                             // A store that will not take them (no write
                             // capability, an older server) is not an error
@@ -13332,25 +13314,6 @@ p2 {}
                         self.thumb_inflight.insert(revision);
                     }
                 }
-            }
-            (CatPurpose::JobProfiles { domain }, ClientOutput::JobProfiles(profiles)) => {
-                self.gen.profiles_arrived(domain, profiles);
-                self.sync_gen_profiles(cx);
-                // The flux list only exists once the image domain lands.
-                self.sync_gen_pickers(cx);
-            }
-            (CatPurpose::JobEnqueue { tag }, ClientOutput::JobQueued(job)) => {
-                let cmds = self.gen.queued_at(tag, job, Some(now_ms()));
-                self.run_gen_cmds(cmds);
-            }
-            (CatPurpose::JobStatus { .. }, ClientOutput::JobStatus(status)) => {
-                // Single-job rows only. A DREAM run is a pipeline: its
-                // record arrives through `pump_pipelines`, and nothing here
-                // advances a stage any more.
-                self.gen.status_arrived_at(&status, now_ms());
-            }
-            (CatPurpose::JobCancel { job }, ClientOutput::JobCancelled(count)) => {
-                self.gen.cancel_confirmed_at(job, count, Some(now_ms()));
             }
             (CatPurpose::SideChannelPublish { asset }, ClientOutput::SideChannels(outcome)) => {
                 match outcome {

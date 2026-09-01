@@ -8,7 +8,7 @@
 //! specialized for the asset server's two-plane protocol): this speaks to
 //! `libs/asset/ai` service nodes.
 
-use makepad_asset_client::json::{self, Value};
+use makepad_strict_json::{self as json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;

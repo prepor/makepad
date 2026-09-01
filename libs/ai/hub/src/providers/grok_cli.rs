@@ -2,16 +2,16 @@
 //! Claude Code (single-turn prompt via `--prompt-file`,
 //! Anthropic-Messages-format NDJSON with partial
 //! deltas, `--resume <session>`), so it shares that parser
-//! ([`crate::claude::parse_stream_line`]). Chat-only: every built-in tool
+//! ([`crate::providers::claude::parse_stream_line`]). Chat-only: every built-in tool
 //! the CLI advertises is disallowed, permission mode `dontAsk` denies
 //! anything that slips through, and `--max-turns 1` bounds the process to
 //! the one reply. No key passes through us: the CLI is logged in on the
 //! broker host or the provider is `Unavailable`.
 
-use crate::claude::{build_prompt_only, poll_messages_turn, ParseState};
-use crate::cli::{cli_command, find_cli, turn_dir, CliTurn};
-use crate::provider::{ChatProvider, ProviderEvent, TurnInput};
-use crate::wire::{ProviderAvailability, ProviderKind};
+use crate::chat_wire::{ProviderAvailability, ProviderKind};
+use crate::providers::claude::{build_prompt_only, poll_messages_turn, ParseState};
+use crate::providers::cli::{cli_command, find_cli, turn_dir, CliTurn};
+use crate::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
 use std::path::PathBuf;
 
 /// Every built-in tool grok 1.0.5 listed in its `init` line. `--tools ""`
@@ -148,7 +148,7 @@ impl Drop for GrokCliChatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::parse_stream_line;
+    use crate::providers::claude::parse_stream_line;
 
     #[test]
     fn argv_is_headless_single_turn_and_toolless() {
@@ -171,7 +171,7 @@ mod tests {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"hello from grok","session_id":"01a0"}"#;
         let mut state = ParseState::default();
         let (events, done) =
-            parse_stream_line(&makepad_asset_client::json::parse(line.as_bytes()).unwrap(), &mut state);
+            parse_stream_line(&makepad_strict_json::parse(line.as_bytes()).unwrap(), &mut state);
         assert!(done);
         assert!(matches!(&events[..], [ProviderEvent::Done { text }] if text == "hello from grok"));
         assert_eq!(state.session_id.as_deref(), Some("01a0"));

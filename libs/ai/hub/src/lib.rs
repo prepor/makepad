@@ -32,6 +32,7 @@
 //!                              see `protocol.rs`'s wire doc block and `crate::realtime`.
 
 pub mod backend;
+pub mod chat_wire;
 pub mod client;
 mod child_process;
 pub mod control_image;
@@ -73,6 +74,7 @@ pub mod pipe;
 pub mod peer_fetch;
 pub mod peer_serve;
 pub mod protocol;
+pub mod providers;
 pub mod realtime;
 pub mod realtime_wire;
 pub mod ram;

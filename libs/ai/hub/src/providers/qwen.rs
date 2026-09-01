@@ -30,10 +30,10 @@
 //! id is surfaced in `Available.model` so the UI can label the row
 //! honestly.
 
-use crate::fleet_http;
-use crate::provider::{ChatProvider, ProviderEvent, TurnInput};
-use crate::wire::{ChatMessage, ChatRole, ProviderAvailability, ProviderKind, ServingFacts};
-use makepad_asset_client::json::{self, Value};
+use crate::chat_wire::{ChatMessage, ChatRole, ProviderAvailability, ProviderKind, ServingFacts};
+use crate::providers::fleet_http;
+use crate::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
+use makepad_strict_json::{self as json, Value};
 use std::time::{Duration, Instant};
 
 /// Transport seam so the provider is deterministic under test. The real

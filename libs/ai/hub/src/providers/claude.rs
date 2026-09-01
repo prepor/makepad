@@ -16,13 +16,13 @@
 //! clients" — a client machine without the CLI simply reports
 //! `Unavailable`, it never receives key material to run one.
 //!
-//! Process plumbing lives in [`crate::cli`], shared with the `grok` CLI
+//! Process plumbing lives in [`crate::providers::cli`], shared with the `grok` CLI
 //! (same Messages-format stream, [`parse_stream_line`]) and `codex`.
 
-use crate::cli::{categorize_cli_error, cli_command, turn_dir, CliTurn};
-use crate::provider::{ChatProvider, ProviderEvent, TurnInput};
-use crate::wire::{ChatRole, ProviderAvailability, ProviderKind};
-use makepad_asset_client::json::{self, Value};
+use crate::chat_wire::{ChatRole, ProviderAvailability, ProviderKind};
+use crate::providers::cli::{categorize_cli_error, cli_command, turn_dir, CliTurn};
+use crate::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
+use makepad_strict_json::{self as json, Value};
 use std::path::PathBuf;
 
 /// Stream-parse state, separated from process plumbing so the line parser
@@ -61,7 +61,7 @@ impl ClaudeCodeChatProvider {
 
 /// `CLAUDE_CODE_PATH`, else `claude` on `$PATH` or in the usual dirs.
 pub fn find_cli() -> Option<PathBuf> {
-    crate::cli::find_cli("CLAUDE_CODE_PATH", "claude", &[])
+    crate::providers::cli::find_cli("CLAUDE_CODE_PATH", "claude", &[])
 }
 
 /// Build the argv (after the executable), pure for testing. The prompt is

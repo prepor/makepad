@@ -15,7 +15,7 @@
 //!   what the session engine checks before every send. There is no
 //!   fallback path anywhere below this trait.
 
-use crate::wire::{ChatMessage, ProviderAvailability, ProviderKind, ServingFacts};
+use crate::chat_wire::{ChatMessage, ProviderAvailability, ProviderKind, ServingFacts};
 
 /// Everything a provider needs for one turn. `system` carries the tool
 /// protocol, live capabilities and attachment bindings; `messages` is the
@@ -284,7 +284,7 @@ impl ChatProvider for ThreadedProvider {
 #[cfg(test)]
 mod threaded_tests {
     use super::*;
-    use crate::wire::ProviderAvailability;
+    use crate::chat_wire::ProviderAvailability;
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::time::{Duration, Instant};
 

@@ -8,11 +8,13 @@
 //! not). No streaming deltas exist in this protocol: the reply lands as one
 //! `agent_message` item; reasoning items are forwarded as a think block.
 
-use crate::claude::build_prompt_only;
-use crate::cli::{categorize_cli_error, cli_command, find_cli, toml_basic_string, turn_dir, CliTurn};
-use crate::provider::{ChatProvider, ProviderEvent, TurnInput};
-use crate::wire::{ProviderAvailability, ProviderKind};
-use makepad_asset_client::json::{self, Value};
+use crate::chat_wire::{ProviderAvailability, ProviderKind};
+use crate::providers::claude::build_prompt_only;
+use crate::providers::cli::{
+    categorize_cli_error, cli_command, find_cli, toml_basic_string, turn_dir, CliTurn,
+};
+use crate::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
+use makepad_strict_json::{self as json, Value};
 use std::path::PathBuf;
 
 #[derive(Default)]

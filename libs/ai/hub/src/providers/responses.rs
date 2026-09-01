@@ -11,13 +11,12 @@
 //! one `function_call_output` item. Production constructors pin the provider
 //! origin; tests inject a transport, not a public endpoint override.
 
-use crate::provider::{ChatProvider, ProviderEvent, TurnInput};
-use crate::tools;
-use crate::wire::{
+use crate::chat_wire::{
     sanitize_public_error, split_delta_text, ChatMessage, ProviderAvailability, ProviderKind,
     MAX_MESSAGES, MAX_TOOL_CALL_ID, MAX_TOOL_JSON_BYTES, MAX_TURN_TEXT_BYTES,
 };
-use makepad_asset_client::json::{self, Value};
+use crate::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
+use makepad_strict_json::{self as json, Value};
 use makepad_network::blocking_http::{
     post_json, CancelToken, Error as HttpError, Limits, Request,
 };
@@ -76,11 +75,14 @@ impl ResponsesConfig {
         ResponsesConfig {
             kind: ProviderKind::OpenAi,
             api_key: Some(api_key),
-            model: bound_model(model.into(), crate::openai::DEFAULT_OPENAI_MODEL),
-            endpoint: crate::openai::OPENAI_RESPONSES_URL.to_string(),
+            model: bound_model(model.into(), crate::providers::openai::DEFAULT_OPENAI_MODEL),
+            endpoint: crate::providers::openai::OPENAI_RESPONSES_URL.to_string(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             request_timeout: DEFAULT_OPENAI_TIMEOUT,
-            missing_key_reason: format!("{} is not set", crate::openai::OPENAI_API_KEY_ENV),
+            missing_key_reason: format!(
+                "{} is not set",
+                crate::providers::openai::OPENAI_API_KEY_ENV
+            ),
         }
     }
 
@@ -89,49 +91,52 @@ impl ResponsesConfig {
         ResponsesConfig {
             kind: ProviderKind::Grok,
             api_key: Some(api_key),
-            model: bound_model(model.into(), crate::grok::DEFAULT_GROK_MODEL),
-            endpoint: crate::grok::GROK_RESPONSES_URL.to_string(),
+            model: bound_model(model.into(), crate::providers::grok::DEFAULT_GROK_MODEL),
+            endpoint: crate::providers::grok::GROK_RESPONSES_URL.to_string(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             request_timeout: grok_timeout_from_env(),
-            missing_key_reason: format!("{} is not set", crate::grok::GROK_API_KEY_ENV),
+            missing_key_reason: format!("{} is not set", crate::providers::grok::GROK_API_KEY_ENV),
         }
     }
 
     pub fn openai_from_env() -> Self {
-        let model = std::env::var(crate::openai::OPENAI_MODEL_ENV)
+        let model = std::env::var(crate::providers::openai::OPENAI_MODEL_ENV)
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| crate::openai::DEFAULT_OPENAI_MODEL.to_string());
-        let api_key = std::env::var(crate::openai::OPENAI_API_KEY_ENV)
+            .unwrap_or_else(|| crate::providers::openai::DEFAULT_OPENAI_MODEL.to_string());
+        let api_key = std::env::var(crate::providers::openai::OPENAI_API_KEY_ENV)
             .ok()
             .and_then(|s| ApiKey::new(s).ok());
         ResponsesConfig {
             kind: ProviderKind::OpenAi,
             api_key,
-            model: bound_model(model, crate::openai::DEFAULT_OPENAI_MODEL),
-            endpoint: crate::openai::OPENAI_RESPONSES_URL.to_string(),
+            model: bound_model(model, crate::providers::openai::DEFAULT_OPENAI_MODEL),
+            endpoint: crate::providers::openai::OPENAI_RESPONSES_URL.to_string(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             request_timeout: DEFAULT_OPENAI_TIMEOUT,
-            missing_key_reason: format!("{} is not set", crate::openai::OPENAI_API_KEY_ENV),
+            missing_key_reason: format!(
+                "{} is not set",
+                crate::providers::openai::OPENAI_API_KEY_ENV
+            ),
         }
     }
 
     pub fn grok_from_env() -> Self {
-        let model = std::env::var(crate::grok::GROK_MODEL_ENV)
+        let model = std::env::var(crate::providers::grok::GROK_MODEL_ENV)
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| crate::grok::DEFAULT_GROK_MODEL.to_string());
-        let api_key = std::env::var(crate::grok::GROK_API_KEY_ENV)
+            .unwrap_or_else(|| crate::providers::grok::DEFAULT_GROK_MODEL.to_string());
+        let api_key = std::env::var(crate::providers::grok::GROK_API_KEY_ENV)
             .ok()
             .and_then(|s| ApiKey::new(s).ok());
         ResponsesConfig {
             kind: ProviderKind::Grok,
             api_key,
-            model: bound_model(model, crate::grok::DEFAULT_GROK_MODEL),
-            endpoint: crate::grok::GROK_RESPONSES_URL.to_string(),
+            model: bound_model(model, crate::providers::grok::DEFAULT_GROK_MODEL),
+            endpoint: crate::providers::grok::GROK_RESPONSES_URL.to_string(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             request_timeout: grok_timeout_from_env(),
-            missing_key_reason: format!("{} is not set", crate::grok::GROK_API_KEY_ENV),
+            missing_key_reason: format!("{} is not set", crate::providers::grok::GROK_API_KEY_ENV),
         }
     }
 
@@ -461,6 +466,7 @@ struct Active {
 
 pub struct ResponsesChatProvider<T: ResponsesTransport> {
     config: ResponsesConfig,
+    native_tools: Option<Value>,
     transport: Arc<T>,
     cancel: CancelToken,
     active: Option<Active>,
@@ -472,9 +478,14 @@ pub struct ResponsesChatProvider<T: ResponsesTransport> {
 }
 
 impl<T: ResponsesTransport> ResponsesChatProvider<T> {
-    pub fn new(config: ResponsesConfig, transport: T) -> ResponsesChatProvider<T> {
+    pub fn new(
+        config: ResponsesConfig,
+        transport: T,
+        native_tools: Option<Value>,
+    ) -> ResponsesChatProvider<T> {
         ResponsesChatProvider {
             config,
+            native_tools,
             transport: Arc::new(transport),
             cancel: CancelToken::new(),
             active: None,
@@ -550,9 +561,14 @@ impl<T: ResponsesTransport> ResponsesChatProvider<T> {
         pairs.push(("instructions", json::s(self.last_instructions.clone())));
         pairs.push(("input", input));
         if self.last_tools_enabled {
-            pairs.push(("tools", tools::native_tools_payload()));
-            pairs.push(("tool_choice", json::s("auto")));
-            pairs.push(("parallel_tool_calls", Value::Bool(false)));
+            if let Some(native_tools) = &self.native_tools {
+                pairs.push(("tools", native_tools.clone()));
+                pairs.push(("tool_choice", json::s("auto")));
+                pairs.push(("parallel_tool_calls", Value::Bool(false)));
+            } else {
+                pairs.push(("tools", Value::Arr(Vec::new())));
+                pairs.push(("tool_choice", json::s("none")));
+            }
         } else {
             pairs.push(("tools", Value::Arr(Vec::new())));
             pairs.push(("tool_choice", json::s("none")));
@@ -604,7 +620,7 @@ fn encode_input_messages(messages: &[ChatMessage]) -> Value {
                 // history — flatten them into labelled user-side context
                 // rather than emitting a role the API refuses.
                 let (role, text) = match m.role {
-                    crate::wire::ChatRole::Tool => {
+                    crate::chat_wire::ChatRole::Tool => {
                         ("user", format!("[tool result]\n{}", m.text))
                     }
                     other => (other.slug(), m.text.clone()),

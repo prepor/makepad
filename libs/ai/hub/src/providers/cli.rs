@@ -13,8 +13,8 @@
 //!
 //! The three providers differ only in argv and in the line protocol they
 //! print; `claude` and `grok` both speak the Anthropic Messages stream
-//! format ([`crate::claude::parse_stream_line`]), `codex` speaks its own
-//! item/turn events ([`crate::codex_cli`]).
+//! format ([`crate::providers::claude::parse_stream_line`]), `codex` speaks
+//! its own item/turn events ([`crate::providers::codex_cli`]).
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;

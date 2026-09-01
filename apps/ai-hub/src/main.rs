@@ -8,7 +8,7 @@
 //!   --host      bind address         (default 0.0.0.0)
 //!   --fleet     partition name       (env MAKEPAD_ASSET_AI_FLEET, default default)
 //!   --cache-dir model + artifact dir (env MAKEPAD_ASSET_AI_CACHE,
-//!                                     default <home>/.makepad/ai_content)
+//!                                     default <home>/.makepad/weights)
 //!   --registry  registry json path   (default: <cache-dir>/registry.json if it
 //!                                     exists, else the embedded registry)
 //!
@@ -143,10 +143,7 @@ fn default_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("MAKEPAD_ASSET_AI_CACHE") {
         return PathBuf::from(dir);
     }
-    // USERPROFILE on Windows, HOME elsewhere; temp dir as a last resort.
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".makepad").join("ai_content")
+    makepad_ai_hub::home::default_weights_dir_with_migration(&mut |message| {
+        eprintln!("{SERVICE_NAME}: {message}");
+    })
 }

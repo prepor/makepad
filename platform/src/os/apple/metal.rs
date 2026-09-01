@@ -1193,7 +1193,11 @@ impl Cx {
         } else {
             (width, height)
         };
-        if !request_ids.is_empty() {
+        // A pending grab/probe request, or a screen-capture sink that is due a
+        // frame for this window: either way the drawable has to be blitted into
+        // a shared texture before it is presented.
+        let wants_capture = crate::screen_capture::capture_wants_window(window_id);
+        if !request_ids.is_empty() || wants_capture {
             let descriptor = RcObjcId::from_owned(
                 NonNull::new(unsafe { msg_send![class!(MTLTextureDescriptor), new] }).unwrap(),
             );
@@ -1225,7 +1229,8 @@ impl Cx {
                 request_ids,
                 width: width as _,
                 height: height as _,
-                texture: texture,
+                window_id,
+                texture,
             });
         }
         None
@@ -1275,6 +1280,14 @@ impl Cx {
                         for px in bgra.chunks_exact_mut(4) {
                             px.swap(0, 2);
                         }
+                        // Continuous capture sinks (the ScreenCap recorder) take the
+                        // raw bytes; they carry no request id and never consume one.
+                        crate::screen_capture::deliver_capture_frame(
+                            sf.window_id,
+                            sf.width as u32,
+                            sf.height as u32,
+                            &bgra,
+                        );
                         // Pixel probes (the eyedropper) want one sample, not a PNG.
                         let mut request_ids = sf.request_ids;
                         crate::pixel_probe::answer_pixel_probes(&mut request_ids, sf.width, sf.height, &bgra);
@@ -1541,6 +1554,9 @@ struct ScreenshotInfo {
     width: usize,
     height: usize,
     request_ids: Vec<u64>,
+    /// The window this pass presented to, so a continuous capture sink bound
+    /// to one window does not swallow another window's frames.
+    window_id: Option<usize>,
     texture: RcObjcId,
 }
 

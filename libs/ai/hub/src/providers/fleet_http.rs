@@ -18,15 +18,20 @@ const IO_TIMEOUT_MS: u64 = 10_000;
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// `POST`/`GET` a JSON document. `bearer` is only used by the in-repo test
-/// harness against the asset server's auth routes; fleet nodes are
-/// unauthenticated LAN peers and callers pass `None`.
+/// `POST`/`GET` a JSON document. An explicit `bearer` wins; otherwise the
+/// fabric secret environment variable authenticates service-node requests.
 pub fn request_json(
     method: &str,
     url: &str,
     body: Option<&Value>,
     bearer: Option<&str>,
 ) -> Result<(u16, Value), String> {
+    let env_bearer = if bearer.is_none() {
+        std::env::var("MAKEPAD_AI_HUB_SECRET").ok()
+    } else {
+        None
+    };
+    let bearer = bearer.or_else(|| env_bearer.as_deref().map(str::trim));
     let (host_port, path) = split_url(url)?;
     let addr = host_port
         .to_socket_addrs()
@@ -48,6 +53,9 @@ pub fn request_json(
         "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\nAccept: application/json\r\n"
     );
     if let Some(b) = bearer {
+        if b.contains(['\r', '\n']) {
+            return Err("bearer credential contains a newline".to_string());
+        }
         head.push_str(&format!("Authorization: Bearer {b}\r\n"));
     }
     if body.is_some() {

@@ -68,6 +68,7 @@ pub trait ContentProvider {
 /// e.g. `http://10.0.0.217:8765`.
 pub struct LocalService {
     base_url: String,
+    auth_headers: Vec<(String, String)>,
 }
 
 const MAX_JSON_BODY: usize = 4 * 1024 * 1024;
@@ -76,18 +77,58 @@ const MAX_ARTIFACT_BODY: usize = 1024 * 1024 * 1024;
 
 impl LocalService {
     pub fn new(base_url: &str) -> Self {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let secret = std::env::var("MAKEPAD_AI_HUB_SECRET").ok();
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
+            auth_headers: Self::auth_headers(secret.as_deref()),
         }
+    }
+
+    /// Override the environment-provided fabric secret for this service.
+    pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+        let secret = secret.into();
+        self.auth_headers = Self::auth_headers(Some(&secret));
+        self
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
+    fn auth_headers(secret: Option<&str>) -> Vec<(String, String)> {
+        let Some(secret) = secret.map(str::trim) else {
+            return Vec::new();
+        };
+        if secret.contains(['\r', '\n']) {
+            return Vec::new();
+        }
+        vec![(
+            "Authorization".to_string(),
+            format!("Bearer {secret}"),
+        )]
+    }
+
+    fn get_request<'a>(&'a self, url: &'a str) -> HttpClientRequest<'a> {
+        let mut request = HttpClientRequest::get(url);
+        request.extra_headers = &self.auth_headers;
+        request
+    }
+
+    fn post_request<'a>(
+        &'a self,
+        url: &'a str,
+        content_type: &'a str,
+        body: &'a [u8],
+    ) -> HttpClientRequest<'a> {
+        let mut request = HttpClientRequest::post(url, content_type, body);
+        request.extra_headers = &self.auth_headers;
+        request
+    }
+
     fn get_json<T: DeJson>(&self, path: &str) -> Result<T, AssetAiError> {
         let url = format!("{}{}", self.base_url, path);
-        let response = http_fetch(&HttpClientRequest::get(&url))?;
+        let response = http_fetch(&self.get_request(&url))?;
         let status = response.status;
         let body = response.read_body_to_vec(MAX_JSON_BODY)?;
         parse_json_body::<T>(status, &body, &url)
@@ -143,11 +184,7 @@ impl ContentProvider for LocalService {
         }
         let url = format!("{}/generate", self.base_url);
         let body = request.serialize_json();
-        let response = http_fetch(&HttpClientRequest::post(
-            &url,
-            "application/json",
-            body.as_bytes(),
-        ))?;
+        let response = http_fetch(&self.post_request(&url, "application/json", body.as_bytes()))?;
         let status = response.status;
         let bytes = response.read_body_to_vec(MAX_JSON_BODY)?;
         let parsed: GenerateResponseJson = parse_json_body(status, &bytes, &url)?;
@@ -167,7 +204,7 @@ impl ContentProvider for LocalService {
     fn cancel(&self, job_id: &str) -> Result<JobStatusJson, AssetAiError> {
         let url = format!("{}/job/{job_id}/cancel", self.base_url);
         // The in-repo HttpServer 500s on body-less POSTs; send an empty object.
-        let response = http_fetch(&HttpClientRequest::post(&url, "application/json", b"{}"))?;
+        let response = http_fetch(&self.post_request(&url, "application/json", b"{}"))?;
         let status = response.status;
         let body = response.read_body_to_vec(MAX_JSON_BODY)?;
         parse_json_body(status, &body, &url)
@@ -175,7 +212,7 @@ impl ContentProvider for LocalService {
 
     fn fetch_artifact(&self, artifact_id: &str) -> Result<ArtifactBytes, AssetAiError> {
         let url = format!("{}/artifact/{artifact_id}", self.base_url);
-        let response = http_fetch(&HttpClientRequest::get(&url))?;
+        let response = http_fetch(&self.get_request(&url))?;
         let status = response.status;
         let content_type = response
             .header("content-type")

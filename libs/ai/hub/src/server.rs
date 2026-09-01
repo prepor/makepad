@@ -15,7 +15,9 @@ use crate::realtime::RealtimeSession;
 use crate::registry::{ModelSpec, Registry};
 use crate::residency::{self, ResidencyConfig};
 use makepad_micro_serde::{DeJson, SerJson};
-use makepad_network::{start_http_server, HttpServer, HttpServerRequest, HttpServerResponse};
+use makepad_network::{
+    start_http_server, HttpServer, HttpServerHeaders, HttpServerRequest, HttpServerResponse,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
@@ -185,6 +187,9 @@ pub struct ServiceShared {
     pub models: Mutex<HashMap<String, ModelTrack>>,
     pub artifacts: Mutex<HashMap<String, ArtifactMeta>>,
     pub gpu: GpuCache,
+    /// Optional bearer secret protecting the service HTTP surface. Deliberately
+    /// omitted from all logs and Debug output.
+    fabric_secret: Option<String>,
     /// Random per-start id shared by /health and the discovery beacon.
     pub node_id: u64,
     /// Durable node identity (cache-dir `node-key` file, 32 hex chars):
@@ -246,6 +251,7 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
     // machine, independent of cache dir, plus an advisory cache-dir lock on
     // every platform. Acquire both before binding or mutating cache state.
     let singleton = acquire_service_lock(&config.cache_dir)?;
+    let fabric_secret = resolve_fabric_secret(&config.cache_dir);
 
     // start_http_server does not report its bound address, so port 0 is
     // resolved by probing for a free port first (bind/drop; tiny race,
@@ -315,6 +321,7 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
         models: Mutex::new(models),
         artifacts: Mutex::new(HashMap::new()),
         gpu: GpuCache::new(),
+        fabric_secret,
         node_id,
         node_key,
         started_ms: crate::jobs::now_ms(),
@@ -392,6 +399,33 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
     })
 }
 
+const FABRIC_SECRET_MIN_BYTES: usize = 16;
+
+/// Resolve the service bearer secret in deployment order: environment first,
+/// then the cache-dir file. An explicitly configured but short value is
+/// ignored rather than falling through to a different credential source.
+fn resolve_fabric_secret(cache_dir: &Path) -> Option<String> {
+    if let Ok(text) = std::env::var("MAKEPAD_AI_HUB_SECRET") {
+        return checked_fabric_secret(&text, "MAKEPAD_AI_HUB_SECRET");
+    }
+    let path = cache_dir.join("fabric-secret");
+    match fs::read_to_string(path) {
+        Ok(text) => checked_fabric_secret(&text, "fabric-secret file"),
+        Err(_) => None,
+    }
+}
+
+fn checked_fabric_secret(text: &str, origin: &str) -> Option<String> {
+    let secret = text.trim();
+    if secret.as_bytes().len() < FABRIC_SECRET_MIN_BYTES {
+        eprintln!(
+            "hub auth: {origin} is shorter than {FABRIC_SECRET_MIN_BYTES} bytes — ignored"
+        );
+        return None;
+    }
+    Some(secret.to_string())
+}
+
 /// Durable worker identity: 32 lowercase hex chars persisted as `node-key`
 /// in the cache dir. Survives restarts and exe swaps; a coordinator keys a
 /// worker on this, while the per-start `node_id` reveals restarts.
@@ -441,7 +475,7 @@ fn route_loop(shared: Arc<ServiceShared>, request_rx: mpsc::Receiver<HttpServerR
                 if headers.path.starts_with(crate::peer_serve::BLOB_PATH_PREFIX) {
                     crate::peer_serve::route_blob(&shared, &headers, response_sender);
                 } else {
-                    let response = route_get(&shared, &headers.path);
+                    let response = route_get_request(&shared, &headers);
                     let _ = response_sender.send(response);
                 }
             }
@@ -450,7 +484,7 @@ fn route_loop(shared: Arc<ServiceShared>, request_rx: mpsc::Receiver<HttpServerR
                 body,
                 response,
             } => {
-                let out = route_post(&shared, &headers.path, &body);
+                let out = route_post_request(&shared, &headers, &body);
                 let _ = response.send(out);
             }
             // The only websocket endpoint is a live session's own path,
@@ -463,6 +497,10 @@ fn route_loop(shared: Arc<ServiceShared>, request_rx: mpsc::Receiver<HttpServerR
                 headers,
                 response_sender,
             } => {
+                if !request_is_authorized(&shared, &headers) {
+                    let _ = response_sender.send(Vec::new());
+                    continue;
+                }
                 let session = headers
                     .path
                     .strip_prefix("/realtime/")
@@ -516,6 +554,72 @@ fn route_loop(shared: Arc<ServiceShared>, request_rx: mpsc::Receiver<HttpServerR
     }
 }
 
+/// Constant-time byte equality (apart from the unavoidable length leak).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+fn header_value<'a>(headers: &'a HttpServerHeaders, name: &str) -> Option<&'a str> {
+    headers.lines.iter().find_map(|line| {
+        let (header_name, value) = line.trim_end().split_once(':')?;
+        header_name
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim())
+    })
+}
+
+fn request_is_authorized(shared: &ServiceShared, headers: &HttpServerHeaders) -> bool {
+    if headers.verb == "GET"
+        && (headers.path == "/health"
+            || headers
+                .path
+                .starts_with(crate::peer_serve::BLOB_PATH_PREFIX))
+    {
+        return true;
+    }
+    let Some(expected) = shared.fabric_secret.as_deref() else {
+        return true;
+    };
+    let Some(actual) = header_value(headers, "authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    constant_time_eq(actual.as_bytes(), expected.as_bytes())
+}
+
+fn unauthorized_response() -> HttpServerResponse {
+    error_json(401, "unauthorized".to_string())
+}
+
+fn route_get_request(
+    shared: &Arc<ServiceShared>,
+    headers: &HttpServerHeaders,
+) -> HttpServerResponse {
+    if !request_is_authorized(shared, headers) {
+        return unauthorized_response();
+    }
+    route_get(shared, &headers.path)
+}
+
+fn route_post_request(
+    shared: &Arc<ServiceShared>,
+    headers: &HttpServerHeaders,
+    body: &[u8],
+) -> HttpServerResponse {
+    if !request_is_authorized(shared, headers) {
+        return unauthorized_response();
+    }
+    route_post(shared, &headers.path, body)
+}
+
 /// Looks up the live session a connected websocket belongs to.
 fn realtime_session_for_socket(shared: &Arc<ServiceShared>, web_socket_id: u64) -> Option<Arc<RealtimeSession>> {
     let job_id = shared.ws_sessions.lock().unwrap().get(&web_socket_id).cloned()?;
@@ -525,7 +629,7 @@ fn realtime_session_for_socket(shared: &Arc<ServiceShared>, web_socket_id: u64) 
 fn route_get(shared: &Arc<ServiceShared>, path: &str) -> HttpServerResponse {
     // "/" arrives as "/index.html" (the shared http server appends it).
     if path == "/health" || path == "/index.html" {
-        return ok_json(health_json(shared).serialize_json());
+        return ok_json(health_json_wire(shared));
     }
     if path == "/models" {
         return ok_json(models_json(shared).serialize_json());
@@ -955,6 +1059,20 @@ fn health_json(shared: &Arc<ServiceShared>) -> HealthJson {
             queue_max: queue_limit,
         }),
     }
+}
+
+fn health_json_wire(shared: &Arc<ServiceShared>) -> String {
+    let mut json = health_json(shared).serialize_json();
+    if json.pop() == Some('}') {
+        json.push_str(",\"auth_required\":");
+        json.push_str(if shared.fabric_secret.is_some() {
+            "true"
+        } else {
+            "false"
+        });
+        json.push('}');
+    }
+    json
 }
 
 /// GET /loras — the adapters this box has, for the `loras` field of
@@ -2358,6 +2476,13 @@ mod lifecycle_tests {
     }
 
     fn fixture_shared(pins: &[&str]) -> Arc<ServiceShared> {
+        fixture_shared_with_secret(pins, None)
+    }
+
+    fn fixture_shared_with_secret(
+        pins: &[&str],
+        fabric_secret: Option<&str>,
+    ) -> Arc<ServiceShared> {
         let mut residency = ResidencyConfig::default();
         residency.pins = pins.iter().map(|s| s.to_string()).collect();
         let peer_options = crate::peer_serve::PeerOptions {
@@ -2373,6 +2498,7 @@ mod lifecycle_tests {
             models: Mutex::new(HashMap::new()),
             artifacts: Mutex::new(HashMap::new()),
             gpu: GpuCache::new(),
+            fabric_secret: fabric_secret.map(str::to_string),
             node_id: 1,
             node_key: "f".repeat(32),
             started_ms: 0,
@@ -2390,6 +2516,95 @@ mod lifecycle_tests {
             ws_sessions: Mutex::new(HashMap::new()),
             backends: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn request_headers(verb: &str, path: &str, bearer: Option<&str>) -> HttpServerHeaders {
+        let mut lines = vec![
+            format!("{verb} {path} HTTP/1.1\r\n"),
+            "Host: 127.0.0.1\r\n".to_string(),
+        ];
+        if let Some(bearer) = bearer {
+            lines.push(format!("Authorization: Bearer {bearer}\r\n"));
+        }
+        HttpServerHeaders {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            addr_text: "127.0.0.1:1".to_string(),
+            lines,
+            verb: verb.to_string(),
+            path: path.to_string(),
+            path_no_slash: path.trim_start_matches('/').to_string(),
+            search: None,
+            content_length: (verb == "POST").then_some(0),
+            accept_encoding: None,
+            sec_websocket_key: None,
+        }
+    }
+
+    #[test]
+    fn absent_fabric_secret_keeps_the_http_surface_open() {
+        let shared = fixture_shared(&[]);
+        let jobs = route_get_request(&shared, &request_headers("GET", "/jobs", None));
+        assert!(jobs.header.starts_with("HTTP/1.1 200"));
+
+        let post = request_headers("POST", "/not-an-endpoint", None);
+        let response = route_post_request(&shared, &post, b"{}");
+        assert!(response.header.starts_with("HTTP/1.1 404"));
+
+        let health = route_get_request(&shared, &request_headers("GET", "/health", None));
+        assert!(String::from_utf8(health.body)
+            .unwrap()
+            .contains("\"auth_required\":false"));
+    }
+
+    #[test]
+    fn fabric_secret_gates_jobs_but_not_health_or_peer_blobs() {
+        const SECRET: &str = "correct-fabric-secret";
+        let shared = fixture_shared_with_secret(&[], Some(SECRET));
+
+        let health = route_get_request(&shared, &request_headers("GET", "/health", None));
+        assert!(health.header.starts_with("HTTP/1.1 200"));
+        assert!(String::from_utf8(health.body)
+            .unwrap()
+            .contains("\"auth_required\":true"));
+
+        let missing = route_get_request(&shared, &request_headers("GET", "/jobs", None));
+        assert!(missing.header.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(missing.body.len() < 128);
+
+        let wrong = route_get_request(
+            &shared,
+            &request_headers("GET", "/jobs", Some("wrong-fabric-secret")),
+        );
+        assert!(wrong.header.starts_with("HTTP/1.1 401 Unauthorized"));
+        let wrong_body = String::from_utf8(wrong.body).unwrap();
+        assert!(!wrong_body.contains(SECRET));
+        assert!(!wrong_body.contains("wrong-fabric-secret"));
+
+        let authorized = route_get_request(
+            &shared,
+            &request_headers("GET", "/jobs", Some(SECRET)),
+        );
+        assert!(authorized.header.starts_with("HTTP/1.1 200 OK"));
+
+        let post_missing = route_post_request(
+            &shared,
+            &request_headers("POST", "/not-an-endpoint", None),
+            b"{}",
+        );
+        assert!(post_missing.header.starts_with("HTTP/1.1 401 Unauthorized"));
+        let post_authorized = route_post_request(
+            &shared,
+            &request_headers("POST", "/not-an-endpoint", Some(SECRET)),
+            b"{}",
+        );
+        assert!(post_authorized.header.starts_with("HTTP/1.1 404 Not Found"));
+
+        let blob = request_headers(
+            "GET",
+            &format!("{}{}", crate::peer_serve::BLOB_PATH_PREFIX, "a".repeat(64)),
+            None,
+        );
+        assert!(request_is_authorized(&shared, &blob));
     }
 
     fn fixture(resident: bool) -> Box<dyn ContentBackend> {
@@ -2722,6 +2937,7 @@ mod lifecycle_tests {
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        401 => "Unauthorized",
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",

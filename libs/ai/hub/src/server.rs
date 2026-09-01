@@ -205,6 +205,12 @@ pub struct ServiceShared {
     /// (aicore §8). Origin-less submits (every legacy client) take no lease
     /// and behave exactly as before — absence is the compatibility story.
     pub leases: Mutex<crate::lease::LeaseTable>,
+    /// The service's bound HTTP port, published in machine residency claims
+    /// so co-located apps route to this node instead of double-loading.
+    pub port: u16,
+    /// Machine residency elections this process holds, one guard per loaded
+    /// model (aicore §3). Dropping a guard (or dying) reopens the election.
+    pub residency_claims: Mutex<HashMap<String, crate::machine::ResidencyGuard>>,
     /// Live/realtime sessions currently running, keyed by job id. Reachable
     /// from both the worker thread (`server::execute_live_job`, which
     /// inserts/removes) and `route_loop` (which feeds it websocket traffic).
@@ -300,6 +306,8 @@ pub fn start_service(config: ServiceConfig) -> Result<ServiceHandle, AssetAiErro
     );
     let shared = Arc::new(ServiceShared {
         leases: Mutex::new(crate::lease::LeaseTable::new()),
+        port,
+        residency_claims: Mutex::new(HashMap::new()),
         registry: config.registry,
         cache_dir: config.cache_dir,
         downloader: config.downloader.with_serve_leases(peer.leases.clone()),
@@ -1924,11 +1932,65 @@ fn execute_live_job(
 }
 
 fn set_model_state(shared: &Arc<ServiceShared>, model_id: &str, state: ModelTrack) {
+    let loaded = matches!(state, ModelTrack::Loaded);
     shared
         .models
         .lock()
         .unwrap()
         .insert(model_id.to_string(), state);
+    reconcile_machine_claim(shared, model_id, loaded);
+}
+
+/// Keep the machine residency election (aicore §3) in step with residency:
+/// a load acquires the model's advisory claim and publishes this service's
+/// port so co-located apps route here instead of double-loading; an unload
+/// drops the guard and reopens the election. Losing the election is only
+/// logged — this process already carries the weights, and duplicate RAM is
+/// the documented soft failure, never a refusal.
+fn reconcile_machine_claim(shared: &Arc<ServiceShared>, model_id: &str, loaded: bool) {
+    // Unit tests drive set_model_state constantly and must never write the
+    // developer's real ~/.makepad/run; the election has its own tests.
+    if cfg!(test) {
+        return;
+    }
+    let key = machine_claim_key(&shared.registry, model_id);
+    let mut claims = shared.residency_claims.lock().unwrap();
+    if loaded {
+        if claims.contains_key(&key) {
+            return;
+        }
+        match crate::machine::claim(&key) {
+            Ok(crate::machine::Claim::Won(mut guard)) => {
+                let _ = guard.publish(crate::machine::ResidencyState::Ready {
+                    port: shared.port,
+                });
+                claims.insert(key, guard);
+            }
+            Ok(_) => eprintln!(
+                "[residency] {key}: another process already hosts this model on                  the machine (duplicate residency, continuing)"
+            ),
+            Err(e) => eprintln!("[residency] {key}: claim failed: {e}"),
+        }
+    } else {
+        claims.remove(&key);
+    }
+}
+
+/// The machine-wide election key for a model: the lowercase basename of its
+/// primary (largest) weights file when the registry knows one, else the model
+/// id. Apps loading a bare GGUF claim the same basename, so one file on disk
+/// is one election regardless of which side names it.
+pub(crate) fn machine_claim_key(registry: &Registry, model_id: &str) -> String {
+    if let Some(spec) = registry.find(model_id) {
+        if let Some(file) = spec.files.iter().max_by_key(|f| f.size.unwrap_or(0)) {
+            if let Some(base) = file.cache_as.rsplit('/').next() {
+                if !base.is_empty() {
+                    return base.to_ascii_lowercase();
+                }
+            }
+        }
+    }
+    model_id.to_ascii_lowercase()
 }
 
 /// Truthful other residents, least-recently-used first (never-used sorts
@@ -2318,6 +2380,8 @@ mod lifecycle_tests {
             last_used: Mutex::new(HashMap::new()),
             fleet: crate::discovery::DEFAULT_FLEET.to_string(),
             leases: Mutex::new(crate::lease::LeaseTable::new()),
+            port: 0,
+            residency_claims: Mutex::new(HashMap::new()),
             peer: crate::peer_serve::PeerRuntime::resolve(
                 &peer_options,
                 &std::env::temp_dir(),

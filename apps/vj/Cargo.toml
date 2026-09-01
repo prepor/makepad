@@ -34,6 +34,7 @@ makepad-asset-client = { path = "../../libs/asset/client" }
 # resumable, sha256-verified downloader. Featureless — the same slice the
 # asset UI links — so none of the model backends come along.
 makepad-ai-hub = { path = "../../libs/ai/hub", default-features = false }
+makepad-asset-creator = { path = "../../libs/asset/creator" }  # DREAM runs execute here now
 # The chat pane itself — ONE component, shared with the asset UI and the
 # game sandbox: the session on the server's chat broker, the worker thread,
 # the transcript with tool chips and the rate meter.

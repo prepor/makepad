@@ -40,6 +40,13 @@ pub enum Splice {
     /// The named dependency's artifact bytes ride as this stage's input
     /// image (asset-ui's cross-stage relay).
     InputImageFrom(String),
+    /// The named dependency's artifact rides as a NAMED input (the DREAM
+    /// video's `last_frame`: the still the clip ends on).
+    NamedInputFrom {
+        dep: String,
+        name: String,
+        content_type: String,
+    },
 }
 
 /// One stage's concrete work order: the spec's graph node plus the request
@@ -66,8 +73,12 @@ pub struct StageOutput {
 pub enum RunEvent {
     StageStarted { key: String, job_id: String },
     StageProgress { key: String, stage: Option<String>, progress: Option<f64> },
-    StageDone { key: String },
+    /// The stage finished; its output rides along so a consumer can publish
+    /// per stage while the run continues.
+    StageDone { key: String, output: Arc<StageOutput> },
     StageFailed { key: String, error: String },
+    /// A failed stage the spec declared skippable; the run continues.
+    StageSkipped { key: String, error: String },
     RunFinished { state: RunState },
 }
 
@@ -108,7 +119,7 @@ pub fn run(
     config: &EngineConfig,
     events: &Sender<RunEvent>,
     cancel: &Arc<AtomicBool>,
-) -> Result<HashMap<String, StageOutput>, AssetAiError> {
+) -> Result<HashMap<String, Arc<StageOutput>>, AssetAiError> {
     crate::pipeline::validate(spec).map_err(AssetAiError::Backend)?;
     if orders.len() != spec.stages.len() {
         return Err(AssetAiError::Backend(format!(
@@ -119,7 +130,7 @@ pub fn run(
         )));
     }
     let mut states = vec![StageState::Pending; spec.stages.len()];
-    let mut outputs: HashMap<String, StageOutput> = HashMap::new();
+    let mut outputs: HashMap<String, Arc<StageOutput>> = HashMap::new();
     let mut jobs: HashMap<usize, (String, Box<dyn ContentProvider>)> = HashMap::new();
 
     loop {
@@ -148,11 +159,7 @@ pub fn run(
             let provider = match providers.pick(&order.spec) {
                 Ok(provider) => provider,
                 Err(error) => {
-                    states[i] = StageState::Failed;
-                    let _ = events.send(RunEvent::StageFailed {
-                        key: order.spec.key.clone(),
-                        error: error.to_string(),
-                    });
+                    fail_stage(&mut states, i, &spec.stages[i], error.to_string(), events);
                     continue;
                 }
             };
@@ -166,11 +173,7 @@ pub fn run(
                     states[i] = StageState::Running;
                 }
                 Err(error) => {
-                    states[i] = StageState::Failed;
-                    let _ = events.send(RunEvent::StageFailed {
-                        key: order.spec.key.clone(),
-                        error: error.to_string(),
-                    });
+                    fail_stage(&mut states, i, &spec.stages[i], error.to_string(), events);
                 }
             }
         }
@@ -187,8 +190,7 @@ pub fn run(
             let status = match provider.poll(&job_id) {
                 Ok(status) => status,
                 Err(error) => {
-                    states[i] = StageState::Failed;
-                    let _ = events.send(RunEvent::StageFailed { key, error: error.to_string() });
+                    fail_stage(&mut states, i, &spec.stages[i], error.to_string(), events);
                     continue;
                 }
             };
@@ -211,25 +213,30 @@ pub fn run(
                                 output.artifact = Some(bytes);
                             }
                             Err(error) => {
-                                states[i] = StageState::Failed;
-                                let _ = events.send(RunEvent::StageFailed {
-                                    key: key.clone(),
-                                    error: format!("artifact fetch: {error}"),
-                                });
+                                fail_stage(
+                                    &mut states,
+                                    i,
+                                    &spec.stages[i],
+                                    format!("artifact fetch: {error}"),
+                                    events,
+                                );
                                 continue;
                             }
                         }
                     }
-                    outputs.insert(key.clone(), output);
+                    let output = Arc::new(output);
+                    outputs.insert(key.clone(), output.clone());
                     states[i] = StageState::Done;
-                    let _ = events.send(RunEvent::StageDone { key });
+                    let _ = events.send(RunEvent::StageDone { key, output });
                 }
                 JOB_STATE_ERROR => {
-                    states[i] = StageState::Failed;
-                    let _ = events.send(RunEvent::StageFailed {
-                        key,
-                        error: status.error.unwrap_or_else(|| "job error".into()),
-                    });
+                    fail_stage(
+                        &mut states,
+                        i,
+                        &spec.stages[i],
+                        status.error.unwrap_or_else(|| "job error".into()),
+                        events,
+                    );
                 }
                 JOB_STATE_CANCELLED => {
                     states[i] = StageState::Cancelled;
@@ -257,10 +264,34 @@ pub fn run(
     }
 }
 
+/// One failure point: honors `on_fail_skip` so a skippable stage never
+/// dooms the run (the DREAM expand law).
+fn fail_stage(
+    states: &mut [StageState],
+    i: usize,
+    spec: &StageSpec,
+    error: String,
+    events: &Sender<RunEvent>,
+) {
+    if spec.on_fail_skip {
+        states[i] = StageState::Skipped;
+        let _ = events.send(RunEvent::StageSkipped {
+            key: spec.key.clone(),
+            error,
+        });
+    } else {
+        states[i] = StageState::Failed;
+        let _ = events.send(RunEvent::StageFailed {
+            key: spec.key.clone(),
+            error,
+        });
+    }
+}
+
 fn apply_splices(
     request: &mut GenerateRequestJson,
     splices: &[Splice],
-    outputs: &HashMap<String, StageOutput>,
+    outputs: &HashMap<String, Arc<StageOutput>>,
 ) {
     for splice in splices {
         match splice {
@@ -279,6 +310,22 @@ fn apply_splices(
                         &makepad_base64::BASE64_STANDARD,
                     );
                     request.input_b64 = String::from_utf8(b64).ok();
+                }
+            }
+            Splice::NamedInputFrom { dep, name, content_type } => {
+                if let Some(artifact) = outputs.get(dep).and_then(|o| o.artifact.as_ref()) {
+                    let b64 = makepad_base64::base64_encode(
+                        &artifact.bytes,
+                        &makepad_base64::BASE64_STANDARD,
+                    );
+                    if let Ok(data_b64) = String::from_utf8(b64) {
+                        let inputs = request.inputs.get_or_insert_with(Vec::new);
+                        inputs.push(makepad_ai_hub::protocol::NamedInputJson {
+                            name: name.clone(),
+                            content_type: content_type.clone(),
+                            data_b64,
+                        });
+                    }
                 }
             }
         }
@@ -435,6 +482,7 @@ mod tests {
             deps: deps.iter().map(|d| d.to_string()).collect(),
             weight: DEFAULT_STAGE_WEIGHT,
             seed: 7,
+            on_fail_skip: false,
         }
     }
 

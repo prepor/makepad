@@ -31,6 +31,10 @@ pub struct StageSpec {
     pub weight: u64,
     /// Pinned entropy: a re-picked stage must regenerate identical content.
     pub seed: u64,
+    /// A failure here skips the stage instead of failing the run; dependents
+    /// proceed with their declared fallbacks (the DREAM expand law: the run
+    /// carries on with the typed prompt).
+    pub on_fail_skip: bool,
 }
 
 /// Default weight for a stage that declares none — the store's old neutral
@@ -44,6 +48,8 @@ pub enum StageState {
     Running,
     Done,
     Failed,
+    /// Failed, but declared `on_fail: skip` — the run went on without it.
+    Skipped,
     Cancelled,
 }
 
@@ -95,7 +101,10 @@ pub fn derive_state(stages: &[StageState]) -> RunState {
     if stages.iter().any(|s| *s == StageState::Cancelled) {
         return RunState::Cancelled;
     }
-    if stages.iter().all(|s| *s == StageState::Done) {
+    if stages
+        .iter()
+        .all(|s| matches!(s, StageState::Done | StageState::Skipped))
+    {
         return RunState::Done;
     }
     if stages.iter().all(|s| *s == StageState::Pending) {
@@ -132,11 +141,13 @@ pub fn ready_stages(spec: &PipelineSpec, states: &[StageState]) -> Vec<usize> {
             continue;
         }
         let deps_done = stage.deps.iter().all(|dep| {
-            spec.stages
-                .iter()
-                .position(|s| &s.key == dep)
-                .and_then(|j| states.get(j))
-                == Some(&StageState::Done)
+            matches!(
+                spec.stages
+                    .iter()
+                    .position(|s| &s.key == dep)
+                    .and_then(|j| states.get(j)),
+                Some(StageState::Done) | Some(StageState::Skipped)
+            )
         });
         if deps_done {
             ready.push(i);
@@ -156,6 +167,7 @@ mod tests {
             deps: deps.iter().map(|d| d.to_string()).collect(),
             weight: DEFAULT_STAGE_WEIGHT,
             seed: 42,
+            on_fail_skip: false,
         }
     }
 

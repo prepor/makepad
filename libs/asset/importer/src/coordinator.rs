@@ -1713,11 +1713,52 @@ impl<'f> Coordinator<'f> {
 // product shaping
 // ---------------------------------------------------------------------------
 
+/// The full publish document for one directly-generated artifact — the exact
+/// dressing the claim path applies (title from the person's words, cleaned
+/// prompts, provenance, typed seed provenance), for creators that drive the
+/// fleet themselves instead of through the store's queue (aicore §9).
+/// `alias` is caller-owned: the queue used `<ns>/job-<hex>`; a direct run
+/// names its own.
+#[allow(clippy::too_many_arguments)]
+pub fn dress_generated_publish(
+    kind: &'static GenKind,
+    namespace: &str,
+    request: &GenRequest,
+    product: GenArtifact,
+    alias: Option<AssetAlias>,
+    backend: String,
+    model: String,
+    version: String,
+    rights: PublishRights,
+) -> Result<PublishRequest, String> {
+    let mut publish = build_product(kind, namespace, request, product)?;
+    publish.alias = alias;
+    publish.prompt = annotation_text(&request.prompt, MAX_PROMPT_BYTES);
+    if let Some(original) = &request.original_prompt {
+        publish.provenance = format!("expanded from: {}", annotation_text(original, 500));
+    }
+    publish.generator = "asset-worker".to_string();
+    publish.backend = backend;
+    publish.model = model.clone();
+    publish.rights = rights;
+    if let Some(seed) = request.seed.filter(|_| !version.is_empty()) {
+        publish.manifest_provenance = Some(PublishProvenance {
+            generator: "makepad-asset-ai".to_string(),
+            model,
+            version,
+            seed,
+            parents: vec![],
+            params_digest: None,
+        });
+    }
+    Ok(publish)
+}
+
 /// Turn one verified artifact into the catalog row its kind declares:
 /// measured dimensions/duration/mesh stats and a real thumbnail, never an
 /// assumed one. Payloads are PARSED here, so an unloadable product fails the
 /// job instead of becoming a catalog entry no viewer can open.
-fn build_product(
+pub fn build_product(
     kind: &'static GenKind,
     ns: &str,
     request: &GenRequest,
@@ -2099,7 +2140,7 @@ const MAX_PROMPT_BYTES: usize = 4_000;
 /// newline between two lines would run their words together and make the
 /// prompt unsearchable. Whitespace runs collapse, the ends trim, and the
 /// cut happens on a word boundary so the last word is a word.
-fn annotation_text(text: &str, max: usize) -> String {
+pub fn annotation_text(text: &str, max: usize) -> String {
     let spaced: String = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -3071,7 +3112,7 @@ fn admitted_route(
 /// actually understands are forwarded; unknown ones are ignored rather than
 /// smuggled through, so a client typo fails visibly at the model instead of
 /// silently changing nothing.
-fn wire_request(
+pub fn wire_request(
     request: &GenRequest,
     model: String,
 ) -> makepad_ai_hub::protocol::GenerateRequestJson {

@@ -80,6 +80,7 @@ fn run_cli() -> Result<(), String> {
                 },
                 weight: DEFAULT_STAGE_WEIGHT,
                 seed,
+                on_fail_skip: false,
             })
             .collect(),
     };
@@ -127,8 +128,9 @@ fn run_cli() -> Result<(), String> {
                         println!("  {key}: {} {:.0}%", stage.unwrap_or_default(), p * 100.0)
                     }
                 }
-                RunEvent::StageDone { key } => println!("✓ {key}"),
+                RunEvent::StageDone { key, .. } => println!("✓ {key}"),
                 RunEvent::StageFailed { key, error } => println!("✗ {key}: {error}"),
+                RunEvent::StageSkipped { key, error } => println!("⤼ {key} skipped: {error}"),
                 RunEvent::RunFinished { state } => println!("run: {state:?}"),
             }
         }

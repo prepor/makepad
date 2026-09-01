@@ -1186,10 +1186,11 @@ impl Cx {
         }
         present_cpu_sample(
             perf_encode_t0.elapsed().as_secs_f64(),
-            (self.os.instance_bytes_uploaded
-                + self.os.uniform_bytes_uploaded
-                + self.os.vertex_buffer_bytes_uploaded
-                + self.os.texture_bytes_uploaded) as u64,
+            (self.os.instance_bytes_uploaded + self.os.vertex_buffer_bytes_uploaded) as u64,
+        );
+        TEX_BYTES.fetch_add(
+            self.os.texture_bytes_uploaded as u64,
+            std::sync::atomic::Ordering::Relaxed,
         );
         true
     }
@@ -4267,6 +4268,7 @@ mod vec_upload_tests {
 /// thread; the present pulse folds them into its once-a-second line.
 static CPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UP_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn present_cpu_sample(seconds: f64, bytes: u64) {
     CPU_US.fetch_add((seconds * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
@@ -4319,8 +4321,9 @@ fn present_pulse() {
                 let gpu_max = GPU_MAX_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
                 let cpu_ms = CPU_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
                 let up_mb = UP_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1048576.0;
+                let tex_mb = TEX_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1048576.0;
                 crate::log!(
-                    "MPPRESENT {count} presents/s · worst gap {:.1}ms · cpu encode {:.1}ms/s · upload {:.2}MB/s · gpu {:.1}ms/frame max {:.1}ms",
+                    "MPPRESENT {count} presents/s · worst gap {:.1}ms · cpu encode {:.1}ms/s · instances {:.2}MB/s · textures {tex_mb:.2}MB/s · gpu {:.1}ms/frame max {:.1}ms",
                     worst * 1000.0,
                     cpu_ms,
                     up_mb,

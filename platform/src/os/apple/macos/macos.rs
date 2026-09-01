@@ -70,6 +70,31 @@ const PRESENT_GATE_IN_FLIGHT: u32 = 3;
 /// every beat forever.
 const OCCLUSION_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// `MAKEPAD_PRESENT_WHEN_OCCLUDED=1`: keep presenting a window the compositor
+/// says is hidden.
+///
+/// Skipping presents for an occluded window is the right default — free power
+/// saving, and an occluded window genuinely gets no compositor vsync. But it
+/// makes a deliberately-backgrounded window unmeasurable and unphotographable:
+/// the probe above lets one frame through every 2 s, so a headless-style test
+/// run presents at 0.5 fps, its frame statistics describe the probe rather
+/// than the renderer, and `screencapture` of that window returns whatever
+/// stale frame the surface still holds.
+///
+/// Headless test runs (mosaic's `--demo`, superapp's `--e2e`) sit behind the
+/// user's windows on purpose, so an automated pass cannot steal the screen of
+/// whoever is using the machine. They still need honest frames, so they set
+/// this. Read once: it is consulted on the paint path.
+fn present_when_occluded() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MAKEPAD_PRESENT_WHEN_OCCLUDED")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// Private paint-clock used only while a widget owns the mouse. AppKit may
 /// reduce a non-key/occluded view's display-link callbacks to roughly 12 Hz;
 /// a captured drag must retain the panel's full refresh cadence.
@@ -654,7 +679,9 @@ impl Cx {
                         } else {
                             NS_WINDOW_OCCLUSION_STATE_VISIBLE
                         };
-                        if occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0 {
+                        if !present_when_occluded()
+                            && occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0
+                        {
                             if in_flight >= PRESENT_GATE_IN_FLIGHT {
                                 metal_window.gate_closed_since.get_or_insert_with(Instant::now);
                             }

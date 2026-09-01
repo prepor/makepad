@@ -16,7 +16,7 @@
 
 use crate::transcript::{ChatData, ChatRole};
 use makepad_asset_chat::context::ClientProfile;
-use makepad_asset_chat::dispatch::AssetServerTools;
+use makepad_asset_creator::tools::CreatorTools;
 use makepad_asset_chat::session::{Session, SessionId, ToolExecutor};
 use makepad_asset_chat::toolcall;
 use makepad_asset_chat::tools::{ContentToolCall, ToolDef};
@@ -243,23 +243,17 @@ fn make_provider(kind: ChatProviderKind) -> Box<dyn ChatProvider> {
 /// asset-client (the same hardened surface the broker drove), park decisions
 /// from the session's client profile, everything else typed-Unavailable.
 struct AppExec {
-    inner: Result<AssetServerTools, String>,
+    inner: CreatorTools,
     profile: ClientProfile,
 }
 
 impl ToolExecutor for AppExec {
     fn capability_doc(&mut self) -> String {
-        match &mut self.inner {
-            Ok(tools) => tools.capability_doc(),
-            Err(error) => format!("the asset server is unreachable: {error}"),
-        }
+        self.inner.capability_doc()
     }
 
     fn tool_definitions(&mut self) -> Vec<ToolDef> {
-        match &mut self.inner {
-            Ok(tools) => tools.tool_definitions(),
-            Err(_) => makepad_asset_chat::tools::definitions(),
-        }
+        self.inner.tool_definitions()
     }
 
     fn client_executes(&mut self, call: &ContentToolCall) -> bool {
@@ -273,12 +267,7 @@ impl ToolExecutor for AppExec {
         progress: &mut dyn FnMut(u16, &str),
         cancel: &makepad_asset_chat::session::CancelFlag,
     ) -> ToolOutcome {
-        match &mut self.inner {
-            Ok(tools) => tools.execute(call, ctx, progress, cancel),
-            Err(error) => ToolOutcome::Unavailable {
-                reason: format!("the asset server is unreachable: {error}"),
-            },
-        }
+        self.inner.execute(call, ctx, progress, cancel)
     }
 }
 
@@ -307,12 +296,7 @@ fn worker(
     let profile =
         ClientProfile::from_slug(&cfg.client).unwrap_or(ClientProfile::General);
     let mut exec = AppExec {
-        inner: AssetServerTools::connect(
-            cfg.endpoints,
-            cfg.token.clone(),
-            cfg.namespace.clone(),
-        )
-        .map_err(|e| e.to_string()),
+        inner: CreatorTools::connect(cfg.endpoints, cfg.token.clone(), cfg.namespace.clone()),
         profile,
     };
     let mut session: Option<Session> = None;
@@ -380,9 +364,7 @@ fn worker(
 fn retire(session: &mut Option<Session>, exec: &mut AppExec) {
     if let Some(session) = session.take() {
         session.cancel_flag().cancel();
-        if let Ok(tools) = &mut exec.inner {
-            tools.retire_session(session.id());
-        }
+        let _ = exec;
     }
 }
 

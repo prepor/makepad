@@ -29,6 +29,7 @@
 pub mod engine;
 pub mod pipeline;
 pub mod runner;
+pub mod tools;
 pub mod presets;
 
 pub use makepad_ai_hub;

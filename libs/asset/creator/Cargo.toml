@@ -11,6 +11,7 @@ makepad-ai-hub = { path = "../../ai/hub", default-features = false }
 makepad-strict-json = { path = "../../strict_json" }
 # …and publishes finished assets through the client. The hub itself never
 # sees this dependency: creation is the app's side of the boundary.
+makepad-asset-chat = { path = "../chat" }
 makepad-asset-client = { path = "../client" }
 makepad-asset-data = { path = "../data" }
 # The worker's own product builder + kind table, until P7 retires the rest.

@@ -27,6 +27,7 @@ description = "Shared chat pane for Makepad apps: broker session transport, tran
 [dependencies]
 makepad-widgets = { path = "../../widgets" }
 makepad-asset-chat = { path = "../asset/chat" }
+makepad-asset-creator = { path = "../asset/creator" }
 makepad-ai-hub = { path = "../ai/hub", default-features = false }
 makepad-asset-client = { path = "../asset/client" }
 

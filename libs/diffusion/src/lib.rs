@@ -29,7 +29,8 @@ pub use makepad_ai_motion::{
     hy_motion_transformer, hy_motion_weights,
 };
 pub use makepad_ai_sfx::{
-    moss, moss_dac, moss_dit, moss_pipeline, moss_text, sa3, sa3_ae, sa3_pipeline, sa3_text,
+    moss, moss_dac, moss_dit, moss_pipeline, moss_text, sa3, sa3_ae, sa3_bake, sa3_pipeline,
+    sa3_text,
     sa3_tokenizer, sa3_transformer, woosh, woosh_ae, woosh_dit, woosh_pipeline, woosh_text,
     woosh_tokenizer,
 };

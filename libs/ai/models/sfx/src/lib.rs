@@ -14,6 +14,7 @@ pub use makepad_ai_common::{
 
 pub mod sa3;
 pub mod sa3_ae;
+pub mod sa3_bake;
 pub mod sa3_pipeline;
 pub mod sa3_text;
 pub mod sa3_tokenizer;

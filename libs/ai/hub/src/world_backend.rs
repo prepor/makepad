@@ -27,6 +27,7 @@
 use crate::backend::{
     ArtifactData, BackendCtx, CancelToken, ContentBackend, GenerateParams, ProgressSink,
 };
+use crate::child_process;
 use crate::error::AssetAiError;
 use makepad_micro_serde::*;
 use std::io::{BufRead, Write};
@@ -67,7 +68,7 @@ struct Worker {
 
 impl Worker {
     fn kill(mut self) {
-        let _ = self.child.kill();
+        let _ = child_process::kill_tree(&mut self.child);
         let _ = self.child.wait();
     }
 }
@@ -144,7 +145,8 @@ impl WorldBackend {
         std::fs::write(&cameras, CAMERAS_FORWARD_JSON)
             .map_err(|e| AssetAiError::Io(format!("stage cameras json: {e}")))?;
 
-        let mut child = Command::new(&self.python)
+        let mut child = child_process::spawn(
+            Command::new(&self.python)
             .arg(&worker_py)
             .arg("--ckpt")
             .arg(&self.ckpt)
@@ -156,7 +158,7 @@ impl WorldBackend {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr inherits the service's stream -> tracebacks in svc.log.
-            .spawn()
+        )
             .map_err(|e| {
                 AssetAiError::Backend(format!(
                     "spawn {} failed: {e} (is the FlashWorld venv provisioned on this box?)",

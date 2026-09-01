@@ -22,6 +22,7 @@
 //! are read and cleaned up here.
 
 use crate::backend::CancelToken;
+use crate::child_process;
 use makepad_micro_serde::*;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -163,9 +164,7 @@ pub fn run_blocking(
     let result = (|| {
         std::fs::write(&in_path, input).map_err(|e| format!("write: {e}"))?;
         let (exe, args) = expand_template(cmd_template, &in_path, &out_path)?;
-        let status = Command::new(&exe)
-            .args(&args)
-            .status()
+        let status = child_process::status(Command::new(&exe).args(&args))
             .map_err(|e| format!("spawn {exe}: {e}"))?;
         if !status.success() {
             return Err(format!("exit {status}"));
@@ -251,13 +250,14 @@ fn run_cancellable_at(
             .map_err(|e| fail(format!("write params: {e}")))?;
     }
     let (exe, args) = expand_template(cmd_template, in_path, out_path).map_err(fail)?;
-    let mut child = Command::new(&exe)
+    let mut child = child_process::spawn(
+        Command::new(&exe)
         .args(&args)
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // stderr inherits the service's stream -> tracebacks in svc.log.
-        .spawn()
+    )
         .map_err(|e| fail(format!("spawn {exe}: {e}")))?;
 
     // Reader thread: ends (and disconnects the channel) when the child
@@ -293,7 +293,7 @@ fn run_cancellable_at(
         println!("{line}");
     };
     let kill = |child: &mut std::process::Child| {
-        let _ = child.kill();
+        let _ = child_process::kill_tree(child);
         let _ = child.wait();
     };
     loop {

@@ -2,6 +2,7 @@
 //! (the content boxes are NVIDIA/Windows), otherwise nulls. Queried through a
 //! short-lived cache so /health polling does not spawn a process per request.
 
+use crate::child_process;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -22,12 +23,13 @@ pub struct GpuInfo {
 pub fn query_gpu() -> GpuInfo {
     // nvidia-smi is on PATH on the GPU boxes (Windows and Linux). On machines
     // without it (macOS dev laptops) this just fails fast and we report nulls.
-    let output = Command::new("nvidia-smi")
+    let output = child_process::output(
+        Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,memory.free,memory.total,compute_cap",
             "--format=csv,noheader,nounits",
-        ])
-        .output();
+        ]),
+    );
     let output = match output {
         Ok(output) if output.status.success() => output,
         _ => return GpuInfo::default(),

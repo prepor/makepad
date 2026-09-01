@@ -39,6 +39,7 @@
 use crate::backend::{
     ArtifactData, BackendCtx, CancelToken, ContentBackend, GenerateParams, ProgressSink,
 };
+use crate::child_process;
 use crate::error::AssetAiError;
 use makepad_audio_decode::{decode_audio_limited, sniff as sniff_audio, AudioFormat, Limits};
 use makepad_micro_serde::*;
@@ -246,7 +247,7 @@ struct Worker {
 
 impl Worker {
     fn kill(mut self) {
-        let _ = self.child.kill();
+        let _ = child_process::kill_tree(&mut self.child);
         let _ = self.child.wait();
     }
 }
@@ -321,7 +322,8 @@ impl Music3Backend {
         std::fs::write(&worker_py, WORKER_PY)
             .map_err(|e| AssetAiError::Io(format!("stage music3_worker.py: {e}")))?;
 
-        let mut child = Command::new(&self.python)
+        let mut child = child_process::spawn(
+            Command::new(&self.python)
             .arg(&worker_py)
             .arg("--model-dir")
             .arg(&model_dir)
@@ -331,7 +333,7 @@ impl Music3Backend {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // stderr inherits the service's stream -> tracebacks in svc.log.
-            .spawn()
+        )
             .map_err(|e| {
                 AssetAiError::Backend(format!(
                     "spawn {} failed: {e} (is the Music3 diffusers venv provisioned on this box?)",

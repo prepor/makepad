@@ -33,6 +33,7 @@
 
 pub mod backend;
 pub mod client;
+mod child_process;
 pub mod control_image;
 pub mod depth_backend;
 pub mod download;

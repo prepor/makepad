@@ -46,7 +46,7 @@ pub(crate) mod routes_import;
 pub(crate) mod state;
 
 pub use config::{
-    BlobRefPolicy, ChatConfig, ChatScript, DiscoveryConfig, ScriptedLane, ScriptedTurn,
+    BlobRefPolicy, DiscoveryConfig,
     ServerConfig, DEFAULT_DISCOVERY_PORT,
 };
 pub use server::{AssetServer, LISTEN_FILE};

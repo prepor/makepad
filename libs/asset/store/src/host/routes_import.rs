@@ -693,10 +693,22 @@ pub fn derivation_complete(
     let now = now_ms();
     let variant = call_state(&rc.state, move |ctx| {
         let p = ctx.core.auth().authenticate(secret.as_bytes(), now)?;
-        let meta = ctx
-            .meta_get(&job)?
-            .ok_or(ServerError::NotFound { what: "job" })?;
-        require_cap(ctx, &p, Capability::JobWorker, &meta.ns)?;
+        // Authorize against the derivation's base-asset namespace — the
+        // same namespace `derive_request` authorized when it minted this
+        // job identity. (The job-routing table left with the queue; the
+        // derivation row itself is the authority, and complete_derivation
+        // still refuses a job id a newer round superseded.)
+        let status = ctx
+            .core
+            .variants()
+            .derivation_status(&dkey)?
+            .ok_or(ServerError::NotFound { what: "derivation" })?;
+        let ns = ctx
+            .core
+            .catalog()
+            .asset_namespace(&status.base.asset_id)?
+            .ok_or(ServerError::NotFound { what: "derivation base asset" })?;
+        require_cap(ctx, &p, Capability::JobWorker, &ns)?;
         let worker = worker_name(&p, &suffix);
         let variant = ctx
             .core

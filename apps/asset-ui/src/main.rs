@@ -41,7 +41,6 @@
 pub use makepad_widgets;
 
 mod analysis;
-mod annotate_queue;
 mod artifact_io;
 mod asset_store_state;
 mod audio;
@@ -72,7 +71,6 @@ use crate::artifact_io::{
     ViewerOpenGate,
 };
 use crate::fleet_poll::FleetPoll;
-use crate::annotate_queue::AnnotateQueue;
 use crate::runs_chip::RunsChip;
 use crate::import::{ImportJob, ImportPage, ImportQueue};
 use crate::import_classic::ClassicImportPage;
@@ -2432,17 +2430,6 @@ script_mod! {
                                     text_style: theme.font_bold{font_size: 7}
                                 }
                             }
-                            // How much of the catalog an AI can actually
-                            // find by asking for it. Visible from every
-                            // surface, because it is a property of the
-                            // store, not of whichever page is open.
-                            annotation_chip := Label{
-                                text: ""
-                                draw_text +: {
-                                    color: #x6a7178
-                                    text_style: theme.font_bold{font_size: 7}
-                                }
-                            }
                             // Everything this app has in flight, whoever is
                             // running it: store pipelines, standalone store
                             // jobs and this app's own engine, counted once
@@ -3169,12 +3156,8 @@ script_mod! {
                                             HintLabel{ text: "CC BY 4.0 · attribution required" }
                                             LinkLabel{ text: "Terms" url: "https://creativecommons.org/licenses/by/4.0/" }
                                             kenney_pack_drop := FieldDrop2{ width: 180 }
-                                            kenney_annotate_btn := GhostButton{ text: "Annotate" }
-                                            kenney_annotate_all_btn := GhostButton{ text: "Annotate all" }
-                                            kenney_annotate_pause_btn := GhostButton{ text: "Pause" }
                                         }
                                         HintLabel{ text: "© Kenney (kenney.nl). Attribution required on every copy and derivative. Not CC0. Local kits only — this card does not download Kenney." }
-                                        HintLabel{ text: "Annotate queues this kit's turntable sheets for the vision model, which writes the descriptions catalog search hits. A publish queues its own — these buttons are for what is already in. Pause cancels what is still queued and lets the boxes finish what they are on; Resume queues exactly those assets again." }
                                     }
 
                                     freedoom_card := ImportRow{
@@ -4243,7 +4226,6 @@ pub struct App {
     /// draws its progress. An asset published without a description is
     /// invisible to every text search the AI level builder makes.
     #[rust]
-    annotate_queue: AnnotateQueue,
     /// Landings waiting to be written a few at a time so the UI stays live.
     #[rust]
     import_landings: Vec<crate::import::LibraryLanding>,
@@ -6745,18 +6727,7 @@ impl App {
         self.ui
             .button(cx, ids!(runs_cancel_all))
             .set_visible(cx, active > 0);
-        // The annotation backlog has its own chip beside this one; naming it
-        // here and listing it would make this panel a second, worse copy.
-        let mut note = String::new();
-        if self.runs_chip.annotate_pending > 0 {
-            note = format!(
-                "{} annotation jobs queued — that backlog is the SEARCHABLE chip's.",
-                self.runs_chip.annotate_pending
-            );
-        }
-        if let Some(error) = &self.runs_chip.error {
-            note = format!("the store did not answer: {error}");
-        }
+        let note = String::new();
         let note_label = self.ui.label(cx, ids!(runs_panel_note));
         note_label.set_visible(cx, !note.is_empty());
         note_label.set_text(cx, &note);
@@ -6824,12 +6795,6 @@ impl App {
         match key {
             crate::runs_chip::CardKey::Local(run_id) => self.cancel_run(cx, *run_id),
             crate::runs_chip::CardKey::LocalQueued(index) => self.cancel_row(cx, *index),
-            key => {
-                if !self.runs_chip.cancel(key) {
-                    log!("runs: nothing to cancel for {}", key.as_text());
-                }
-                self.refresh_run_ui(cx);
-            }
         }
     }
 
@@ -11511,14 +11476,6 @@ impl App {
         self.ui
             .button(cx, ids!(queue_clear_btn))
             .set_visible(cx, !self.import_queue.pending.is_empty() || self.import_busy());
-        // The Pause/Resume button says which of the two it will do, and is
-        // only worth showing while the catalog still owes descriptions.
-        let pause_btn = self.ui.button(cx, ids!(kenney_annotate_pause_btn));
-        pause_btn.set_visible(cx, self.annotate_queue.has_work());
-        pause_btn.set_text(
-            cx,
-            if self.annotate_queue.paused { "Resume" } else { "Pause" },
-        );
         let kenney_job = ImportJob::Kenney {
             pack: self.import_page.selected_pack_id().0,
             pack_index: self.import_page.kenney_pack_index,
@@ -11896,22 +11853,6 @@ impl App {
                 cancel: RowAction::RemoveQueuedImport(item.id),
             });
         }
-        // The annotation queue is the store's, not this window's: it gets
-        // its own row for the same reason the analysis bake below does —
-        // the work outlives the import that queued it, and an operator
-        // watching a load wants to see the descriptions arriving too.
-        if self.annotate_queue.has_work() {
-            rows.push(StoreRow::Stage {
-                title: "Annotation".into(),
-                meta: self.annotate_queue.status_line(),
-                progress: self.annotate_queue.progress_fraction(),
-                failed: self.annotate_queue.error.is_some(),
-                cancel: None,
-                detail: String::new(),
-                expand: None,
-                copy: None,
-            });
-        }
         // The analysis bake is its own lane beside the imports: it outlives
         // the run that queued it (a 200-track import publishes long before
         // the first track is separated), so it gets its own row with its own
@@ -12206,46 +12147,6 @@ impl App {
         }
     }
 
-    /// Host the annotation worker as soon as there is a server to talk to.
-    ///
-    /// The same shape as the generation job loop: this process runs the
-    /// store, so this process drains the store's queues. A deployment that
-    /// wants the vision work elsewhere runs
-    /// `makepad-asset-annotate --worker` on that box instead — same loop,
-    /// same claim, and this one simply finds an empty queue.
-    fn maybe_start_annotate_queue(&mut self) {
-        if self.annotate_queue.running() {
-            return;
-        }
-        let Some(session) = self.import_server_session() else {
-            return;
-        };
-        // Scratch and client cache beside THIS instance's store root, never
-        // at a fixed repo path: a second instance on an isolated root must
-        // not write its sheets into the operator's.
-        let home = crate::asset_store_state::default_asset_server_root()
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(crate::asset_store_state::asset_ui_home);
-        self.annotate_queue.start(
-            session.endpoints,
-            Some(session.server_id),
-            session.token,
-            home,
-        );
-    }
-
-    /// Start reading everything in flight from the server this process is
-    /// talking to. Idempotent; a no-op until there is a session.
-    fn maybe_start_runs_chip(&mut self) {
-        if self.runs_chip.running() {
-            return;
-        }
-        let Some(session) = self.import_server_session() else {
-            return;
-        };
-        self.runs_chip.start(session.endpoints, session.token);
-    }
 
     fn import_server_session(&self) -> Option<crate::import::ServerSession> {
         let from_session = (|| {
@@ -13224,32 +13125,6 @@ impl MatchEvent for App {
         }
         if self.ui.button(cx, ids!(kenney_import_all_btn)).clicked(actions) {
             self.open_kenney_donate_modal(cx, ImportJob::KenneyAll);
-        }
-        // No donate prompt on these two: they load nothing from Kenney,
-        // they ask the SERVER to queue descriptions for what is already in
-        // the catalog. One request each — the queue outlives this window.
-        if self.ui.button(cx, ids!(kenney_annotate_btn)).clicked(actions) {
-            let (kit, _) = self.import_page.selected_pack_id();
-            log!("annotate: sweeping {kit} into the queue");
-            self.annotate_queue.sweep(Some(kit));
-            self.refresh_import_ui(cx);
-        }
-        if self.ui.button(cx, ids!(kenney_annotate_all_btn)).clicked(actions) {
-            log!("annotate: sweeping the whole catalog into the queue");
-            self.annotate_queue.sweep(None);
-            self.refresh_import_ui(cx);
-        }
-        // One button, two states: an operator either wants the backlog to
-        // stop or to carry on, and both are the same place on screen.
-        if self.ui.button(cx, ids!(kenney_annotate_pause_btn)).clicked(actions) {
-            if self.annotate_queue.paused {
-                log!("annotate: resuming the backlog");
-                self.annotate_queue.resume();
-            } else {
-                log!("annotate: pausing the backlog");
-                self.annotate_queue.pause();
-            }
-            self.refresh_import_ui(cx);
         }
         let donate_modal = self.ui.modal(cx, ids!(kenney_donate_modal));
         if self.ui.button(cx, ids!(kenney_donate_ok)).clicked(actions) {
@@ -14687,30 +14562,7 @@ impl AppMain for App {
             // per-asset and coincidental, and a failed run publishes
             // nothing at all — so the card settles on the event rather
             // than on the next tick of a poll clock.
-            let finished = self.store.take_finished_pipelines();
-            if !finished.is_empty() {
-                for pipeline in &finished {
-                    log!("runs: {pipeline} finished");
-                }
-                self.runs_chip.wake();
-            }
             self.maybe_open_gc_confirm(cx);
-            self.maybe_start_annotate_queue();
-            self.maybe_start_runs_chip();
-            // The RUNS chip and its panel: the poll thread's picture landing
-            // is the only thing that can change a store run on screen.
-            if self.runs_chip.poll() {
-                self.refresh_run_ui(cx);
-            }
-            let annotate_poll = self.annotate_queue.poll();
-            if annotate_poll {
-                self.ui
-                    .label(cx, ids!(annotation_chip))
-                    .set_text(cx, &self.annotate_queue.chip());
-                if self.surface == Surface::Import {
-                    self.refresh_import_ui(cx);
-                }
-            }
             let kenney_poll = self.import_page.poll();
             let classic_poll = self.classic_import_page.poll();
             let music_poll = self.music_import_page.poll();

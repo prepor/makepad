@@ -56,18 +56,6 @@ use makepad_asset_data::{
     FileRole, GameAlias, GameId, GameRevisionId, GameRevisionManifest,
 };
 
-/// Largest worker-supplied result/error document the transport records.
-const MAX_RESULT_BYTES: usize = 16 * 1024;
-const MAX_PROGRESS_NOTE_BYTES: usize = 200;
-/// One stage record: the full text a model was handed, plus its parameters.
-/// Generous on purpose — a prompt is capped at 4 000 characters upstream and
-/// the whole point of keeping it is that it is not truncated — and still
-/// bounded, because this is queue state a worker writes.
-const MAX_STAGE_BYTES: usize = 16 * 1024;
-/// Most assets one backlog sweep may queue. The 4023-asset Kenney library
-/// is nine sweeps, and the ceiling is what keeps one request from holding
-/// the state thread while it writes thousands of rows.
-const MAX_ANNOTATE_BACKLOG: u64 = 1000;
 const CACHE_IMMUTABLE: &str = "private, max-age=31536000, immutable";
 
 pub fn dispatch(conn: &mut Conn, head: &mut Head, rc: &RouteCtx) -> RouteResult<Outcome> {
@@ -1508,13 +1496,6 @@ fn publish_batch(conn: &mut Conn, head: &mut Head, rc: &RouteCtx) -> RouteResult
             }
             Ok(())
         })?;
-        // Every newly live asset that can be described gets its vision
-        // annotation queued, whoever published it — an import, a
-        // generation, a game agent. Best effort: the asset is in the
-        // catalog either way, and a backlog sweep finds what a failed
-        // enqueue missed.
-        for outcome in &outcomes {
-        }
         // Events after commit, in commit order, mirroring the split flow:
         // annotation_set, asset_published, alias_set per item.
         for (item, outcome) in parsed.iter().zip(&outcomes) {

@@ -88,10 +88,6 @@ impl AssetServer {
             cfg.event_journal_cap,
             cfg.event_max_waiters,
         ));
-        let endpoints = makepad_asset_client::ApiEndpoints {
-            control: control_addr,
-            data: data_addr,
-        };
         let requests: [Arc<std::sync::atomic::AtomicU64>; 2] = [
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -102,7 +98,6 @@ impl AssetServer {
             cfg: cfg.clone(),
             server_id,
             events: events.clone(),
-            op_event_waiters: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             rooms: std::sync::Arc::new(super::rooms::RoomRegistry::new()),
             cas: std::sync::Arc::new(crate::cas::Cas::open(
                 &cfg.root.join("cas"),
@@ -141,9 +136,7 @@ impl AssetServer {
             );
         }
 
-        let janitor = Some(spawn_janitor(
-            state.clone(),
-            events.clone(),
+        let janitor = Some(spawn_janitor(state.clone(),
             cfg.janitor_interval_ms,
             cfg.gc_janitor_steps,
         )?);
@@ -439,7 +432,6 @@ fn serve_conn(stream: TcpStream, rc: &RouteCtx, plane: Plane, stop: &AtomicBool)
 
 fn spawn_janitor(
     state: StateHandle,
-    events: Arc<super::events::EventHub>,
     interval_ms: u64,
     gc_steps: u32,
 ) -> ServerResult<(mpsc::Sender<()>, JoinHandle<()>)> {

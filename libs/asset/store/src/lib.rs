@@ -89,8 +89,8 @@ pub use server::{
 /// HTTP/UDP host used by asset-ui / sandbox embed and the standalone bin.
 pub mod host;
 pub use host::{
-    AssetServer, BlobRefPolicy, DiscoveryConfig,
-    ScriptedTurn, LISTEN_FILE, ServerConfig, DEFAULT_DISCOVERY_PORT,
+    AssetServer, BlobRefPolicy, DiscoveryConfig, LISTEN_FILE, ServerConfig,
+    DEFAULT_DISCOVERY_PORT,
 };
 pub use host::discovery;
 pub use host::json;

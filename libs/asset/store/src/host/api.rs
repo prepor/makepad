@@ -124,15 +124,6 @@ pub fn parse_job(s: &str) -> Option<JobId> {
     Some(JobId(from_hex_exact::<16>(hex)?))
 }
 
-pub fn pipeline_str(p: &super::state::PipelineId) -> String {
-    format!("{}{}", PIPELINE_PREFIX, to_hex(&p.0))
-}
-
-pub fn parse_pipeline(s: &str) -> Option<super::state::PipelineId> {
-    let hex = s.strip_prefix(PIPELINE_PREFIX)?;
-    Some(super::state::PipelineId(from_hex_exact::<16>(hex)?))
-}
-
 // ---- capability names ------------------------------------------------------
 
 pub const ALL_CAPS: [Capability; 16] = [

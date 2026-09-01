@@ -8,7 +8,6 @@ use makepad_asset_store::variants::JobId;
 use makepad_asset_store::*;
 use makepad_asset_data::*;
 
-const LEASE: u64 = 60_000;
 
 fn tool() -> ToolClosure {
     ToolClosure {

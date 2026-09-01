@@ -337,9 +337,9 @@ impl AssetServerCore {
     }
 
     /// Restart recovery: purge orphan CAS temp files, finish or abandon blob
-    /// delete intents a crash left mid-sweep, and tear down expired worker
-    /// leases (re-queueing or failing their jobs).
-    pub fn recover(&self, now_ms: u64) -> ServerResult<RecoverReport> {
+    /// delete intents a crash left mid-sweep. (Worker-lease teardown left
+    /// with the queue; the report field stays for callers that print it.)
+    pub fn recover(&self, _now_ms: u64) -> ServerResult<RecoverReport> {
         let cas_temps_removed = self.cas.recover()?;
         let gc_deletes_resolved = self.gc().recover_pending(&self.cas)?;
         let leases_expired = 0u64;

@@ -471,26 +471,44 @@ script_mod! {
             cap_shadow: uniform(#x8d98a7)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(2., 6., self.rect_size.x - 4., self.rect_size.y - 12., 8.)
+                sdf.box(2., 6., self.rect_size.x - 4., self.rect_size.y - 12., 12.)
                 sdf.fill(self.body_color)
-                // The cap's CENTER travels an inset span, so the cap body
-                // never clips at the extremes (cap 22 wide → 15px inset
+                // The cap's CENTER travels an inset span, so the cap blob
+                // never clips at the extremes (blob r 12 → 15px inset
                 // each end keeps it fully inside the chrome).
                 let left = 15.
                 let right_pad = 15.
                 let w = self.rect_size.x - left - right_pad
+                let cy = self.rect_size.y * 0.5
                 let track_h = 10.
                 let track_y = (self.rect_size.y - track_h) * 0.5
-                sdf.box(left, track_y, w, track_h, 4.)
+                // Track: a capsule with a soft bulge glooped onto each end.
+                sdf.box(left, track_y, w, track_h, 10.)
+                sdf.circle(left, cy, 7.)
+                sdf.gloop(6.)
+                sdf.circle(left + w, cy, 7.)
+                sdf.gloop(6.)
                 sdf.fill(self.track_color)
+                // Fill: a capsule whose leading edge goos into a bulge, with
+                // a trailing droplet melting back along the travelled span.
                 let fill_w = max(1., w * self.slide_pos)
-                sdf.box(left + 1.5, track_y + 1.5, max(1., fill_w - 3.), track_h - 3., 3.)
+                let head_x = left + fill_w
+                sdf.box(left + 1.5, track_y + 1.5, max(1., fill_w - 3.), track_h - 3., 7.)
+                sdf.circle(head_x - 1.5, cy, 6.5)
+                sdf.gloop(7.)
+                sdf.circle(head_x - min(fill_w, 26.), cy, 4.5)
+                sdf.gloop(9.)
                 sdf.fill(self.fill_color)
-                let cap_w = 22.
-                let cap_x = left + fill_w - cap_w * 0.5
-                sdf.box(cap_x + 1.5, 8., cap_w, self.rect_size.y - 16., 6.)
+                // Cap: a droplet — the big blob and a smaller one leaning
+                // back toward the fill, glooped into one goo. Shadow first.
+                let cap_x = head_x
+                sdf.circle(cap_x + 1.5, cy + 1.5, 12.)
+                sdf.circle(cap_x - 5.5, cy + 1.5, 7.5)
+                sdf.gloop(8.)
                 sdf.fill(self.cap_shadow)
-                sdf.box(cap_x, 6., cap_w, self.rect_size.y - 14., 6.)
+                sdf.circle(cap_x, cy, 12.)
+                sdf.circle(cap_x - 7., cy, 7.5)
+                sdf.gloop(8.)
                 sdf.fill(self.cap_color)
                 return sdf.result
             }

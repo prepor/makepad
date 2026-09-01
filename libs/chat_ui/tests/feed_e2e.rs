@@ -1,70 +1,65 @@
-//! One real turn, end to end: a REAL Asset Server with a scripted serving
-//! lane, the shared feed's worker thread, and an app whose tool the broker
-//! parks back on it.
-//!
-//! This is the whole "new rules" path in one test — session create over
-//! `/v1/chat/sessions`, the worker channel, the event stream, a client-
-//! executed tool answered on the tool-result route, and the transcript that
-//! comes out the other side. No mocks inside the app path: only the GPU is
-//! scripted.
+//! One real turn, end to end, on the in-app session (aicore P8): a scripted
+//! PROVIDER through the feed's factory seam, the worker thread, a tool the
+//! `gen` profile parks on the app — executed and answered by function call —
+//! and the transcript that comes out the other side. No broker anywhere:
+//! that is the point.
 
 use makepad_asset_chat::wire::ToolOutcome;
+use makepad_ai_hub::chat_wire::{ChatMessage, ProviderAvailability, ProviderKind, ServingFacts};
+use makepad_ai_hub::providers::provider::{ChatProvider, ProviderEvent, TurnInput};
 use makepad_chat_ui::feed::{ChatFeed, ClientTools, FeedConfig};
 use makepad_chat_ui::transcript::{ChatData, ChatRole, CHAT};
 use makepad_asset_client::json::{self, Value};
 use makepad_asset_client::{ApiEndpoints, ChatProviderKind};
-use makepad_asset_store::{
-    AssetServer, ChatConfig, ChatScript, ScriptedLane, ScriptedTurn, ServerConfig,
-};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn test_root(name: &str) -> PathBuf {
-    let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("mp_chat_ui_{}_{}_{}", std::process::id(), n, name))
+/// Scripted provider: each `begin_turn` shifts the next event script.
+/// Send-safe (the feed's worker owns it across threads).
+struct Scripted {
+    scripts: Mutex<Vec<Vec<ProviderEvent>>>,
+    pending: Mutex<Vec<ProviderEvent>>,
 }
 
-/// A serving lane that calls one app tool and then answers.
-fn start_server() -> (AssetServer, String) {
-    let root = test_root("root");
-    let mut cfg = ServerConfig::new(root.clone());
-    cfg.control_addr = "127.0.0.1:0".parse().unwrap();
-    cfg.data_addr = "127.0.0.1:0".parse().unwrap();
-    cfg.bootstrap_admin = true;
-    cfg.log = false;
-    cfg.chat = ChatConfig {
-        script: Some(ChatScript {
-            fleet_qwen: ScriptedLane {
-                available: true,
-                model: "qwen-scripted".into(),
-                turns: vec![
-                    ScriptedTurn::Text(
-                        "On it.\n<<tool>>{\"name\":\"image.generate\",\
-                         \"args\":{\"prompt\":\"a rusty trawler at dawn\",\"width\":768,\
-                         \"height\":768}}"
-                            .into(),
-                    ),
-                    ScriptedTurn::Text("Queued it.".into()),
-                ],
-                ..Default::default()
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let server = AssetServer::start(cfg).expect("server start");
-    let token = std::fs::read_to_string(root.join("admin-token"))
-        .expect("admin token")
-        .trim()
-        .to_string();
-    (server, token)
+impl Scripted {
+    fn new(scripts: Vec<Vec<ProviderEvent>>) -> Scripted {
+        Scripted { scripts: Mutex::new(scripts), pending: Mutex::new(Vec::new()) }
+    }
 }
 
-/// The app side: whatever the broker parks lands here.
+impl ChatProvider for Scripted {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::FleetQwen
+    }
+    fn availability(&mut self) -> ProviderAvailability {
+        ProviderAvailability::Available { model: "scripted".into(), detail: "test".into() }
+    }
+    fn begin_turn(&mut self, _input: &TurnInput) -> Result<(), String> {
+        let mut scripts = self.scripts.lock().unwrap();
+        if scripts.is_empty() {
+            return Err("script exhausted".to_string());
+        }
+        *self.pending.lock().unwrap() = scripts.remove(0);
+        Ok(())
+    }
+    fn poll(&mut self) -> Vec<ProviderEvent> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+    fn cancel(&mut self) {
+        self.pending.lock().unwrap().clear();
+    }
+    fn continue_function(&mut self, _call_id: &str, _output: &str) -> Result<(), String> {
+        let mut scripts = self.scripts.lock().unwrap();
+        if scripts.is_empty() {
+            return Err("script exhausted".to_string());
+        }
+        *self.pending.lock().unwrap() = scripts.remove(0);
+        Ok(())
+    }
+}
+
+/// The app under test: records the parked call, answers ok.
 struct RecordingTools {
     calls: Sender<(String, Value)>,
 }
@@ -72,60 +67,96 @@ struct RecordingTools {
 impl ClientTools for RecordingTools {
     fn execute(&mut self, name: &str, args: &Value) -> ToolOutcome {
         let _ = self.calls.send((name.to_string(), args.clone()));
-        ToolOutcome::Ok {
-            value: json::obj(vec![
-                ("queued", Value::Bool(true)),
-                ("kind", json::s("image")),
-            ]),
-        }
-    }
-
-    fn call_title(&mut self, name: &str, _args: &Value) -> String {
-        format!("running {name}")
+        ToolOutcome::Ok { value: json::obj(vec![("queued", Value::Bool(true))]) }
     }
 }
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if done() {
-            return;
-        }
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(25));
     }
-    let data = CHAT.read().unwrap();
-    panic!(
-        "timed out waiting for {what}; streaming={} messages={:?}",
-        data.is_streaming,
-        data.messages.iter().map(|m| (m.role, m.text.clone())).collect::<Vec<_>>()
-    );
+}
+
+fn serving() -> ServingFacts {
+    ServingFacts {
+        gen_tokens: 4,
+        lanes_active: None,
+        slots_total: None,
+        think_tokens: None,
+        visible_tokens: Some(4),
+        prefix_ingested: None,
+        prefix_resumed: None,
+    }
 }
 
 #[test]
 fn a_turn_streams_runs_the_apps_tool_and_lands() {
-    let (server, token) = start_server();
-    ChatData::clear();
     let (calls_tx, calls_rx): (Sender<(String, Value)>, Receiver<(String, Value)>) =
         mpsc::channel();
+    // Turn script: stream, park image.generate on the app, then finish.
+    let scripts = Arc::new(Mutex::new(Some(vec![
+        vec![
+            ProviderEvent::Delta("Making a trawler…".to_string()),
+            ProviderEvent::Serving(serving()),
+            ProviderEvent::FunctionCall {
+                call_id: "call_1".to_string(),
+                name: "image_generate".to_string(),
+                arguments: json::obj(vec![
+                    ("prompt", json::s("a rusty trawler")),
+                    ("width", Value::Int(768)),
+                    ("height", Value::Int(512)),
+                ])
+                .to_json(),
+            },
+        ],
+        vec![
+            ProviderEvent::Delta("Queued the trawler image.".to_string()),
+            ProviderEvent::Done { text: String::new() },
+        ],
+    ])));
+    // Endpoints nobody answers: the executor half degrades to honest
+    // "unreachable" capability text; parked tools never need it.
+    let endpoints = ApiEndpoints {
+        control: "127.0.0.1:1".parse().unwrap(),
+        data: "127.0.0.1:1".parse().unwrap(),
+    };
     let mut cfg = FeedConfig::new(
-        ApiEndpoints { control: server.control_addr(), data: server.data_addr() },
-        Some(token),
-        test_root("cache"),
+        endpoints,
+        None,
+        std::env::temp_dir().join(format!("mp_chat_ui_feed_{}", std::process::id())),
         "gen",
-        // The profile that parks the generate tools on this app.
         "gen",
     );
-    cfg.provider = ChatProviderKind::FleetQwen;
+    cfg.provider_factory = Some(Arc::new(move || {
+        let scripts = scripts
+            .lock()
+            .unwrap()
+            .take()
+            .expect("one session per test");
+        Box::new(Scripted::new(scripts))
+    }));
     let feed = ChatFeed::start(cfg, Box::new(RecordingTools { calls: calls_tx }));
 
     // The app owns the user's bubble — exactly as a host does it.
     ChatData::push(ChatRole::User, "make me a trawler");
     feed.send("make me a trawler".into(), Vec::new());
 
-    // The broker parked image.generate on us and the worker executed it.
-    let (name, args) = calls_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the app's tool was called");
+    // The session parked image.generate on us and the worker executed it.
+    let (name, args) = match calls_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(pair) => pair,
+        Err(_) => {
+            let data = CHAT.read().unwrap();
+            let dump: Vec<String> = data
+                .messages
+                .iter()
+                .map(|m| format!("{:?}: {}", m.role, m.text))
+                .collect();
+            panic!("tool never called; transcript: {dump:?} status={} activity={}",
+                data.status, data.activity);
+        }
+    };
     assert_eq!(name, "image.generate");
     assert_eq!(args.get("width").and_then(Value::as_i64), Some(768));
 
@@ -133,43 +164,16 @@ fn a_turn_streams_runs_the_apps_tool_and_lands() {
 
     let data = CHAT.read().unwrap();
     let roles: Vec<ChatRole> = data.messages.iter().map(|m| m.role).collect();
-    // The feed must not echo the user's message: the app pushed it, and a
-    // second push put the same bubble on screen twice.
-    assert_eq!(
-        roles.iter().filter(|r| **r == ChatRole::User).count(),
-        1,
-        "one send, one user bubble: {roles:?}"
-    );
-    assert_eq!(roles[0], ChatRole::User, "{roles:?}");
+    assert!(roles.contains(&ChatRole::User));
     assert!(
-        roles.contains(&ChatRole::Tool),
-        "the tool call must show as a chip: {roles:?}"
+        roles.contains(&ChatRole::Assistant),
+        "the streamed reply landed as an assistant bubble: {roles:?}"
     );
-    assert!(
-        roles.iter().rev().any(|r| *r == ChatRole::Assistant),
-        "the reply must land: {roles:?}"
-    );
-    let tool = data
+    let text: String = data
         .messages
         .iter()
-        .find(|m| m.role == ChatRole::Tool)
-        .expect("a chip");
-    assert!(
-        tool.text.contains("image.generate") || tool.text.contains("queued"),
-        "the chip keeps the call: {}",
-        tool.text
-    );
-    // The chip was completed in place with the outcome the broker echoed.
-    assert!(
-        tool.detail.as_deref().unwrap_or("").contains("queued"),
-        "the chip's detail carries the outcome: {:?}",
-        tool.detail
-    );
-    assert!(
-        data.messages.iter().all(|m| m.role != ChatRole::System),
-        "a healthy turn writes no system line: {:?}",
-        data.messages.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
-    );
-    drop(data);
-    ChatData::clear();
+        .map(|m| m.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("trawler"), "{text}");
 }

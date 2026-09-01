@@ -1,31 +1,35 @@
-//! One chat session on the Asset Server's broker, pumped by a worker
-//! thread on a channel.
+//! One chat session, run IN THE APP, pumped by a worker thread on a channel.
 //!
-//! The routing law (user, 2026-08-20): the asset server is the ONE routing
-//! point for all AI. An app never talks to a fleet box or an external
-//! provider — it opens a broker-owned chat session on its Asset Server,
-//! sends user turns, and renders the event stream. The model runs on a
-//! fleet box the SERVER picked; the model's tool calls execute on the
-//! server (catalog SQL, search, typed operations) — except the tools the
-//! session's declared profile parks BACK on this app (the game's `world.*`,
-//! the asset UI's `*.generate` / `defaults.*` / `fleet.introspect`), which
-//! this worker executes through [`ClientTools`] and posts to the
-//! tool-result route.
+//! The routing law (aicore, 2026-08-31, superseding the 2026-08-20 broker
+//! law): the AI-HUB is the backbone and the asset server only stores. The
+//! session engine (`makepad_asset_chat::session`) runs on this worker; the
+//! model is reached through the hub's providers directly (fleet qwen over
+//! LAN discovery, or a cloud provider from env); catalog tools execute over
+//! the app's own asset-client; and the tools the session's profile parks on
+//! the app (the game's `world.*`, the asset UI's `*.generate`) execute
+//! through [`ClientTools`] exactly as before — the answer now lands by a
+//! function call instead of a tool-result route.
 //!
-//! The UI thread never blocks: every HTTP call happens here, and the only
-//! thing the app touches is [`ChatFeed`]'s channel and the transcript
+//! The UI thread never blocks: every provider round happens here, and the
+//! only thing the app touches is [`ChatFeed`]'s channel and the transcript
 //! global in [`crate::transcript`].
 
 use crate::transcript::{ChatData, ChatRole};
+use makepad_asset_chat::context::ClientProfile;
+use makepad_asset_chat::dispatch::AssetServerTools;
+use makepad_asset_chat::session::{Session, SessionId, ToolExecutor};
 use makepad_asset_chat::toolcall;
-use makepad_asset_chat::wire::ToolOutcome;
-use makepad_asset_client::dto::{
-    ChatEventBodyDto, ChatProviderKind, ChatProviderStateDto, ChatSessionId, ChatToolOutcomeDto,
+use makepad_asset_chat::tools::{ContentToolCall, ToolDef};
+use makepad_asset_chat::wire::{
+    AttachmentBinding, ChatEventBody, ProviderAvailability, ToolOutcome,
 };
+use makepad_ai_hub::chat_wire::ProviderKind;
+use makepad_ai_hub::providers::provider::ChatProvider;
+use makepad_ai_hub::providers::qwen::{FleetQwenChatProvider, HttpFleetTransport};
+use makepad_ai_hub::discovery;
+use makepad_asset_client::dto::{ChatProviderKind, ChatToolOutcomeDto};
 use makepad_asset_client::json::Value;
-use makepad_asset_client::{
-    ApiEndpoints, AssetClient, ChatAttachment, ChatCreateRequest, ChatSendRequest, ClientConfig,
-};
+use makepad_asset_client::{ApiEndpoints, ChatAttachment};
 use makepad_widgets::log;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -33,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// What the app can ask the worker to do. Everything else it learns from
 /// the transcript.
@@ -48,7 +52,7 @@ enum Cmd {
 /// personality seam: the namespace and the declared client profile select
 /// the taught context and the tool surface server-side, so two apps share
 /// this whole file and still get their own chat.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FeedConfig {
     pub endpoints: ApiEndpoints,
     pub token: Option<String>,
@@ -62,6 +66,9 @@ pub struct FeedConfig {
     pub provider: ChatProviderKind,
     /// How the provider is named in status lines ("Qwen").
     pub provider_label: String,
+    /// Test seam: a factory overriding [`make_provider`] (scripted turns).
+    pub provider_factory:
+        Option<Arc<dyn Fn() -> Box<dyn ChatProvider> + Send + Sync>>,
 }
 
 impl FeedConfig {
@@ -80,6 +87,7 @@ impl FeedConfig {
             client: client.into(),
             provider: ChatProviderKind::FleetQwen,
             provider_label: "Qwen".to_string(),
+            provider_factory: None,
         }
     }
 }
@@ -204,6 +212,91 @@ enum TurnEnd {
     Cleared,
 }
 
+/// The provider this feed's configured kind opens — the broker's own
+/// factory, replicated: fleet qwen over LAN discovery; cloud and CLI
+/// providers from this host's env. Constructed fresh per session.
+fn make_provider(kind: ChatProviderKind) -> Box<dyn ChatProvider> {
+    match kind {
+        ChatProviderKind::FleetQwen => {
+            let bases: Vec<String> = discovery::start_listener()
+                .nodes()
+                .into_iter()
+                .map(|n| n.base_url)
+                .collect();
+            Box::new(FleetQwenChatProvider::new(HttpFleetTransport, bases))
+        }
+        ChatProviderKind::OpenAi => Box::new(makepad_asset_chat::openai::from_env()),
+        ChatProviderKind::Grok => Box::new(makepad_asset_chat::grok::from_env()),
+        ChatProviderKind::ClaudeCli => {
+            Box::new(makepad_asset_chat::claude::ClaudeCodeChatProvider::new(None))
+        }
+        ChatProviderKind::CodexCli => {
+            Box::new(makepad_asset_chat::codex_cli::CodexCliChatProvider::new(None))
+        }
+        ChatProviderKind::GrokCli => {
+            Box::new(makepad_asset_chat::grok_cli::GrokCliChatProvider::new(None))
+        }
+    }
+}
+
+/// The in-app tool executor: catalog and operation tools over the app's own
+/// asset-client (the same hardened surface the broker drove), park decisions
+/// from the session's client profile, everything else typed-Unavailable.
+struct AppExec {
+    inner: Result<AssetServerTools, String>,
+    profile: ClientProfile,
+}
+
+impl ToolExecutor for AppExec {
+    fn capability_doc(&mut self) -> String {
+        match &mut self.inner {
+            Ok(tools) => tools.capability_doc(),
+            Err(error) => format!("the asset server is unreachable: {error}"),
+        }
+    }
+
+    fn tool_definitions(&mut self) -> Vec<ToolDef> {
+        match &mut self.inner {
+            Ok(tools) => tools.tool_definitions(),
+            Err(_) => makepad_asset_chat::tools::definitions(),
+        }
+    }
+
+    fn client_executes(&mut self, call: &ContentToolCall) -> bool {
+        self.profile.client_executes(call)
+    }
+
+    fn execute(
+        &mut self,
+        call: &ContentToolCall,
+        ctx: &makepad_asset_chat::session::ExecCtx,
+        progress: &mut dyn FnMut(u16, &str),
+        cancel: &makepad_asset_chat::session::CancelFlag,
+    ) -> ToolOutcome {
+        match &mut self.inner {
+            Ok(tools) => tools.execute(call, ctx, progress, cancel),
+            Err(error) => ToolOutcome::Unavailable {
+                reason: format!("the asset server is unreachable: {error}"),
+            },
+        }
+    }
+}
+
+/// Wire → DTO outcome, for the app-facing summary hooks (same five shapes).
+fn outcome_dto(outcome: &ToolOutcome) -> ChatToolOutcomeDto {
+    match outcome {
+        ToolOutcome::Ok { value } => ChatToolOutcomeDto::Ok { value: value.clone() },
+        ToolOutcome::Failed { message } => {
+            ChatToolOutcomeDto::Failed { message: message.clone() }
+        }
+        ToolOutcome::Refused { what } => ChatToolOutcomeDto::Refused { what: what.clone() },
+        ToolOutcome::Denied { what } => ChatToolOutcomeDto::Denied { what: what.clone() },
+        ToolOutcome::Unavailable { reason } => {
+            ChatToolOutcomeDto::Unavailable { reason: reason.clone() }
+        }
+    }
+}
+
 fn worker(
     cfg: FeedConfig,
     mut tools: Box<dyn ClientTools>,
@@ -211,26 +304,19 @@ fn worker(
     dirty: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
 ) {
-    let _ = std::fs::create_dir_all(&cfg.cache);
-    let mut client_cfg = ClientConfig::new(cfg.cache.clone());
-    client_cfg.token = cfg.token.clone();
-    let client = match AssetClient::connect(client_cfg, cfg.endpoints, None) {
-        Ok(c) => c,
-        Err(error) => {
-            let line = format!("chat could not reach the asset server: {error}");
-            ChatData::set_status(&line);
-            ChatData::push(ChatRole::System, line);
-            dirty.store(true, Ordering::Relaxed);
-            return;
-        }
+    let profile =
+        ClientProfile::from_slug(&cfg.client).unwrap_or(ClientProfile::General);
+    let mut exec = AppExec {
+        inner: AssetServerTools::connect(
+            cfg.endpoints,
+            cfg.token.clone(),
+            cfg.namespace.clone(),
+        )
+        .map_err(|e| e.to_string()),
+        profile,
     };
-    // The session AND its event cursor live across turns: the broker's
-    // event log is one monotonic stream per session, and polling a new turn
-    // from 0 REPLAYS every earlier turn — re-executing old client tools and
-    // posting stale results the broker answers with 409 no_client_tool.
-    let mut session: Option<(ChatSessionId, u64)> = None;
+    let mut session: Option<Session> = None;
     let mut view = TurnView::default();
-    // Turns the user sent while another was still running.
     let mut queued: VecDeque<(String, Vec<ChatAttachment>)> = VecDeque::new();
     loop {
         let cmd = match queued.pop_front() {
@@ -243,10 +329,10 @@ fn worker(
         match cmd {
             Cmd::Send { text, attachments } => {
                 match run_turn(
-                    &client,
                     &cfg,
                     &mut session,
                     &mut view,
+                    &mut exec,
                     tools.as_mut(),
                     &text,
                     &attachments,
@@ -262,18 +348,16 @@ fn worker(
                         ChatData::push(ChatRole::System, error);
                     }
                     TurnEnd::Cleared => {
-                        retire(&client, &mut session);
+                        retire(&mut session, &mut exec);
                         ChatData::clear();
                     }
                 }
                 dirty.store(true, Ordering::Relaxed);
             }
             Cmd::Cancel => {
-                // Nothing is streaming: a cancel outside a turn is a no-op
-                // rather than a request the broker has to reason about.
                 if ChatData::is_streaming() {
-                    if let Some((id, _)) = &session {
-                        let _ = client.chat_cancel(id);
+                    if let Some(session) = &session {
+                        session.cancel_flag().cancel();
                     }
                     ChatData::end_stream();
                     ChatData::set_activity("");
@@ -281,31 +365,33 @@ fn worker(
                 }
             }
             Cmd::Clear => {
-                retire(&client, &mut session);
+                retire(&mut session, &mut exec);
                 ChatData::clear();
                 dirty.store(true, Ordering::Relaxed);
             }
             Cmd::Shutdown => break,
         }
     }
-    retire(&client, &mut session);
+    retire(&mut session, &mut exec);
 }
 
-/// Retire the session server-side so a Clear really does start over (and a
-/// closing app does not leave a session against the broker's per-owner cap).
-fn retire(client: &AssetClient, session: &mut Option<(ChatSessionId, u64)>) {
-    if let Some((id, _)) = session.take() {
-        let _ = client.chat_cancel(&id);
-        let _ = client.chat_retire(&id);
+/// Drop the session (and let the executor forget its operations) so a Clear
+/// really does start over.
+fn retire(session: &mut Option<Session>, exec: &mut AppExec) {
+    if let Some(session) = session.take() {
+        session.cancel_flag().cancel();
+        if let Ok(tools) = &mut exec.inner {
+            tools.retire_session(session.id());
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
-    client: &AssetClient,
     cfg: &FeedConfig,
-    session: &mut Option<(ChatSessionId, u64)>,
+    session: &mut Option<Session>,
     view: &mut TurnView,
+    exec: &mut AppExec,
     tools: &mut dyn ClientTools,
     text: &str,
     attachments: &[ChatAttachment],
@@ -315,130 +401,77 @@ fn run_turn(
     connected: &AtomicBool,
 ) -> TurnEnd {
     if session.is_none() {
-        ChatData::set_activity("checking the server's chat providers…");
-        let providers = match client.chat_providers() {
-            Ok(p) => p,
-            Err(e) => {
-                connected.store(false, Ordering::Relaxed);
-                return TurnEnd::Failed(format!("the asset server did not answer: {e}"));
-            }
+        ChatData::set_activity(&format!("probing the {} provider…", cfg.provider_label));
+        let mut provider = match &cfg.provider_factory {
+            Some(factory) => factory(),
+            None => make_provider(cfg.provider),
         };
-        let picked = providers.iter().find(|p| p.kind == cfg.provider);
-        match picked.map(|p| &p.state) {
-            Some(ChatProviderStateDto::Available { model }) => {
+        match provider.availability() {
+            ProviderAvailability::Available { model, .. } => {
                 ChatData::set_status(format!("{} ready · {model}", cfg.provider_label));
                 ChatData::set_activity(&format!("{} ready · {model}", cfg.provider_label));
             }
-            Some(ChatProviderStateDto::Unavailable { reason }) => {
-                connected.store(false, Ordering::Relaxed);
-                let line = format!("The server's {} provider is unavailable: {reason}", cfg.provider_label);
-                ChatData::set_status(&line);
-                return TurnEnd::Failed(line);
-            }
-            None => {
+            ProviderAvailability::Unavailable { reason } => {
                 connected.store(false, Ordering::Relaxed);
                 let line = format!(
-                    "this asset server has no {} provider",
-                    cfg.provider.as_str()
+                    "The {} provider is unavailable: {reason}",
+                    cfg.provider_label
                 );
                 ChatData::set_status(&line);
                 return TurnEnd::Failed(line);
             }
         }
-        ChatData::set_activity("opening a chat session…");
-        let request = ChatCreateRequest::new(cfg.namespace.clone(), cfg.provider)
-            .with_client(cfg.client.clone());
-        let created = match client.chat_create(&request) {
-            Ok(c) => c,
-            Err(e) => {
-                connected.store(false, Ordering::Relaxed);
-                return TurnEnd::Failed(format!("open chat session: {e}"));
-            }
-        };
-        // Cursor 0 is correct exactly once: a fresh session has no history.
-        *session = Some((created.session, 0));
+        *session = Some(Session::new(cfg.client.clone(), provider));
         view.answered.clear();
         connected.store(true, Ordering::Relaxed);
         tools.session_opened();
     }
-    let (id, mut cursor) = {
-        let (id, cursor) = session.as_ref().expect("just ensured");
-        (id.clone(), *cursor)
-    };
+    let live = session.as_mut().expect("just ensured");
     ChatData::set_activity("sending…");
-    let request = ChatSendRequest {
-        text: text.to_string(),
-        attachments: attachments.to_vec(),
-        dynamic_context: None,
-    };
-    if let Err(e) = client.chat_send(&id, &request) {
-        // A sealed/expired session starts over cleanly on the next message.
+    let bindings: Vec<AttachmentBinding> = attachments
+        .iter()
+        .map(|a| AttachmentBinding { revision: a.revision, role: a.role.clone() })
+        .collect();
+    if let Err(refusal) = live.send(text, &bindings, exec) {
+        let error = format!("send: {refusal:?}");
         *session = None;
         connected.store(false, Ordering::Relaxed);
-        return TurnEnd::Failed(format!("send: {e}"));
+        return TurnEnd::Failed(error);
     }
     ChatData::begin_stream();
     view.raw.clear();
     view.call_names.clear();
     ChatData::set_activity("thinking…");
     dirty.store(true, Ordering::Relaxed);
-    // One failed poll must not kill a live turn: the broker's actor can be
-    // busy past the route's own timeout during a long provider round, and a
-    // parked client tool gives us a window to come back for it. Only a
-    // sustained outage ends the turn.
-    let mut poll_failures = 0u32;
     let mut cleared = false;
     loop {
-        // Commands are serviced INSIDE the turn: Escape has to reach the
-        // broker while the reply is still streaming, not after it lands.
+        // Commands are serviced INSIDE the turn: Escape has to land while
+        // the reply is still streaming.
         loop {
             match rx.try_recv() {
                 Ok(Cmd::Cancel) => {
-                    let _ = client.chat_cancel(&id);
+                    live.cancel_flag().cancel();
                     ChatData::set_activity("stopping…");
                 }
                 Ok(Cmd::Clear) => {
-                    let _ = client.chat_cancel(&id);
+                    live.cancel_flag().cancel();
                     cleared = true;
                     ChatData::set_activity("clearing…");
                 }
-                // A turn at a time is the session engine's law; the next
-                // one runs as soon as this one lands.
                 Ok(Cmd::Send { text, attachments }) => queued.push_back((text, attachments)),
                 Ok(Cmd::Shutdown) | Err(TryRecvError::Disconnected) => {
-                    let _ = client.chat_cancel(&id);
+                    live.cancel_flag().cancel();
                     return TurnEnd::Done;
                 }
                 Err(TryRecvError::Empty) => break,
             }
         }
-        let page = match client.chat_events(&id, cursor, 8_000, 64) {
-            Ok(page) => {
-                poll_failures = 0;
-                page
-            }
-            Err(e) => {
-                poll_failures += 1;
-                // The broker actor can be busy for MINUTES when another
-                // session's provider round is queued behind fleet jobs —
-                // and a parked tool's timeout is starved by exactly as
-                // much, so patience here never loses to it. ~2 minutes.
-                if poll_failures >= 60 {
-                    return TurnEnd::Failed(format!("events: {e}"));
-                }
-                ChatData::set_activity("server busy — still listening…");
-                thread::sleep(Duration::from_millis(2000));
-                continue;
-            }
-        };
-        cursor = page.cursor;
-        // Persist the cursor as it advances: the NEXT turn must resume
-        // after this one's events, never replay them.
-        if let Some((_, saved)) = session.as_mut() {
-            *saved = cursor;
-        }
-        for event in page.events {
-            if let Some(end) = handle_event(client, &id, view, tools, event.body) {
+        live.pump(exec);
+        let session_id = live.id().clone();
+        for event in live.drain_events() {
+            if let Some(end) =
+                handle_event(live, exec, &session_id, view, tools, event.body)
+            {
                 dirty.store(true, Ordering::Relaxed);
                 return if cleared { TurnEnd::Cleared } else { end };
             }
@@ -450,17 +483,15 @@ fn run_turn(
 
 /// Returns `Some(end)` when the turn ended.
 fn handle_event(
-    client: &AssetClient,
-    id: &ChatSessionId,
+    session: &mut Session,
+    exec: &mut AppExec,
+    _id: &SessionId,
     view: &mut TurnView,
     tools: &mut dyn ClientTools,
-    body: ChatEventBodyDto,
+    body: ChatEventBody,
 ) -> Option<TurnEnd> {
     match body {
-        ChatEventBodyDto::Delta { text, serving } => {
-            // The rate meter reads the RAW delta (thinking and tool lines
-            // included — the box generated all of it) and prefers the
-            // service's own token count over a guess from bytes.
+        ChatEventBody::Delta { text, serving } => {
             ChatData::note_delta(
                 text.len(),
                 serving.map(|s| s.gen_tokens),
@@ -469,12 +500,9 @@ fn handle_event(
                 serving.and_then(|s| s.visible_tokens),
             );
             view.raw.push_str(&text);
-            // The porthole reads the think block as it arrives.
             ChatData::set_thinking_text(&toolcall::split_thinking(&view.raw).thinking);
             let visible = toolcall::strip_marker(&view.raw);
             if visible.trim().is_empty() {
-                // The box streams its hidden-reasoning progress before any
-                // visible text; show the work, not a generic wait.
                 match serving.and_then(|s| s.think_tokens) {
                     Some(n) if n > 0 => ChatData::set_activity(&format!("thinking · {n} tok")),
                     _ => ChatData::set_activity("thinking…"),
@@ -485,125 +513,59 @@ fn handle_event(
             }
             None
         }
-        ChatEventBodyDto::ToolCall { id: call_id, name, args } => {
+        ChatEventBody::ToolCall { id: call_id, name, args } => {
             view.call_names.insert(call_id.clone(), name.clone());
             ChatData::set_stream_text(&toolcall::strip_marker(&view.raw));
             view.raw.clear();
             let detail = format!("args: {}\n", args.to_json());
             ChatData::push_tool(&call_id, tools.call_title(&name, &args), detail);
             ChatData::set_activity(&format!("running {name}…"));
-            // The broker executes its own tools; the ones this session's
-            // profile parks on the app land here — execute and answer.
-            if !view.answered.contains(&call_id) {
-                deliver_client_tool(client, id, view, tools, &call_id, &name, &args);
+            // The session executes its own tools inside pump(); the calls
+            // its profile parks on this app land here — execute and answer
+            // by function call, no wire in between.
+            let parked = ContentToolCall::parse(&name, &args)
+                .map(|call| exec.profile.client_executes(&call))
+                .unwrap_or(false);
+            if parked && !view.answered.contains(&call_id) {
+                view.answered.insert(call_id.clone());
+                let outcome = tools.execute(&name, &args).clamped();
+                if let Err(error) = session.provide_client_outcome(&call_id, outcome, exec) {
+                    log!("chat-feed: client outcome for {call_id} refused: {error}");
+                }
             }
             None
         }
-        ChatEventBodyDto::ToolProgress { note, .. } => {
+        ChatEventBody::ToolProgress { note, .. } => {
             ChatData::set_activity(&note);
             None
         }
-        ChatEventBodyDto::ToolResult { id: call_id, outcome } => {
+        ChatEventBody::ToolResult { id: call_id, outcome } => {
             let name = view.call_names.remove(&call_id).unwrap_or_else(|| "tool".into());
-            let (title, detail) = tools.outcome_summary(&name, &outcome);
+            let dto = outcome_dto(&outcome);
+            let (title, detail) = tools.outcome_summary(&name, &dto);
             ChatData::finish_tool(&call_id, title, &detail);
             ChatData::set_activity("thinking about the result…");
             None
         }
-        ChatEventBodyDto::Done => {
+        ChatEventBody::Done => {
             ChatData::set_stream_text(&toolcall::strip_marker(&view.raw));
             view.raw.clear();
             ChatData::end_stream();
             ChatData::set_activity("");
             Some(TurnEnd::Done)
         }
-        ChatEventBodyDto::Cancelled => {
+        ChatEventBody::Cancelled => {
             view.raw.clear();
             ChatData::end_stream();
             ChatData::set_activity("");
             Some(TurnEnd::Done)
         }
-        ChatEventBodyDto::Error { message, .. } => {
+        ChatEventBody::Error { message, .. } => {
             view.raw.clear();
             ChatData::end_stream();
             ChatData::set_activity("");
             Some(TurnEnd::Failed(message))
         }
-    }
-}
-
-/// Execute one parked tool and PERSISTENTLY deliver its outcome.
-///
-/// The broker actor is single-threaded; a long provider round for ANOTHER
-/// session can starve this route for minutes — and, crucially, it starves
-/// the park-timeout check by exactly as much, so a post that keeps retrying
-/// WINS: the real result lands before any timeout can fire. Give up only on
-/// a definitive non-busy answer or after ~90 s of sustained failure. Every
-/// attempt is logged so this leg is never dark.
-fn deliver_client_tool(
-    client: &AssetClient,
-    id: &ChatSessionId,
-    view: &mut TurnView,
-    tools: &mut dyn ClientTools,
-    call_id: &str,
-    name: &str,
-    args: &Value,
-) {
-    view.answered.insert(call_id.to_string());
-    // Clamp to the wire bounds BEFORE posting: encode does not validate,
-    // and an over-long honest refusal is 400'd wholesale by the broker's
-    // parser while the model hears "the app did not answer".
-    let outcome = tools.execute(name, args).clamped();
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut wait = Duration::from_millis(1000);
-    let posted = loop {
-        match client.chat_tool_result(id, call_id, &outcome.encode()) {
-            Ok(()) => {
-                log!("chat-feed: tool result {call_id} ({name}) accepted");
-                break Ok(());
-            }
-            Err(e) => {
-                let text = e.to_string();
-                // 4xx-class protocol refusals are final; the busy/
-                // unavailable class retries.
-                let busy = text.contains("503")
-                    || text.contains("timed out")
-                    || text.contains("timeout")
-                    || text.contains("connect")
-                    || text.contains("unavailable");
-                log!(
-                    "chat-feed: tool result {call_id} ({name}) post failed: {text}{}",
-                    if busy && Instant::now() < deadline { " — retrying" } else { " — giving up" }
-                );
-                if !busy || Instant::now() >= deadline {
-                    break Err(e);
-                }
-                ChatData::set_activity("server busy — delivering the result…");
-                thread::sleep(wait);
-                wait = (wait * 2).min(Duration::from_secs(4));
-            }
-        }
-    };
-    if let Err(e) = posted {
-        // NOT fatal: the turn is alive server-side and its fate arrives
-        // through this same event stream. The chip keeps the truth without
-        // alarming language — and says WHICH failure this was: a server
-        // that REJECTED the answer (protocol skew — report it) is a
-        // different animal from one that stayed busy.
-        let text = e.to_string();
-        let rejected = text.contains("400") || text.contains("malformed");
-        let title_note = if rejected {
-            "result rejected by the server (protocol)"
-        } else {
-            "result delivery failed"
-        };
-        let title = format!("{} — done ({title_note})", tools.call_title(name, args));
-        ChatData::finish_tool(
-            call_id,
-            title,
-            &format!("{e}\nthe app applied it locally; the model continues with the broker's own outcome"),
-        );
-        ChatData::set_activity("");
     }
 }
 

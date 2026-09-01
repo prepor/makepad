@@ -16,7 +16,7 @@ makepad-mbtile-reader = { path = "../../libs/mbtile_reader" } # terrain drape la
 makepad-ai      = { path = "../../libs/makepad_ai" }       # M1: cloud agent + tool definitions
 serde_json      = "1"                                      # geodata FeatureHit attrs
 
-makepad-ai-llm  = { path = "../../libs/ai/llm" }           # M2: local dispatcher LLM (pure-Rust ggml)
+makepad-ai-hub  = { path = "../../libs/ai/hub", default-features = false, features = ["llm"] } # M2: local dispatcher LLM
 
 makepad-converse = { path = "../../libs/converse", features = ["local-llm"] } # M3: attention-gate filter
 

@@ -14,7 +14,9 @@
 //!   a re-prefill, never a conversation (aicore.md §7).
 
 #[cfg(feature = "llm")]
-use crate::local_llm::{LocalLlmConfig, LocalLlmSession, ToolSpec, WakeHook};
+use crate::hub_chat::{HubChatConfig, HubChatSession};
+#[cfg(feature = "llm")]
+use crate::local_llm::{LocalLlmConfig, ToolSpec, WakeHook};
 use crate::pipe::PipeId;
 
 /// Configuration for a local-model chat session.
@@ -43,13 +45,19 @@ impl AiHub {
         Self { _private: () }
     }
 
-    /// Start a chat on the in-process local model. Loading happens on the
-    /// engine's worker thread and reports through the returned session's
-    /// `poll()`; nothing blocks.
+    /// Start a chat on this machine. The session's worker runs the machine
+    /// residency election first (aicore §3): route to a serving co-located
+    /// holder, wait on a loading one, else claim and load in-process.
+    /// Loading reports through the returned session's `poll()`; nothing
+    /// blocks.
     #[cfg(feature = "llm")]
-    pub fn start_local_chat(&self, config: ChatConfig) -> LocalLlmSession {
-        let prefix = crate::local_llm::build_prefix(&config.system_prompt, &config.tools);
-        LocalLlmSession::start(config.llm, prefix, config.wake)
+    pub fn start_local_chat(&self, config: ChatConfig) -> HubChatSession {
+        HubChatSession::start(HubChatConfig {
+            llm: config.llm,
+            system_prompt: config.system_prompt,
+            tools: config.tools,
+            wake: config.wake,
+        })
     }
 
     /// The pipe id the in-process local model publishes (machine-local only).

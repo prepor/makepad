@@ -45,6 +45,8 @@ pub mod fleet;
 pub mod gpu;
 pub mod home;
 pub mod hub;
+#[cfg(feature = "llm")]
+pub mod hub_chat;
 pub mod machine;
 pub mod fast_backend;
 pub mod h3_backend;

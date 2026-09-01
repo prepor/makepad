@@ -117,7 +117,7 @@ pub enum ChatEvent {
     ContextFull,
 }
 
-enum WorkerMsg {
+pub(crate) enum WorkerMsg {
     UserTurn(String),
     /// One (text, is_error) per tool the last turn asked for, in call order.
     ToolResults(Vec<(String, bool)>),
@@ -140,7 +140,7 @@ impl LocalLlmSession {
         let worker_cancel = cancel.clone();
         thread::Builder::new()
             .name("ai-hub-local-llm".into())
-            .spawn(move || worker_main(config, prefix, msg_rx, event_tx, worker_cancel, wake))
+            .spawn(move || worker_main(config, prefix, msg_rx, event_tx, worker_cancel, wake, None))
             .expect("spawn local llm worker");
         Self {
             to_worker,
@@ -243,13 +243,17 @@ fn tool_response_turn(results: &[(String, bool)]) -> String {
 
 // --------------------------------------------------------------- the worker
 
-fn worker_main(
+pub(crate) fn worker_main(
     config: LocalLlmConfig,
     prefix: String,
     msg_rx: Receiver<WorkerMsg>,
     event_tx: Sender<ChatEvent>,
     cancel: Arc<AtomicBool>,
     wake: Option<WakeHook>,
+    // The held machine election, when this worker won it (aicore §3). The
+    // guard publishes load progress so co-located waiters ride one load,
+    // and it drops — reopening the election — exactly when this worker ends.
+    mut residency: Option<crate::machine::ResidencyGuard>,
 ) {
     let wake_consumer = move || {
         if let Some(wake) = &wake {
@@ -265,7 +269,11 @@ fn worker_main(
     let load = {
         let event_tx = event_tx.clone();
         let wake_consumer = wake_consumer.clone();
+        let residency = &mut residency;
         let mut progress = move |phase: &str, fraction: f64| {
+            if let Some(guard) = residency.as_mut() {
+                let _ = guard.publish(crate::machine::ResidencyState::Loading { fraction });
+            }
             let _ = event_tx.send(ChatEvent::Loading {
                 phase: phase.to_string(),
                 fraction,
@@ -299,6 +307,11 @@ fn worker_main(
     let prefill_tokens = tokens.len();
     if let Err(error) = session.append_tokens(&tokens) {
         return send(ChatEvent::Failed(format!("prefill: {error:?}")));
+    }
+    if let Some(guard) = residency.as_mut() {
+        // Resident but not serving a port: co-located claimants see the
+        // election held and fall back per the documented soft failure.
+        let _ = guard.publish(crate::machine::ResidencyState::Ready { port: 0 });
     }
     send(ChatEvent::Ready {
         prefill_tokens,

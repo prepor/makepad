@@ -2,7 +2,8 @@
 
 use makepad_ai_hub::{
     hub::{AiHub, ChatConfig},
-    local_llm::{LocalLlmConfig, LocalLlmSession, ToolSpec},
+    hub_chat::HubChatSession,
+    local_llm::{LocalLlmConfig, ToolSpec},
 };
 use makepad_widgets::makepad_platform::thread::SignalToUI;
 
@@ -19,7 +20,7 @@ pub const MODEL_FILE: &str = "local/models/Qwen3.5-9B-UD-Q4_K_XL.gguf";
 pub const MODEL_ENV: &str = "MPFILES_CHAT_MODEL";
 
 pub struct ChatAgent {
-    session: LocalLlmSession,
+    session: HubChatSession,
 }
 
 impl ChatAgent {

@@ -3,7 +3,8 @@
 use makepad_converse::agent_seam::*;
 use makepad_ai_hub::{
     hub::{AiHub, ChatConfig},
-    local_llm::{ChatEvent, LocalLlmConfig, LocalLlmSession, ToolSpec},
+    hub_chat::HubChatSession,
+    local_llm::{ChatEvent, LocalLlmConfig, ToolSpec},
 };
 use makepad_widgets::*;
 
@@ -19,7 +20,7 @@ const MIN_REMAINING_CONTEXT: usize = 256;
 
 pub struct LocalAgent {
     model_path: PathBuf,
-    session: Option<LocalLlmSession>,
+    session: Option<HubChatSession>,
     session_id: Option<SessionId>,
     prompt_id: Option<PromptId>,
     ready: bool,

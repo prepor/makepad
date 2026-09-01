@@ -24,7 +24,8 @@
 
 use makepad_asset_client::json::{obj, s, Value};
 use makepad_asset_client::{
-    AssetClient, ClientConfig, ApiEndpoints, JobId, JobProgressDto, JobResultDto,
+    AssetClient, ClientConfig, ApiEndpoints, JobId, JobProfileDto, JobProgressDto, JobResultDto,
+    JobStatusDto,
     JobStateDto, PipelineCancelDto, PipelineCreatedDto, PipelineDetailDto, PipelineId,
     PipelineStageDto, PipelineStageJobDto, PipelineStateDto, PublishRights, StageOnFailDto,
 };
@@ -39,6 +40,7 @@ use makepad_asset_importer::coordinator::{
     dress_generated_publish, wire_request, GenArtifact, GenRequest,
 };
 use makepad_asset_importer::gen_kinds::kind_of;
+use makepad_asset_importer::gen_profiles::build_profiles;
 use makepad_ai_hub::client::{ContentProvider, LocalService};
 use makepad_ai_hub::error::AssetAiError;
 use makepad_ai_hub::{discovery, fleet};
@@ -92,6 +94,15 @@ pub enum PipeReq {
     Detail { pipeline: PipelineId },
     /// Stop every non-terminal stage of the run.
     Cancel { pipeline: PipelineId },
+    /// One plain generation, executed here the same way a stage is.
+    EnqueueJob { tag: u64, namespace: String, kind: String, body: Value },
+    /// One read of a local job's synthesized status.
+    JobStatus { job: JobId },
+    /// Cancel one local job.
+    CancelJob { job: JobId },
+    /// The generation drawer's rows, built from the live fleet directly
+    /// (the store's profile registry retired with its queue).
+    Profiles { domain: String },
 }
 
 /// One transport answer. Errors are strings because the row shows them.
@@ -99,6 +110,10 @@ pub enum PipeDone {
     Created { tag: u64, result: Result<PipelineCreatedDto, String> },
     Detail { pipeline: PipelineId, result: Result<PipelineDetailDto, String> },
     Cancelled { pipeline: PipelineId, result: Result<PipelineCancelDto, String> },
+    JobQueued { tag: u64, result: Result<JobId, String> },
+    JobStatus { job: JobId, result: Result<JobStatusDto, String> },
+    JobCancelled { job: JobId, cancelled: u64 },
+    Profiles { domain: String, result: Result<Vec<JobProfileDto>, String> },
 }
 
 /// Owns the worker thread and the completion channel; the host pumps it
@@ -198,6 +213,25 @@ struct RunHandle {
 
 type Registry = Arc<Mutex<HashMap<[u8; 16], Arc<RunHandle>>>>;
 
+/// One plain generation's live view.
+struct JobView {
+    namespace: String,
+    kind: String,
+    created_ms: u64,
+    state: StageState,
+    note: String,
+    permille: u16,
+    outcome: Option<String>,
+    published: Option<(String, String)>,
+}
+
+struct JobHandle {
+    view: Mutex<JobView>,
+    cancel: Arc<AtomicBool>,
+}
+
+type JobRegistry = Arc<Mutex<HashMap<[u8; 16], Arc<JobHandle>>>>;
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -231,6 +265,10 @@ fn worker(
     let registry = REGISTRY
         .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
         .clone();
+    static JOBS: std::sync::OnceLock<JobRegistry> = std::sync::OnceLock::new();
+    let jobs = JOBS
+        .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+        .clone();
     for req in rx {
         let answer = match req {
             PipeReq::Create { tag, namespace, title, prompt, stages } => {
@@ -254,6 +292,43 @@ fn worker(
                     .map(|run| synthesize_detail(pipeline, run))
                     .ok_or_else(|| "no such run in this session".to_string());
                 PipeDone::Detail { pipeline, result }
+            }
+            PipeReq::EnqueueJob { tag, namespace, kind, body } => {
+                let result = spawn_job(&jobs, &endpoints, token.clone(), tag, namespace, kind, body);
+                PipeDone::JobQueued { tag, result }
+            }
+            PipeReq::JobStatus { job } => {
+                let result = jobs
+                    .lock()
+                    .unwrap()
+                    .get(&job.0)
+                    .map(|handle| synthesize_job_status(job, handle))
+                    .ok_or_else(|| "no such job in this session".to_string());
+                PipeDone::JobStatus { job, result }
+            }
+            PipeReq::CancelJob { job } => {
+                let cancelled = jobs
+                    .lock()
+                    .unwrap()
+                    .get(&job.0)
+                    .map(|handle| {
+                        handle.cancel.store(true, Ordering::Relaxed);
+                        let view = handle.view.lock().unwrap();
+                        matches!(view.state, StageState::Pending | StageState::Running) as u64
+                    })
+                    .unwrap_or(0);
+                PipeDone::JobCancelled { job, cancelled }
+            }
+            PipeReq::Profiles { domain } => {
+                let snapshots = fleet_snapshots();
+                let result = if snapshots.is_empty() {
+                    Err("no GPU nodes on the LAN".to_string())
+                } else {
+                    let mut profiles = build_profiles(&snapshots, "gen");
+                    profiles.retain(|p| p.domain == domain);
+                    Ok(profiles)
+                };
+                PipeDone::Profiles { domain, result }
             }
             PipeReq::Cancel { pipeline } => {
                 let result = registry
@@ -488,34 +563,41 @@ fn ref_stage(value: &mut Value) -> Option<String> {
 
 // ------------------------------------------------------------- the run
 
+/// The live LAN fleet, one health + models probe per node.
+fn fleet_snapshots() -> Vec<fleet::BoxSnapshot> {
+    let mut snapshots = Vec::new();
+    for node in discovery::start_listener().nodes() {
+        let service = LocalService::new(&node.base_url);
+        let mut snapshot = fleet::BoxSnapshot::new(&node.base_url);
+        snapshot.health = service.health().ok();
+        snapshot.models = service.list_models().unwrap_or_default();
+        snapshots.push(snapshot);
+    }
+    snapshots
+}
+
+/// ETA-ranked node pick for one domain.
+fn pick_node(domain: &str) -> Result<LocalService, AssetAiError> {
+    let snapshots = fleet_snapshots();
+    if snapshots.is_empty() {
+        return Err(AssetAiError::Unavailable(
+            "no GPU nodes on the LAN".to_string(),
+        ));
+    }
+    let cost = stage_cost(domain);
+    let (index, _model, _eta) = fleet::pick_for_domain_eta(&snapshots, domain, cost)
+        .ok_or_else(|| {
+            AssetAiError::Unavailable(format!("no node serves the {domain} domain right now"))
+        })?;
+    Ok(LocalService::new(&snapshots[index].base_url))
+}
+
 /// ETA-ranked per-stage node pick over the live LAN fleet.
 struct FleetPick;
 
 impl ProviderPick for FleetPick {
     fn pick(&self, stage: &StageSpec) -> Result<Box<dyn ContentProvider>, AssetAiError> {
-        let nodes = discovery::start_listener().nodes();
-        if nodes.is_empty() {
-            return Err(AssetAiError::Unavailable(
-                "no GPU nodes on the LAN".to_string(),
-            ));
-        }
-        let mut snapshots = Vec::new();
-        for node in nodes {
-            let service = LocalService::new(&node.base_url);
-            let mut snapshot = fleet::BoxSnapshot::new(&node.base_url);
-            snapshot.health = service.health().ok();
-            snapshot.models = service.list_models().unwrap_or_default();
-            snapshots.push(snapshot);
-        }
-        let cost = stage_cost(&stage.domain);
-        let (index, _model, _eta) = fleet::pick_for_domain_eta(&snapshots, &stage.domain, cost)
-            .ok_or_else(|| {
-                AssetAiError::Unavailable(format!(
-                    "no node serves the {} domain right now",
-                    stage.domain
-                ))
-            })?;
-        Ok(Box::new(LocalService::new(&snapshots[index].base_url)))
+        Ok(Box::new(pick_node(&stage.domain)?))
     }
 }
 
@@ -714,6 +796,232 @@ fn publish_stage(
         .publish_artifact(&publish)
         .map_err(|e| e.to_string())?;
     Ok(Some((published.asset_id.to_string(), published.revision.to_string())))
+}
+
+
+// ---------------------------------------------------------- plain jobs
+
+/// One plain generation: the single-stage version of a run — pick a node,
+/// submit, poll, publish, all on its own thread; the registry serves status.
+fn spawn_job(
+    jobs: &JobRegistry,
+    endpoints: &ApiEndpoints,
+    token: Option<String>,
+    tag: u64,
+    namespace: String,
+    kind_name: String,
+    body: Value,
+) -> Result<JobId, String> {
+    let kind =
+        kind_of(&kind_name).ok_or_else(|| format!("unknown kind {kind_name}"))?;
+    let request = GenRequest::from_body(kind, &body)?;
+    let mut wire = wire_request(&request, request.model.clone());
+    if wire.seed.is_none() {
+        wire.seed = Some(tag);
+    }
+    let job = JobId(mint_id(tag ^ 0x00B5));
+    let handle = Arc::new(JobHandle {
+        view: Mutex::new(JobView {
+            namespace: namespace.clone(),
+            kind: kind_name.clone(),
+            created_ms: now_ms(),
+            state: StageState::Pending,
+            note: "queued-on-fleet".to_string(),
+            permille: 0,
+            outcome: None,
+            published: None,
+        }),
+        cancel: Arc::new(AtomicBool::new(false)),
+    });
+    jobs.lock().unwrap().insert(job.0, handle.clone());
+    let endpoints = endpoints.clone();
+    let domain = kind.domain.to_string();
+    std::thread::Builder::new()
+        .name(format!("vj-gen-{tag}"))
+        .spawn(move || {
+            job_thread(handle, endpoints, token, namespace, kind_name, request, wire, domain)
+        })
+        .map_err(|_| "could not spawn the job thread".to_string())?;
+    Ok(job)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn job_thread(
+    handle: Arc<JobHandle>,
+    endpoints: ApiEndpoints,
+    token: Option<String>,
+    namespace: String,
+    kind_name: String,
+    request: GenRequest,
+    wire: makepad_ai_hub::protocol::GenerateRequestJson,
+    domain: String,
+) {
+    use makepad_ai_hub::protocol::{
+        JOB_STATE_CANCELLED, JOB_STATE_DONE, JOB_STATE_ERROR,
+    };
+    let fail = |handle: &Arc<JobHandle>, error: String| {
+        let mut view = handle.view.lock().unwrap();
+        view.state = StageState::Failed;
+        view.outcome = Some("failed".to_string());
+        view.note = error;
+    };
+    let service = match pick_node(&domain) {
+        Ok(service) => service,
+        Err(error) => return fail(&handle, error.to_string()),
+    };
+    let parsed_domain = match kind_name.split('.').next().and_then(|_| {
+        use makepad_ai_hub::registry::Domain;
+        match domain.as_str() {
+            "image" => Some(Domain::Image),
+            "video" => Some(Domain::Video),
+            "audio" => Some(Domain::Audio),
+            "mesh" => Some(Domain::Mesh),
+            "text" => Some(Domain::Text),
+            "speech" => Some(Domain::Speech),
+            "world" => Some(Domain::World),
+            "matte" => Some(Domain::Matte),
+            "depth" => Some(Domain::Depth),
+            _ => None,
+        }
+    }) {
+        Some(domain) => domain,
+        None => return fail(&handle, format!("unroutable domain {domain}")),
+    };
+    let remote = match service.request(parsed_domain, &wire) {
+        Ok(id) => id,
+        Err(error) => return fail(&handle, error.to_string()),
+    };
+    {
+        let mut view = handle.view.lock().unwrap();
+        view.state = StageState::Running;
+    }
+    let artifact = loop {
+        if handle.cancel.load(Ordering::Relaxed) {
+            let _ = service.cancel(&remote);
+            let mut view = handle.view.lock().unwrap();
+            view.state = StageState::Cancelled;
+            view.outcome = Some("cancelled".to_string());
+            return;
+        }
+        let status = match service.poll(&remote) {
+            Ok(status) => status,
+            Err(error) => return fail(&handle, error.to_string()),
+        };
+        match status.state.as_str() {
+            JOB_STATE_DONE => {
+                break status.artifacts.first().cloned();
+            }
+            JOB_STATE_ERROR => {
+                return fail(
+                    &handle,
+                    status.error.unwrap_or_else(|| "job error".to_string()),
+                )
+            }
+            JOB_STATE_CANCELLED => {
+                let mut view = handle.view.lock().unwrap();
+                view.state = StageState::Cancelled;
+                view.outcome = Some("cancelled".to_string());
+                return;
+            }
+            _ => {
+                let mut view = handle.view.lock().unwrap();
+                view.note = status.stage.clone().unwrap_or_default();
+                view.permille =
+                    (status.progress.unwrap_or(0.0).clamp(0.0, 1.0) * 1000.0) as u16;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+
+    // Publish exactly as a stage would; kinds without a catalog product
+    // (text/vision) succeed without a row.
+    let kind = kind_of(&kind_name).expect("kind checked at enqueue");
+    let published = if kind.catalog().is_some() {
+        let Some(artifact_ref) = artifact else {
+            return fail(&handle, "the job finished without an artifact".to_string());
+        };
+        let bytes = match service.fetch_artifact(&artifact_ref.id) {
+            Ok(bytes) => bytes,
+            Err(error) => return fail(&handle, format!("artifact fetch: {error}")),
+        };
+        let cache = std::env::temp_dir().join("makepad-vj-dream-publish");
+        let mut config = ClientConfig::new(cache);
+        config.token = token;
+        let mut client = match AssetClient::connect(config, endpoints, None) {
+            Ok(client) => client,
+            Err(error) => return fail(&handle, format!("publish connect: {error}")),
+        };
+        let job_hex = JobId(handle_key(&handle)).to_string();
+        let alias_text = format!(
+            "{namespace}/run-{}",
+            job_hex.trim_start_matches("job_").chars().take(16).collect::<String>()
+        );
+        let publish = match dress_generated_publish(
+            kind,
+            &namespace,
+            &request,
+            GenArtifact {
+                content_type: bytes.content_type.clone(),
+                bytes: bytes.bytes,
+            },
+            AssetAlias::from_str(&alias_text).ok(),
+            String::new(),
+            String::new(),
+            String::new(),
+            PublishRights::generated_cc0(),
+        ) {
+            Ok(publish) => publish,
+            Err(error) => return fail(&handle, format!("publish build: {error}")),
+        };
+        match client.publish_artifact(&publish) {
+            Ok(published) => {
+                Some((published.asset_id.to_string(), published.revision.to_string()))
+            }
+            Err(error) => return fail(&handle, format!("publish: {error}")),
+        }
+    } else {
+        None
+    };
+    let mut view = handle.view.lock().unwrap();
+    view.state = StageState::Done;
+    view.permille = 1000;
+    view.note = "done".to_string();
+    view.outcome = Some("succeeded".to_string());
+    view.published = published;
+}
+
+/// The registry key a handle was inserted under is not stored on it; jobs
+/// only need a stable per-run alias, so hash the Arc identity.
+fn handle_key(handle: &Arc<JobHandle>) -> [u8; 16] {
+    let addr = Arc::as_ptr(handle) as usize as u64;
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&addr.to_be_bytes());
+    out[8..].copy_from_slice(&addr.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_be_bytes());
+    out
+}
+
+fn synthesize_job_status(job: JobId, handle: &Arc<JobHandle>) -> JobStatusDto {
+    let view = handle.view.lock().unwrap();
+    use makepad_asset_data::{AssetId, AssetRevisionId};
+    let (result_asset, result_revision) = match &view.published {
+        Some((asset, revision)) => (
+            AssetId::from_str(asset).ok(),
+            AssetRevisionId::from_str(revision).ok(),
+        ),
+        None => (None, None),
+    };
+    JobStatusDto {
+        job,
+        namespace: view.namespace.clone(),
+        kind: view.kind.clone(),
+        state: job_state_dto(view.state),
+        created_ms: view.created_ms,
+        progress: Some((view.permille, view.note.clone())),
+        outcome: view.outcome.clone(),
+        result_asset,
+        result_revision,
+        stages: Vec::new(),
+    }
 }
 
 // --------------------------------------------------------- DTO synthesis

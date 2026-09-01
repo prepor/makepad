@@ -471,44 +471,26 @@ script_mod! {
             cap_shadow: uniform(#x8d98a7)
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.box(2., 6., self.rect_size.x - 4., self.rect_size.y - 12., 12.)
+                sdf.box(2., 6., self.rect_size.x - 4., self.rect_size.y - 12., 8.)
                 sdf.fill(self.body_color)
-                // The cap's CENTER travels an inset span, so the cap blob
-                // never clips at the extremes (blob r 12 → 15px inset
+                // The cap's CENTER travels an inset span, so the cap body
+                // never clips at the extremes (cap 22 wide → 15px inset
                 // each end keeps it fully inside the chrome).
                 let left = 15.
                 let right_pad = 15.
                 let w = self.rect_size.x - left - right_pad
-                let cy = self.rect_size.y * 0.5
                 let track_h = 10.
                 let track_y = (self.rect_size.y - track_h) * 0.5
-                // Track: a capsule with a soft bulge glooped onto each end.
-                sdf.box(left, track_y, w, track_h, 10.)
-                sdf.circle(left, cy, 7.)
-                sdf.gloop(6.)
-                sdf.circle(left + w, cy, 7.)
-                sdf.gloop(6.)
+                sdf.box(left, track_y, w, track_h, 4.)
                 sdf.fill(self.track_color)
-                // Fill: a capsule whose leading edge goos into a bulge, with
-                // a trailing droplet melting back along the travelled span.
                 let fill_w = max(1., w * self.slide_pos)
-                let head_x = left + fill_w
-                sdf.box(left + 1.5, track_y + 1.5, max(1., fill_w - 3.), track_h - 3., 7.)
-                sdf.circle(head_x - 1.5, cy, 6.5)
-                sdf.gloop(7.)
-                sdf.circle(head_x - min(fill_w, 26.), cy, 4.5)
-                sdf.gloop(9.)
+                sdf.box(left + 1.5, track_y + 1.5, max(1., fill_w - 3.), track_h - 3., 3.)
                 sdf.fill(self.fill_color)
-                // Cap: a droplet — the big blob and a smaller one leaning
-                // back toward the fill, glooped into one goo. Shadow first.
-                let cap_x = head_x
-                sdf.circle(cap_x + 1.5, cy + 1.5, 12.)
-                sdf.circle(cap_x - 5.5, cy + 1.5, 7.5)
-                sdf.gloop(8.)
+                let cap_w = 22.
+                let cap_x = left + fill_w - cap_w * 0.5
+                sdf.box(cap_x + 1.5, 8., cap_w, self.rect_size.y - 16., 6.)
                 sdf.fill(self.cap_shadow)
-                sdf.circle(cap_x, cy, 12.)
-                sdf.circle(cap_x - 7., cy, 7.5)
-                sdf.gloop(8.)
+                sdf.box(cap_x, 6., cap_w, self.rect_size.y - 14., 6.)
                 sdf.fill(self.cap_color)
                 return sdf.result
             }
@@ -11464,43 +11446,41 @@ p2 {}
             let Some(up) = self.up.as_mut() else { return };
             for cmd in cmds {
                 match cmd {
+                    // ---- plain generations -------------------------
+                    //
+                    // Off the store's queue entirely (aicore §9): the run
+                    // transport executes them against the fleet and
+                    // publishes the result itself; the store only stores.
                     GenCmd::FetchProfiles { domain } => {
-                        if let Ok(id) = up.catalog.submit(ClientRequest::FetchJobProfiles {
-                            domain: Some(domain.to_string()),
-                        }) {
-                            self.cat_reqs.insert(id, CatPurpose::JobProfiles { domain });
-                        } else {
-                            runtime_down = true;
+                        if !self.pipelines.connected() {
+                            self.pipelines.connect(up.endpoints, up.token.clone());
                         }
+                        self.pipelines.submit(PipeReq::Profiles {
+                            domain: domain.to_string(),
+                        });
                     }
                     GenCmd::Enqueue { tag, namespace, kind, body } => {
-                        match up.catalog.submit(ClientRequest::EnqueueJob { namespace, kind, body }) {
-                            Ok(id) => {
-                                self.cat_reqs.insert(id, CatPurpose::JobEnqueue { tag });
-                            }
-                            Err(_) => {
-                                runtime_down = true;
-                                self.gen.enqueue_failed_at(
-                                    tag,
-                                    "connection lost — reconnecting, press Queue again".to_string(),
-                                    Some(now),
-                                );
-                            }
+                        if !self.pipelines.connected() {
+                            self.pipelines.connect(up.endpoints, up.token.clone());
+                        }
+                        if !self.pipelines.submit(PipeReq::EnqueueJob {
+                            tag,
+                            namespace,
+                            kind,
+                            body,
+                        }) {
+                            self.gen.enqueue_failed_at(
+                                tag,
+                                "run transport unavailable — press Queue again".to_string(),
+                                Some(now),
+                            );
                         }
                     }
                     GenCmd::PollStatus { job } => {
-                        if let Ok(id) = up.catalog.submit(ClientRequest::FetchJobStatus { job }) {
-                            self.cat_reqs.insert(id, CatPurpose::JobStatus { job });
-                        } else {
-                            runtime_down = true;
-                        }
+                        self.pipelines.submit(PipeReq::JobStatus { job });
                     }
                     GenCmd::Cancel { job } => {
-                        if let Ok(id) = up.catalog.submit(ClientRequest::CancelJob { job }) {
-                            self.cat_reqs.insert(id, CatPurpose::JobCancel { job });
-                        } else {
-                            runtime_down = true;
-                        }
+                        self.pipelines.submit(PipeReq::CancelJob { job });
                     }
                     // ---- declared runs ------------------------------
                     //
@@ -11594,7 +11574,7 @@ p2 {}
     /// enqueues a successor or carries a result — the store's dependency
     /// gate and its claim-time splice do that, whether or not this app is
     /// running.
-    fn pump_pipelines(&mut self) {
+    fn pump_pipelines(&mut self, cx: &mut Cx) {
         for done in self.pipelines.drain() {
             match done {
                 PipeDone::Created { tag, result } => match result {
@@ -11663,6 +11643,34 @@ p2 {}
                     Err(error) => {
                         self.gen.pipeline_failed_read(pipeline, error, now_ms());
                     }
+                },
+                PipeDone::JobQueued { tag, result } => match result {
+                    Ok(job) => {
+                        let cmds = self.gen.queued_at(tag, job, Some(now_ms()));
+                        self.run_gen_cmds(cmds);
+                    }
+                    Err(error) => {
+                        self.gen.enqueue_failed_at(tag, error, Some(now_ms()));
+                    }
+                },
+                PipeDone::JobStatus { job, result } => match result {
+                    Ok(status) => self.gen.status_arrived_at(&status, now_ms()),
+                    Err(error) => {
+                        self.gen.status_failed_at(job, error, Some(now_ms()));
+                    }
+                },
+                PipeDone::JobCancelled { job, cancelled } => {
+                    self.gen.cancel_confirmed_at(job, cancelled, Some(now_ms()));
+                }
+                PipeDone::Profiles { domain, result } => match result {
+                    Ok(profiles) => {
+                        // Leaked to 'static: GenCmd::FetchProfiles carries the
+                        // domain as &'static str today.
+                        self.gen.profiles_arrived(domain.leak(), profiles);
+                        self.sync_gen_profiles(cx);
+                        self.sync_gen_pickers(cx);
+                    }
+                    Err(error) => self.gen.profiles_failed(error),
                 },
                 PipeDone::Cancelled { pipeline, result } => match result {
                     Ok(cancelled) => {
@@ -24177,7 +24185,7 @@ impl AppMain for App {
             // Bounded generation-status polling.
             let cmds = self.gen.tick(now_ms());
             self.run_gen_cmds(cmds);
-            self.pump_pipelines();
+            self.pump_pipelines(cx);
             self.pump_dream_thumbs();
             let cmds = self.gen.ensure_profiles();
             self.run_gen_cmds(cmds);

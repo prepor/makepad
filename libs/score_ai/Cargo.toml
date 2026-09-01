@@ -6,6 +6,8 @@ description = "Brokered AI score generation with musical validation and repair"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+makepad-ai-hub = { path = "../ai/hub", default-features = false }
+makepad-asset-chat = { path = "../asset/chat" }
 makepad-asset-client = { path = "../asset/client" }
 makepad-score = { path = "../score" }
 makepad-musicxml = { path = "../musicxml" }

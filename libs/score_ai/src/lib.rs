@@ -5,6 +5,7 @@
 //! after extraction, musical validation, and a bounded repair loop.
 
 mod broker;
+pub mod local_broker;
 mod engine;
 mod extract;
 mod prompt;

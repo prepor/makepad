@@ -110,3 +110,18 @@ pub fn is_terminal_chat_event(body: &ChatEventBodyDto) -> bool {
             | ChatEventBodyDto::Error { .. }
     )
 }
+
+/// Wire outcome → DTO outcome (same five shapes), for local brokers.
+pub fn broker_outcome_dto(
+    outcome: &makepad_asset_chat::wire::ToolOutcome,
+) -> makepad_asset_client::dto::ChatToolOutcomeDto {
+    use makepad_asset_chat::wire::ToolOutcome as W;
+    use makepad_asset_client::dto::ChatToolOutcomeDto as D;
+    match outcome {
+        W::Ok { value } => D::Ok { value: value.clone() },
+        W::Failed { message } => D::Failed { message: message.clone() },
+        W::Refused { what } => D::Refused { what: what.clone() },
+        W::Denied { what } => D::Denied { what: what.clone() },
+        W::Unavailable { reason } => D::Unavailable { reason: reason.clone() },
+    }
+}

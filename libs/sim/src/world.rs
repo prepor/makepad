@@ -53,6 +53,12 @@ pub struct GameWorld {
     pub next_id: u64,
     pub gravity: f32,
     pub on_tick: Option<CallbackSlot>,
+    /// Per-commandable-unit decision hook. Called once per unit per tick,
+    /// BEFORE the kit steers, with that unit's own situation — the seam a
+    /// script needs to give one unit behaviour of its own rather than tuning
+    /// the whole kit. Pair it with `unit(id, {control: "script"})` when the
+    /// script means to drive the body itself.
+    pub on_unit: Option<CallbackSlot>,
     pub on_touch: Option<CallbackSlot>,
     /// Fired when a player joins or leaves the room (M2). The session layer
     /// raises the events; the host resolves the slot and calls the closure.

@@ -32,6 +32,7 @@
 //! contract supports.
 
 use super::annotate;
+use super::assets_query::{CatalogReader, QueryOutput, MAX_QUERY_ROWS};
 use super::api::{
     body_str, body_u64, parse_capability, parse_job, parse_json_body, parse_limit,
     parse_principal, principal_str, Fail, RouteResult, TOKEN_PREFIX,
@@ -47,7 +48,7 @@ use super::state::{
     envelope_build, envelope_parse, StateCtx, MAX_JOB_NAMESPACES, MAX_PIPELINE_PROMPT_BYTES,
     MAX_PIPELINE_STAGES, MAX_PIPELINE_TITLE_BYTES, MAX_STAGE_WEIGHT,
 };
-use super::util::{from_hex_bounded, from_hex_exact, now_ms, rand16, rand32, to_hex};
+use super::util::{from_hex_bounded, from_hex_exact, log, now_ms, rand16, rand32, to_hex};
 use crate::search::{kind_name, kind_parse};
 use crate::{
     token_hash, AssetAnnotation, Capability, CandidateState, JobId, JobState, NewJob, PrincipalId,
@@ -107,6 +108,13 @@ pub fn dispatch(conn: &mut Conn, head: &mut Head, rc: &RouteCtx) -> RouteResult<
         // ---- assets --------------------------------------------------------
         ["v1", "assets"] if m == Method::Post => asset_register(conn, head, rc),
         ["v1", "assets"] if is_read(m) => assets_list(head, rc),
+        ["v1", "assets", "query"] => {
+            if m == Method::Post {
+                assets_query(conn, head, rc)
+            } else {
+                method_not_allowed()
+            }
+        }
         ["v1", "assets", a] if is_read(m) => asset_get(head, rc, ast_of(a)?),
         ["v1", "model-previews"] if m == Method::Post => {
             model_preview(conn, head, rc)
@@ -721,6 +729,73 @@ fn grant_edit(conn: &mut Conn, head: &mut Head, rc: &RouteCtx, add: bool) -> Rou
 // ---------------------------------------------------------------------------
 // assets
 // ---------------------------------------------------------------------------
+
+/// Run one bounded, single-SELECT query against this server's own catalog.
+/// Authentication is deliberately the same no-capability read gate used by
+/// asset listings and search.
+fn assets_query(conn: &mut Conn, head: &mut Head, rc: &RouteCtx) -> RouteResult<Outcome> {
+    let secret = secret_of(head)?;
+    let body = json_body!(conn, head, rc);
+    let sql = body_str(&body, "sql")?.to_string();
+    let max_rows = match body.get("limit") {
+        None => MAX_QUERY_ROWS,
+        Some(value) => {
+            let limit = value.as_u64().ok_or(Fail::Http(400, "malformed limit"))?;
+            if limit == 0 || limit > MAX_QUERY_ROWS as u64 {
+                return Err(Fail::Http(400, "malformed limit"));
+            }
+            limit as usize
+        }
+    };
+
+    let now = now_ms();
+    call_state(&rc.state, move |ctx| {
+        ctx.core.auth().authenticate(secret.as_bytes(), now)?;
+        Ok(())
+    })?;
+
+    let mut reader = CatalogReader::new(rc.cfg.root.join("catalog.sqlite3"));
+    reader.limits.max_rows = max_rows;
+    match reader.query(&sql) {
+        Ok(output) => Ok(Outcome::Resp(Resp::json(200, &query_output_json(output)))),
+        Err(detail) if query_refusal(&detail) => Ok(Outcome::Resp(Resp::json(
+            400,
+            &obj(vec![("error", s("query refused")), ("detail", s(detail))]),
+        ))),
+        Err(detail) => {
+            log(rc.cfg.log, &format!("assets query internal error: {detail}"));
+            Ok(Outcome::Resp(Resp::error(500, "internal")))
+        }
+    }
+}
+
+fn query_refusal(detail: &str) -> bool {
+    detail == "empty SQL"
+        || detail.starts_with("SQL too large")
+        || detail.starts_with("refused:")
+        || detail.starts_with("query over budget:")
+}
+
+fn query_output_json(output: QueryOutput) -> Value {
+    Value::Obj(vec![
+        (
+            "columns".to_string(),
+            Value::Arr(output.columns.into_iter().map(s).collect()),
+        ),
+        (
+            "rows".to_string(),
+            Value::Arr(
+                output
+                    .rows
+                    .into_iter()
+                    .map(|row| Value::Arr(row.into_iter().map(s).collect()))
+                    .collect(),
+            ),
+        ),
+        ("truncated".to_string(), Value::Bool(output.truncated)),
+        ("elapsed_ms".to_string(), Value::Int(output.elapsed_ms as i64)),
+    ])
+}
 
 fn asset_register(conn: &mut Conn, head: &mut Head, rc: &RouteCtx) -> RouteResult<Outcome> {
     let secret = secret_of(head)?;

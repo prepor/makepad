@@ -35,6 +35,7 @@ pub mod server;
 pub mod util;
 
 pub mod annotate;
+pub mod assets_query;
 
 pub(crate) mod appdb;
 pub(crate) mod chat;

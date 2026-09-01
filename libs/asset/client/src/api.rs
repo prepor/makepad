@@ -10,7 +10,7 @@
 //! canonical manifest bytes. Data plane: blob HEAD/GET (Range/resume).
 
 use crate::dto::{
-    self, AliasDto, AssetDetailDto, AssetsPageDto, CatalogPageDto, ClaimedJobDto, EventsPageDto,
+    self, AliasDto, AssetDetailDto, AssetsPageDto, AssetsQueryDto, CatalogPageDto, ClaimedJobDto, EventsPageDto,
     GameAliasDto, HealthDto, ImportReportDto, ImportStatusDto, JobDetailDto, JobId, JobProfileDto,
     JobRowDto, JobStatusDto, PipelineCancelDto, PipelineCreatedDto, PipelineDetailDto, PipelineId,
     PipelineRowDto, SourceCollectionRowDto, SourceCollectionsPageDto, StageOnFailDto,
@@ -908,6 +908,19 @@ impl Api {
         req.bearer = self.bearer();
         let v = self.call_json(self.endpoints.control, req)?;
         dto::parse_catalog_page(&v)
+    }
+
+    /// Run one bounded, single-SELECT query against the server's live asset
+    /// catalog. The server owns the row, value, step, and deadline budgets.
+    pub fn assets_query(&self, sql: &str) -> ClientResult<AssetsQueryDto> {
+        if sql.trim().is_empty() || sql.len() > 4096 {
+            return Err(ClientError::InvalidInput { what: "assets query sql" });
+        }
+        let body = json::obj(vec![("sql", json::s(sql))]).to_json().into_bytes();
+        let mut req = Request::post("/v1/assets/query", &body);
+        req.bearer = self.bearer();
+        let v = self.call_json(self.endpoints.control, req)?;
+        dto::parse_assets_query(&v)
     }
 
     /// One page of the keyset asset listing.

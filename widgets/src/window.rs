@@ -494,6 +494,11 @@ struct GaussStack {
     levels: Vec<GaussStackLevel>,
 }
 
+fn gauss_fast() -> bool {
+    thread_local! { static ON: bool = std::env::var_os("MAKEPAD_GAUSS_FAST").is_some(); }
+    ON.with(|v| *v)
+}
+
 fn gauss_render_texture_y_flip_for_os(os_type: &OsType) -> f32 {
     match os_type {
         OsType::Android(_) => 1.0,
@@ -632,6 +637,11 @@ impl GaussStack {
         let mut source_texture = self.scene_texture.clone();
 
         for (index, level) in self.levels.iter_mut().enumerate() {
+            // MAKEPAD_GAUSS_FAST=1: probe rig — stop the chain early to
+            // measure how much of a frame the pass COUNT itself costs.
+            if gauss_fast() && index > 3 {
+                break;
+            }
             let level_size = Self::level_size(root_size, dpi, index);
 
             level.pass.set_size(cx, level_size);
@@ -667,6 +677,9 @@ impl GaussStack {
         upsample: &mut DrawGaussUpsample,
         root_size: Vec2d,
     ) {
+        if gauss_fast() {
+            return;
+        }
         let dpi = cx.current_dpi_factor();
         for index in GAUSS_SMOOTH_LEVEL_START..self.levels.len() {
             let level = &mut self.levels[index];

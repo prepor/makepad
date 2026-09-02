@@ -598,6 +598,26 @@ impl SelectionTracker {
             }
         }
 
+
+        // Rows padded for their descenders overlap wherever the line gap is
+        // under twice the padding, and a translucent wash paints the overlap
+        // twice as dark: a band between every two lines of a paragraph. A
+        // padded row that reaches into the row under it ends at that row's
+        // top instead, so the wash is continuous and even.
+        for i in 0..rects.len() {
+            let a = rects[i];
+            let mut bottom = a.pos.y + a.size.y;
+            for b in &rects {
+                let under = b.pos.y > a.pos.y + 0.5
+                    && b.pos.y < bottom
+                    && b.pos.x < a.pos.x + a.size.x
+                    && a.pos.x < b.pos.x + b.size.x;
+                if under {
+                    bottom = b.pos.y;
+                }
+            }
+            rects[i].size.y = bottom - a.pos.y;
+        }
         rects
     }
 }

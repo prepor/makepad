@@ -908,6 +908,45 @@ impl MacosApp {
                     );
                 };
             }
+            // A trackpad pinch. There is no gesture event in the platform
+            // vocabulary, and a zoom is what every app means by a pinch, so
+            // it is delivered the way a zoom is already asked for: a scroll
+            // with the command key held, vertical, at the pointer. The
+            // magnification is a fraction per event (a full pinch sums to
+            // about ±1); ×100 puts it on the scale a wheel notch has, so a
+            // consumer's `-scroll.y * 0.01` reads the fraction back. No
+            // phase: a pinch neither arms momentum nor disqualifies a tap.
+            NSEventType::NSEventTypeMagnify => {
+                let window: ObjcId = msg_send![ns_event, window];
+                if window == nil {
+                    return;
+                }
+                let window_delegate: ObjcId = msg_send![window, delegate];
+                if window_delegate == nil {
+                    return;
+                }
+                if (*window_delegate)
+                    .class()
+                    .instance_variable("macos_window_ptr")
+                    .is_none()
+                {
+                    return;
+                }
+                let ptr: *mut c_void = *(*window_delegate).get_ivar("macos_window_ptr");
+                let cocoa_window = &mut *(ptr as *mut MacosWindow);
+                let magnification: f64 = msg_send![ns_event, magnification];
+                let mut modifiers = get_event_key_modifier(ns_event);
+                modifiers.logo = true;
+                cocoa_window.send_scroll(
+                    Vec2d {
+                        x: 0.0,
+                        y: -magnification * 100.0,
+                    },
+                    modifiers,
+                    false,
+                    ScrollPhase::None,
+                );
+            }
             NSEventType::NSEventTypePressure => {}
             _ => (),
         }

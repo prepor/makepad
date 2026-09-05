@@ -532,7 +532,12 @@ impl CxFingers {
         self.tap.count
     }
 
-    pub(crate) fn process_tap_count(&mut self, pos: Vec2d, time: f64) -> u32 {
+    /// Fold a press into the run of presses before it and answer how many
+    /// deep it is. The platform's own event loop calls this for every real
+    /// press; an app that synthesizes presses of its own — a scripted run,
+    /// a replay — must call it too, or every one of them reads as a first
+    /// click and no widget it drives ever sees a double one.
+    pub fn process_tap_count(&mut self, pos: Vec2d, time: f64) -> u32 {
         // TODO: query the platform for its multi-press / double-click timeout.
         //       e.g., see Android's ViewConfiguration.getMultiPressTimeout().
         if (time - self.tap.last_time) < TAP_COUNT_TIME

@@ -581,7 +581,11 @@ impl CxFingers {
         self.switch_captures();
     }
 
-    pub(crate) fn mouse_down(&mut self, button: MouseButton, window_id: WindowId) {
+    /// Note the button that owns the gesture from here to its release. The
+    /// platform's own event loop calls this before it delivers a press; an
+    /// app that synthesizes presses must call it too, or the release below
+    /// has nothing to match and hands no capture back.
+    pub fn mouse_down(&mut self, button: MouseButton, window_id: WindowId) {
         if self.first_mouse_button.is_none() {
             self.first_mouse_button = Some((button, window_id));
         }
@@ -596,7 +600,11 @@ impl CxFingers {
         }
     }
 
-    pub(crate) fn mouse_up(&mut self, button: MouseButton) {
+    /// Hand the pointer back on a release. The platform's own event loop
+    /// calls this after it delivers one; an app that synthesizes presses
+    /// must call it too, or the widget it pressed keeps the capture and is
+    /// dealt every later press, wherever that press lands.
+    pub fn mouse_up(&mut self, button: MouseButton) {
         match self.first_mouse_button {
             Some((fmb, _)) if fmb == button => {
                 self.first_mouse_button = None;

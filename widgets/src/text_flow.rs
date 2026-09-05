@@ -5,7 +5,7 @@ use crate::makepad_draw::text::{
 };
 use crate::{
     animator::*, makepad_derive_widget::*, makepad_draw::shader::draw_text::TextOverflow,
-    makepad_draw::*, widget::*, widget_tree::CxWidgetExt,
+    makepad_draw::*, text_input::SelectBy, widget::*, widget_tree::CxWidgetExt,
 };
 use std::rc::Rc;
 
@@ -813,6 +813,15 @@ pub struct TextFlow {
     #[rust]
     is_selecting: bool,
 
+    /// What the press that began the drag takes at a time: the caret's
+    /// place, a word, or a line.
+    #[rust]
+    select_by: SelectBy,
+
+    /// The span that press took, which the drag pivots around.
+    #[rust]
+    select_anchor_span: (usize, usize),
+
     // Streaming text animation fields
     #[rust]
     next_frame: NextFrame,
@@ -1250,16 +1259,32 @@ impl Widget for TextFlow {
                     cx.hide_clipboard_actions();
                 }
                 if let Some(idx) = self.selection_tracker.point_to_index(cx, fe.abs) {
-                    self.selection_anchor = idx;
-                    self.selection_cursor = idx;
+                    // Two presses take the word under them, three the
+                    // paragraph — a letter is read, and reading is where
+                    // one reaches for a word without sweeping it.
+                    self.select_by = SelectBy::from_tap_count(fe.tap_count);
+                    let (start, end) = self.select_by.range(&self.selection_tracker.text, idx);
+                    self.select_anchor_span = (start, end);
+                    self.selection_anchor = start;
+                    self.selection_cursor = end;
                     self.is_selecting = true;
+                    self.propagate_selection_to_children();
                     self.redraw(cx);
                 }
             }
             Hit::FingerMove(fe) if self.is_selecting => {
                 if let Some(idx) = self.selection_tracker.point_to_index(cx, fe.abs) {
-                    if self.selection_cursor != idx {
-                        self.selection_cursor = idx;
+                    // A drag sweeps in whatever the press took: characters
+                    // after one press, whole words or paragraphs after two
+                    // or three, with the one it began on kept inside.
+                    let (anchor, cursor) = self.select_by.extend(
+                        &self.selection_tracker.text,
+                        self.select_anchor_span,
+                        idx,
+                    );
+                    if (self.selection_anchor, self.selection_cursor) != (anchor, cursor) {
+                        self.selection_anchor = anchor;
+                        self.selection_cursor = cursor;
                         // Propagate selection to child widgets (e.g., CodeView)
                         self.propagate_selection_to_children();
                         self.redraw(cx);

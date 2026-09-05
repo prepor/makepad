@@ -621,6 +621,15 @@ pub struct TextInput {
     blink_timer: Timer,
     #[rust]
     preserved_selection_cursor: Option<Cursor>,
+    /// What a press-drag takes at a time: a plain press moves the caret, a
+    /// double one takes words, a triple one takes lines.
+    #[rust]
+    select_by: SelectBy,
+    /// The span the press itself selected. A drag pivots around it, so
+    /// sweeping back past its start still holds the word (or the line) the
+    /// gesture began on, the way every macOS field does.
+    #[rust]
+    select_anchor_span: (usize, usize),
     /// When true, the next draw will scroll to keep the cursor visible.
     /// Set when the cursor/selection changes; cleared after scroll_to_cursor runs.
     #[rust(true)]
@@ -1690,11 +1699,12 @@ impl TextInput {
     }
 
     pub fn select_word(&mut self, cx: &mut Cx) {
+        let (start, end) = word_range(&self.text, self.selection.cursor.index);
         if self.selection.cursor.index < self.selection.anchor.index {
             self.set_cursor(
                 cx,
                 Cursor {
-                    index: self.ceil_word_boundary(self.selection.cursor.index),
+                    index: start,
                     prefer_next_row: true,
                 },
                 true,
@@ -1703,7 +1713,7 @@ impl TextInput {
             self.set_cursor(
                 cx,
                 Cursor {
-                    index: self.floor_word_boundary(self.selection.cursor.index),
+                    index: end,
                     prefer_next_row: false,
                 },
                 true,
@@ -1713,16 +1723,59 @@ impl TextInput {
                 cx,
                 Selection {
                     anchor: Cursor {
-                        index: self.ceil_word_boundary(self.selection.cursor.index),
+                        index: start,
                         prefer_next_row: true,
                     },
                     cursor: Cursor {
-                        index: self.floor_word_boundary(self.selection.cursor.index),
+                        index: end,
                         prefer_next_row: false,
                     },
                 },
             );
         }
+    }
+
+    /// Take the whole unit a multi-click press means — the word under a
+    /// double click, the line under a triple one — and remember it as the
+    /// span the drag that may follow pivots around.
+    fn select_unit(&mut self, cx: &mut Cx, by: SelectBy) {
+        let (start, end) = by.range(&self.text, self.selection.cursor.index);
+        self.select_by = by;
+        self.select_anchor_span = (start, end);
+        self.set_selection(
+            cx,
+            Selection {
+                anchor: Cursor {
+                    index: start,
+                    prefer_next_row: true,
+                },
+                cursor: Cursor {
+                    index: end,
+                    prefer_next_row: false,
+                },
+            },
+        );
+    }
+
+    /// Where a drag started by a multi-click press has got to: whole units,
+    /// with the one the press took still inside the selection.
+    fn extend_selection_by_unit(&mut self, cx: &mut Cx, index: usize) {
+        let (anchor, cursor) = self
+            .select_by
+            .extend(&self.text, self.select_anchor_span, index);
+        self.set_selection(
+            cx,
+            Selection {
+                anchor: Cursor {
+                    index: anchor,
+                    prefer_next_row: false,
+                },
+                cursor: Cursor {
+                    index: cursor,
+                    prefer_next_row: cursor < anchor,
+                },
+            },
+        );
     }
 
     pub fn force_new_edit_group(&mut self) {
@@ -1891,28 +1944,6 @@ impl TextInput {
             );
         }
         self.draw_composition_underline.end_many_instances(cx);
-    }
-
-    fn ceil_word_boundary(&self, index: usize) -> usize {
-        let mut prev_word_boundary_index = 0;
-        for (word_boundary_index, _) in self.text.split_word_bound_indices() {
-            if word_boundary_index > index {
-                return prev_word_boundary_index;
-            }
-            prev_word_boundary_index = word_boundary_index;
-        }
-        prev_word_boundary_index
-    }
-
-    fn floor_word_boundary(&self, index: usize) -> usize {
-        let mut prev_word_boundary_index = self.text.len();
-        for (word_boundary_index, _) in self.text.split_word_bound_indices().rev() {
-            if word_boundary_index < index {
-                return prev_word_boundary_index;
-            }
-            prev_word_boundary_index = word_boundary_index;
-        }
-        prev_word_boundary_index
     }
 
     fn filter_input(&self, input: &str, is_set_text: bool) -> String {
@@ -2178,6 +2209,65 @@ impl TextInput {
             next_grapheme_boundary(&self.text, end)
         };
         (start, end)
+    }
+
+    /// What `^K` takes: the rest of the line, or — with the caret already
+    /// at its end — the break itself, which pulls the line below up.
+    fn kill_range(&self) -> (usize, usize) {
+        let start = self.selection.start().index;
+        let end = self.selection.end().index;
+        if start != end {
+            return (start, end);
+        }
+        let (_, line_end) = line_range(&self.text, end);
+        let text_end = if self.text[..line_end].ends_with('\n') {
+            line_end - 1
+        } else {
+            line_end
+        };
+        if text_end > end {
+            (end, text_end)
+        } else {
+            (end, line_end)
+        }
+    }
+
+    /// The macOS control chords that edit rather than move: `^H` back,
+    /// `^D` forward, `^K` to the end of the line. Answers whether the key
+    /// was one of them.
+    fn handle_control_edit_key(&mut self, cx: &mut Cx, uid: WidgetUid, event: KeyEvent) -> bool {
+        let Some(edit) = ControlEdit::from_key_event(event) else {
+            return false;
+        };
+        if self.is_read_only {
+            return false;
+        }
+        self.reset_blink_timer(cx);
+        let (kind, (start, end)) = match edit {
+            ControlEdit::DeleteBackward => (
+                EditKind::Backspace,
+                self.backspace_range(KeyModifiers::default()),
+            ),
+            ControlEdit::DeleteForward => {
+                (EditKind::Delete, self.delete_range(KeyModifiers::default()))
+            }
+            ControlEdit::KillToLineEnd => (EditKind::Other, self.kill_range()),
+        };
+        if start == end {
+            return true;
+        }
+        self.create_or_extend_edit_group(kind);
+        self.apply_edit(
+            cx,
+            Edit {
+                start,
+                end,
+                replace_with: String::new(),
+            },
+        );
+        self.draw_bg.redraw(cx);
+        self.emit_change(cx, uid);
+        true
     }
 
     fn current_line_start_index(&self) -> Result<usize, ()> {
@@ -2481,6 +2571,7 @@ impl Widget for TextInput {
                 self.handle_focus_lost(cx, uid, kf.focus);
             }
             Hit::KeyDown(event) if self.handle_navigation_key(cx, uid, event) => {}
+            Hit::KeyDown(event) if self.handle_control_edit_key(cx, uid, event) => {}
             Hit::KeyDown(KeyEvent {
                 key_code: KeyCode::KeyA,
                 modifiers,
@@ -2534,32 +2625,17 @@ impl Widget for TextInput {
                     self.preserved_selection_cursor = Some(cursor);
                 }
 
-                match tap_count {
-                    2 => {
-                        self.select_word(cx);
-                        if device.is_touch() {
-                            let has_selection = !self.selected_text().is_empty();
-                            let selection_rect = self.get_selection_rect(cx);
-                            cx.show_clipboard_actions(
-                                has_selection,
-                                selection_rect,
-                                cx.keyboard_shift,
-                            );
-                        }
+                // Two presses take the word under them, three take the
+                // line — and the unit is kept, because a drag from here
+                // sweeps in units of it.
+                self.select_by = SelectBy::from_tap_count(tap_count);
+                if self.select_by != SelectBy::Caret {
+                    self.select_unit(cx, self.select_by);
+                    if device.is_touch() {
+                        let has_selection = !self.selected_text().is_empty();
+                        let selection_rect = self.get_selection_rect(cx);
+                        cx.show_clipboard_actions(has_selection, selection_rect, cx.keyboard_shift);
                     }
-                    3 => {
-                        self.select_all(cx);
-                        if device.is_touch() {
-                            let has_selection = !self.selected_text().is_empty();
-                            let selection_rect = self.get_selection_rect(cx);
-                            cx.show_clipboard_actions(
-                                has_selection,
-                                selection_rect,
-                                cx.keyboard_shift,
-                            );
-                        }
-                    }
-                    _ => {}
                 }
 
                 self.animator_play(cx, ids!(hover.down));
@@ -2596,10 +2672,11 @@ impl Widget for TextInput {
                     // Check if cursor is over actual text
                     if cursor.index < self.text.len() {
                         self.set_cursor(cx, cursor, false);
-                        self.select_word(cx);
+                        self.select_unit(cx, SelectBy::Word);
                     } else {
                         // Long press on empty space just position the cursor
                         self.set_cursor(cx, cursor, false);
+                        self.select_by = SelectBy::Caret;
                     }
                 }
 
@@ -2613,12 +2690,9 @@ impl Widget for TextInput {
                 // Skip next move to prevent selection change when finger lifts
                 self.ignore_next_move = true;
             }
-            Hit::FingerMove(FingerMoveEvent {
-                abs,
-                tap_count,
-                device,
-                ..
-            }) if device.is_primary_hit() && !scrollbar_captured => {
+            Hit::FingerMove(FingerMoveEvent { abs, device, .. })
+                if device.is_primary_hit() && !scrollbar_captured =>
+            {
                 // Skip first move after long press to prevent selection changes
                 if self.ignore_next_move {
                     self.ignore_next_move = false;
@@ -2636,11 +2710,10 @@ impl Widget for TextInput {
                     warning!("can't move cursor because layout was invalidated by earlier event");
                     return;
                 };
-                self.set_cursor(cx, cursor, true);
-                match tap_count {
-                    2 => self.select_word(cx),
-                    3 => self.select_all(cx),
-                    _ => {}
+                if self.select_by == SelectBy::Caret {
+                    self.set_cursor(cx, cursor, true);
+                } else {
+                    self.extend_selection_by_unit(cx, cursor.index);
                 }
             }
             Hit::KeyDown(KeyEvent {
@@ -3454,6 +3527,20 @@ enum TextNavigation {
 impl TextNavigation {
     fn from_key_event(event: KeyEvent) -> Option<Self> {
         let modifiers = event.modifiers;
+        // The emacs chords every text view on macOS answers, and which a
+        // hand that learned them there expects in any field. Shift extends,
+        // exactly as it does with the arrows.
+        if is_apple_control_chord(modifiers) {
+            return match event.key_code {
+                KeyCode::KeyA => Some(Self::LineStart),
+                KeyCode::KeyE => Some(Self::LineEnd),
+                KeyCode::KeyB => Some(Self::Left),
+                KeyCode::KeyF => Some(Self::Right),
+                KeyCode::KeyP => Some(Self::Up),
+                KeyCode::KeyN => Some(Self::Down),
+                _ => None,
+            };
+        }
         if has_only_selection_modifier(modifiers) {
             return match event.key_code {
                 KeyCode::ArrowLeft => Some(Self::Left),
@@ -3487,6 +3574,77 @@ impl TextNavigation {
             };
         }
         None
+    }
+}
+
+/// The macOS control chords that edit: what `^H`, `^D` and `^K` do in every
+/// text view on that platform.
+#[derive(Clone, Copy, Debug)]
+enum ControlEdit {
+    DeleteBackward,
+    DeleteForward,
+    KillToLineEnd,
+}
+
+impl ControlEdit {
+    fn from_key_event(event: KeyEvent) -> Option<Self> {
+        if !is_apple_control_chord(event.modifiers) {
+            return None;
+        }
+        match event.key_code {
+            KeyCode::KeyH => Some(Self::DeleteBackward),
+            KeyCode::KeyD => Some(Self::DeleteForward),
+            KeyCode::KeyK => Some(Self::KillToLineEnd),
+            _ => None,
+        }
+    }
+}
+
+/// What a press takes at a time, counted off the presses before it: one
+/// click moves the caret, two take the word, three take the line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SelectBy {
+    #[default]
+    Caret,
+    Word,
+    Line,
+}
+
+impl SelectBy {
+    pub(crate) fn from_tap_count(tap_count: u32) -> Self {
+        match tap_count {
+            2 => Self::Word,
+            3 => Self::Line,
+            _ => Self::Caret,
+        }
+    }
+
+    /// The span this unit covers around `index`.
+    pub(crate) fn range(self, text: &str, index: usize) -> (usize, usize) {
+        match self {
+            Self::Caret => (index, index),
+            Self::Word => word_range(text, index),
+            Self::Line => line_range(text, index),
+        }
+    }
+
+    /// Where a drag has reached, as `(anchor, cursor)`: the unit under the
+    /// pointer, with the span the press took kept whole — sweep back past
+    /// its start and the selection pivots around it rather than shrinking
+    /// to what the pointer alone covers.
+    pub(crate) fn extend(
+        self,
+        text: &str,
+        anchor_span: (usize, usize),
+        index: usize,
+    ) -> (usize, usize) {
+        let (anchor_start, anchor_end) = anchor_span;
+        let (start, end) = self.range(text, index);
+        if start < anchor_start {
+            (anchor_end, start)
+        } else {
+            (anchor_start, end)
+        }
     }
 }
 
@@ -3722,6 +3880,60 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+/// The word around `index`: what a double click takes.
+///
+/// An index sits *between* two segments as often as inside one — a click on
+/// the left half of a glyph lands on its start — so a boundary reads the way
+/// a person means it: the word after it when there is one, otherwise the
+/// word before.
+pub(crate) fn word_range(text: &str, index: usize) -> (usize, usize) {
+    let index = floor_char_boundary(text, index);
+    let mut before: Option<(usize, &str)> = None;
+    for (start, segment) in text.split_word_bound_indices() {
+        let end = start + segment.len();
+        if index > start && index < end {
+            return (start, end);
+        }
+        if index == start {
+            return match before {
+                Some((prev_start, prev)) if !is_word_segment(segment) && is_word_segment(prev) => {
+                    (prev_start, start)
+                }
+                _ => (start, end),
+            };
+        }
+        before = Some((start, segment));
+    }
+    // Past the last segment: the end of the text, and the word that ends there.
+    match before {
+        Some((start, segment)) => (start, start + segment.len()),
+        None => (0, 0),
+    }
+}
+
+/// Whether a word-bound segment is a word rather than a space or a mark.
+fn is_word_segment(segment: &str) -> bool {
+    segment.chars().next().is_some_and(char::is_alphanumeric)
+}
+
+/// The line around `index`, its break included: what a triple click takes,
+/// and what `^K` kills to the end of.
+pub(crate) fn line_range(text: &str, index: usize) -> (usize, usize) {
+    let index = floor_char_boundary(text, index);
+    let start = text[..index].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[index..]
+        .find('\n')
+        .map_or(text.len(), |i| index + i + 1);
+    (start, end)
+}
+
+/// A chord on the macOS control key, which that platform's text views read
+/// as the emacs bindings. Elsewhere control is the primary modifier and
+/// these letters mean select-all, copy, paste — so this is Apple's alone.
+fn is_apple_control_chord(modifiers: KeyModifiers) -> bool {
+    is_apple_text_platform() && modifiers.control && !modifiers.alt && !modifiers.logo
+}
+
 fn has_only_selection_modifier(modifiers: KeyModifiers) -> bool {
     !modifiers.control && !modifiers.alt && !modifiers.logo
 }
@@ -3762,4 +3974,101 @@ fn uses_apple_text_boundary_modifier(modifiers: KeyModifiers) -> bool {
 
 fn is_apple_text_platform() -> bool {
     cfg!(target_vendor = "apple")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(key_code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            key_code,
+            modifiers,
+            is_repeat: false,
+            time: 0.0,
+        }
+    }
+
+    const CONTROL: KeyModifiers = KeyModifiers {
+        shift: false,
+        control: true,
+        alt: false,
+        logo: false,
+    };
+
+    #[test]
+    fn a_word_is_taken_from_inside_it() {
+        assert_eq!(word_range("hello world", 2), (0, 5));
+        assert_eq!(word_range("hello world", 8), (6, 11));
+    }
+
+    #[test]
+    fn a_word_is_taken_from_either_of_its_ends() {
+        // A click on the left half of a glyph lands on the boundary before
+        // it: the first word of a run is reached that way and no other.
+        assert_eq!(word_range("hello world", 0), (0, 5));
+        // And the boundary after a word belongs to the word, not the space.
+        assert_eq!(word_range("hello world", 5), (0, 5));
+        assert_eq!(word_range("hello world", 11), (6, 11));
+    }
+
+    #[test]
+    fn a_line_is_taken_with_its_break() {
+        assert_eq!(line_range("one\ntwo\nthree", 0), (0, 4));
+        assert_eq!(line_range("one\ntwo\nthree", 5), (4, 8));
+        assert_eq!(line_range("one\ntwo\nthree", 9), (8, 13));
+        assert_eq!(line_range("alone", 3), (0, 5));
+    }
+
+    #[test]
+    fn a_drag_keeps_the_word_it_began_on() {
+        let text = "one two three";
+        let span = SelectBy::Word.range(text, 5);
+        assert_eq!(span, (4, 7));
+        // Forward, over "three".
+        assert_eq!(SelectBy::Word.extend(text, span, 10), (4, 13));
+        // Back over "one": the anchor pivots to the far end of "two".
+        assert_eq!(SelectBy::Word.extend(text, span, 1), (7, 0));
+    }
+
+    #[test]
+    fn the_macos_caret_chords_are_read_as_movement() {
+        for (code, expected) in [
+            (KeyCode::KeyA, TextNavigation::LineStart),
+            (KeyCode::KeyE, TextNavigation::LineEnd),
+            (KeyCode::KeyB, TextNavigation::Left),
+            (KeyCode::KeyF, TextNavigation::Right),
+            (KeyCode::KeyP, TextNavigation::Up),
+            (KeyCode::KeyN, TextNavigation::Down),
+        ] {
+            let read = TextNavigation::from_key_event(key(code, CONTROL));
+            if is_apple_text_platform() {
+                assert_eq!(format!("{:?}", read), format!("{:?}", Some(expected)));
+            } else {
+                // Elsewhere control is the primary modifier, and these
+                // letters are select-all and its neighbours.
+                assert!(read.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn the_macos_editing_chords_are_read_as_edits() {
+        let deletes = [KeyCode::KeyH, KeyCode::KeyD, KeyCode::KeyK];
+        for code in deletes {
+            assert_eq!(
+                ControlEdit::from_key_event(key(code, CONTROL)).is_some(),
+                is_apple_text_platform()
+            );
+        }
+        // A chord with another modifier on it is somebody else's.
+        assert!(ControlEdit::from_key_event(key(
+            KeyCode::KeyK,
+            KeyModifiers {
+                logo: true,
+                ..CONTROL
+            }
+        ))
+        .is_none());
+    }
 }

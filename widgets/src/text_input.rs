@@ -3588,7 +3588,10 @@ enum ControlEdit {
 
 impl ControlEdit {
     fn from_key_event(event: KeyEvent) -> Option<Self> {
-        if !is_apple_control_chord(event.modifiers) {
+        // Shift extends a movement; on a deletion it is nobody's chord —
+        // AppKit binds none of these with it — and a field that took it
+        // anyway would eat text under a hand that meant nothing by it.
+        if !is_apple_control_chord(event.modifiers) || event.modifiers.shift {
             return None;
         }
         match event.key_code {
@@ -4061,14 +4064,21 @@ mod tests {
                 is_apple_text_platform()
             );
         }
-        // A chord with another modifier on it is somebody else's.
-        assert!(ControlEdit::from_key_event(key(
-            KeyCode::KeyK,
+        // A chord with another modifier on it is somebody else's, and one
+        // with shift is nobody's: it must not delete.
+        for extra in [
             KeyModifiers {
                 logo: true,
                 ..CONTROL
+            },
+            KeyModifiers {
+                shift: true,
+                ..CONTROL
+            },
+        ] {
+            for code in deletes {
+                assert!(ControlEdit::from_key_event(key(code, extra)).is_none());
             }
-        ))
-        .is_none());
+        }
     }
 }

@@ -1184,9 +1184,14 @@ impl Widget for TextFlow {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        // Handle child item events first
-        for (_id, (entry, _)) in self.items.as_mut().unwrap().iter_mut() {
-            entry.handle_event(cx, event, scope);
+        // A shifted press extends text through inline links and widgets.
+        // Let the flow capture it before a child can activate or take focus.
+        let extend_press = self.selectable && matches!(event,
+            Event::MouseDown(e) if e.button.is_primary() && e.modifiers.shift);
+        if !extend_press {
+            for (_id, (entry, _)) in self.items.as_mut().unwrap().iter_mut() {
+                entry.handle_event(cx, event, scope);
+            }
         }
 
         // Handle streaming animation NextFrame
@@ -1254,6 +1259,8 @@ impl Widget for TextFlow {
                 cx.set_cursor(MouseCursor::Default);
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                let extend = fe.modifiers.shift
+                    && (cx.has_key_focus(self.area) || self.has_selection());
                 cx.set_key_focus(self.area);
                 if fe.device.is_touch() {
                     cx.hide_clipboard_actions();
@@ -1262,11 +1269,17 @@ impl Widget for TextFlow {
                     // Two presses take the word under them, three the
                     // paragraph — a letter is read, and reading is where
                     // one reaches for a word without sweeping it.
-                    self.select_by = SelectBy::from_tap_count(fe.tap_count);
-                    let (start, end) = self.select_by.range(&self.selection_tracker.text, idx);
-                    self.select_anchor_span = (start, end);
-                    self.selection_anchor = start;
-                    self.selection_cursor = end;
+                    if extend {
+                        self.select_by = SelectBy::Caret;
+                        self.select_anchor_span = (self.selection_anchor, self.selection_anchor);
+                        self.selection_cursor = idx;
+                    } else {
+                        self.select_by = SelectBy::from_tap_count(fe.tap_count);
+                        let (start, end) = self.select_by.range(&self.selection_tracker.text, idx);
+                        self.select_anchor_span = (start, end);
+                        self.selection_anchor = start;
+                        self.selection_cursor = end;
+                    }
                     self.is_selecting = true;
                     self.propagate_selection_to_children();
                     self.redraw(cx);

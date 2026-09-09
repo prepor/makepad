@@ -3060,7 +3060,9 @@ impl Widget for PortalList {
                             if fe.device.is_touch() {
                                 cx.hide_clipboard_actions();
                             }
-                            self.selection_anchor = Some((item_id, char_idx));
+                            if !fe.modifiers.shift || self.selection_anchor.is_none() {
+                                self.selection_anchor = Some((item_id, char_idx));
+                            }
                             self.selection_cursor = Some((item_id, char_idx));
                             self.is_selecting = true;
                             self.select_scroll_state = Some(SelectScrollState {

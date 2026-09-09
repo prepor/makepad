@@ -2591,6 +2591,7 @@ impl Widget for TextInput {
                 abs,
                 tap_count,
                 device,
+                modifiers,
                 ..
             }) if device.is_primary_hit() && !scrollbar_captured => {
                 self.reset_blink_timer(cx);
@@ -2618,7 +2619,12 @@ impl Widget for TextInput {
                     false
                 };
 
-                if tap_count > 1 || !touching_selection {
+                if modifiers.shift {
+                    // Shift moves only the active end, even inside the old
+                    // selection. The release must not collapse it afterwards.
+                    self.set_cursor(cx, cursor, true);
+                    self.preserved_selection_cursor = None;
+                } else if tap_count > 1 || !touching_selection {
                     self.set_cursor(cx, cursor, false);
                     self.preserved_selection_cursor = None;
                 } else {
@@ -2628,7 +2634,11 @@ impl Widget for TextInput {
                 // Two presses take the word under them, three take the
                 // line — and the unit is kept, because a drag from here
                 // sweeps in units of it.
-                self.select_by = SelectBy::from_tap_count(tap_count);
+                self.select_by = if modifiers.shift {
+                    SelectBy::Caret
+                } else {
+                    SelectBy::from_tap_count(tap_count)
+                };
                 if self.select_by != SelectBy::Caret {
                     self.select_unit(cx, self.select_by);
                     if device.is_touch() {

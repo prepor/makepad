@@ -513,6 +513,13 @@ static mut CHOREOGRAPHER_POST_CALLBACK_FN: Option<
     ) -> i32,
 > = None;
 
+/// Whether a render loop has been started for this process. An activity
+/// recreated in the same process — a foldable moving between its screens
+/// with the native loop kept alive — calls `initChoreographer` again, and a
+/// second vsync chain would deliver two `RenderLoop` messages a frame.
+static RENDER_LOOP_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Initializes the render loop which used the Android Choreographer when available to ensure proper vsync.
 /// If `no_android_choreographer` is present (e.g. OHOS with non-compatiblity), we fallback to a simple loop with frame pacing.
 /// This will be replaced by proper a vsync mechanism once we firgure it out for that OHOS.
@@ -524,6 +531,9 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographe
     device_refresh_rate: jni_sys::jfloat,
     sdk_version: jni_sys::jint,
 ) {
+    if RENDER_LOOP_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     // If the Choreographer is not available (e.g. OHOS), use a manual render loop
     #[cfg(no_android_choreographer)]
     {

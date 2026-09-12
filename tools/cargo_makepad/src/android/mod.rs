@@ -95,7 +95,7 @@ impl AndroidVariant {
                     <meta-data android:name="android.max_aspect" android:value="2.1" />
                     <activity
                     android:name=".{class_name}"
-                    android:configChanges="orientation|screenSize|keyboardHidden"
+                    android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode"
                     android:exported="true"
                     android:launchMode="singleTask"
                     android:windowSoftInputMode="adjustNothing|stateUnchanged"

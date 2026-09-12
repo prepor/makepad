@@ -1410,12 +1410,23 @@ public class MakepadActivity
         mSurfaceSnapshotCopyInFlight = false;
         cleanupVideoPlaybackState();
         shutdownVideoPlaybackThread();
-        if (!mIsSwitchingActivity) {
+        // A configuration change the manifest does not declare (a foldable
+        // moving between its screens, a display density change) recreates
+        // the activity in the same process. The native event loop outlives
+        // the activity in that case, exactly as it does across an activity
+        // switch: the next onCreate re-attaches it through activityOnCreate,
+        // and telling it to shut down here would leave the new activity's
+        // surface with nobody to draw it — a black screen until the process
+        // is killed.
+        boolean recreating = mIsSwitchingActivity || isChangingConfigurations();
+        if (!recreating) {
             cleanupNetworkState();
             shutdownWebSocketsThread();
         }
         super.onDestroy();
-        MakepadNative.activityOnDestroy();
+        if (!recreating) {
+            MakepadNative.activityOnDestroy();
+        }
     }
 
     @Override

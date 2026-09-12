@@ -1421,7 +1421,15 @@ impl Cx {
                     }
                 }
             }
-            FromJavaMessage::Init(_) => {}
+            FromJavaMessage::Init(params) => {
+                // An activity recreated in the same process (see
+                // `MakepadActivity.onDestroy`) reports its parameters
+                // again. The density is the one that can have changed; the
+                // `SurfaceChanged` that follows lays the window out with it.
+                if params.density > 0.0 {
+                    self.os.dpi_factor = params.density;
+                }
+            }
         }
     }
 

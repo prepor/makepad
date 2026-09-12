@@ -887,6 +887,19 @@ impl AppleVideoPlayer {
         self.post_seek_gate.is_some()
     }
 
+    /// True only while a frame is actually due: the item is prepared, asked to
+    /// play, and AVPlayer reports it is playing at rate. A paused player produces
+    /// no frames on purpose, and one still buffering a network item — waiting to
+    /// play at the specified rate — none yet; neither is a stalled decoder.
+    pub fn is_advancing(&self) -> bool {
+        if !self.is_prepared || !self.should_play.load(Ordering::Acquire) {
+            return false;
+        }
+        // AVPlayerTimeControlStatus: Paused=0, WaitingToPlayAtSpecifiedRate=1, Playing=2.
+        let time_control: i64 = unsafe { msg_send![self.player.as_id(), timeControlStatus] };
+        time_control == 2
+    }
+
     fn apply_play_rate(&self) {
         unsafe {
             let rate = f32::from_bits(self.playback_rate.load(Ordering::Relaxed)).max(0.05);

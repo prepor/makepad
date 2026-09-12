@@ -120,6 +120,9 @@ impl AppleUnifiedVideoPlayer {
     pub fn check_prepared(&mut self) -> Option<Result<PlaybackPrepared, String>> {
         match &mut self.mode {
             ApplePlayerMode::Native(player) => match player.check_prepared() {
+                // With no software decoder installed the native error is the error;
+                // switching would only replace it with "no media plugin installed".
+                Some(Err(err)) if crate::media_plugin::media_plugin().is_none() => Some(Err(err)),
                 Some(Err(err)) => {
                     self.switch_to_software(&err);
                     if let ApplePlayerMode::Software(software) = &mut self.mode {
@@ -161,11 +164,23 @@ impl AppleUnifiedVideoPlayer {
                 if player.is_post_seek_holding() {
                     return false;
                 }
+                // A paused player yields no frames on purpose, and a buffering one none yet
+                // (a network MP4 typically takes longer than sixty polls to start). Only polls
+                // while AVPlayer says it is playing at rate count as a stalled decoder.
+                if !player.is_advancing() {
+                    self.null_frame_count = 0;
+                    return false;
+                }
                 self.null_frame_count += 1;
                 // HLS/DASH network streams can take a while to buffer their first segment after
                 // becoming "ready to play". The software decoder cannot parse a playlist, so never
                 // fall back for them — just keep polling the native player.
                 if self.source.is_network_stream() {
+                    return false;
+                }
+                // Without a software decoder installed there is nothing to fall back to: the
+                // switch could only turn a slow native player into an error.
+                if crate::media_plugin::media_plugin().is_none() {
                     return false;
                 }
                 if self.null_frame_count >= 60 {

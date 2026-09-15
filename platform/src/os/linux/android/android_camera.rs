@@ -1358,6 +1358,7 @@ impl AndroidCameraAccess {
                         input_id,
                         name: name.to_string(),
                         formats,
+                        sensor_orientation: sensor_orientation_degrees.rem_euclid(360) as u32,
                     };
                     self.devices.push(AndroidCameraDevice {
                         camera_id_str: camera_id_str.into(),

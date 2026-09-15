@@ -101,11 +101,9 @@ impl AndroidCameraPlayer {
             }) as CameraHardwareBufferInputFn
         });
 
-        let (width, height, yuv_rotation_steps) = {
+        let (width, height) = {
             let mut cam = camera_access.lock().unwrap();
             let (width, height) = cam.format_size(input_id, format_id).unwrap_or((0, 0));
-            let sensor_orientation = cam.sensor_orientation_for_input(input_id).rem_euclid(360);
-            let yuv_rotation_steps = ((sensor_orientation / 90) % 4) as f32;
 
             match hardware_buffer_cb {
                 Some(hardware_buffer_cb) => cam.register_preview_hardware_buffer(
@@ -120,7 +118,7 @@ impl AndroidCameraPlayer {
                 }
             }
 
-            (width, height, yuv_rotation_steps)
+            (width, height)
         };
 
         Self {
@@ -137,7 +135,12 @@ impl AndroidCameraPlayer {
             prepare_notified: false,
             native_preview,
             texture_mode,
-            yuv_rotation_steps,
+            // Hand the frames on in the sensor's own orientation. Which quarter
+            // turn stands them upright depends on how the screen is held and on
+            // which way the lens faces, and neither is ours to know here; the
+            // input's description carries its `sensor_orientation` and the app
+            // does the turning.
+            yuv_rotation_steps: 0.0,
             i420_frames,
             hardware_buffer_frame,
             camera_access: Some(camera_access),

@@ -1167,6 +1167,11 @@ pub struct VideoInputDesc {
     pub input_id: VideoInputId,
     pub name: String,
     pub formats: Vec<VideoFormat>,
+    /// Clockwise degrees a frame of this input must be turned to stand
+    /// upright on the device's natural screen — Android's
+    /// `SENSOR_ORIENTATION` (0, 90, 180 or 270). Zero wherever the platform
+    /// already delivers frames upright (Apple, V4L2, Media Foundation).
+    pub sensor_orientation: u32,
 }
 
 #[derive(Clone)]

@@ -981,6 +981,7 @@ impl V4l2CameraAccess {
                 input_id,
                 name,
                 formats,
+                sensor_orientation: 0,
             },
         })
     }

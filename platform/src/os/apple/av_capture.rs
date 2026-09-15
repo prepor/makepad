@@ -951,6 +951,7 @@ impl AvCaptureAccess {
                         input_id: LiveId::from_str(&uuid).into(),
                         name,
                         formats,
+                        sensor_orientation: 0,
                     },
                     av_formats,
                 });

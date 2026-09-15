@@ -75,9 +75,10 @@ script_mod! {
             }
 
             sample_yuv: fn(coord: vec2) -> vec4 {
-                let coord_90 = vec2(1.0 - coord.y, coord.x)
+                // One step turns the picture a quarter clockwise (VideoYuvMetadata.rotation_steps).
+                let coord_90 = vec2(coord.y, 1.0 - coord.x)
                 let coord_180 = vec2(1.0 - coord.x, 1.0 - coord.y)
-                let coord_270 = vec2(coord.y, 1.0 - coord.x)
+                let coord_270 = vec2(1.0 - coord.y, coord.x)
 
                 let is_90 = step(0.5, self.yuv_rotation_steps) * step(self.yuv_rotation_steps, 1.5)
                 let is_180 = step(1.5, self.yuv_rotation_steps) * step(self.yuv_rotation_steps, 2.5)
@@ -827,6 +828,12 @@ impl VideoRef {
         }
     }
 
+    pub fn set_uniform(&self, cx: &Cx, uniform: LiveId, value: &[f32]) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.draw_bg.set_uniform(cx, uniform, value);
+        }
+    }
+
     pub fn is_unprepared(&self) -> bool {
         if let Some(inner) = self.borrow() {
             return inner.playback_state == PlaybackState::Unprepared;
@@ -1055,6 +1062,18 @@ impl Widget for Video {
                         id!(yuv_rotation_steps),
                         &[event.yuv.rotation_steps],
                     );
+                    // An odd turn stands the picture on its side, so the fit reads
+                    // the turned size rather than the frame's own.
+                    let odd = (event.yuv.rotation_steps as i32).rem_euclid(4) % 2 == 1;
+                    let (fit_w, fit_h) = if odd {
+                        (self.video_height, self.video_width)
+                    } else {
+                        (self.video_width, self.video_height)
+                    };
+                    if fit_w > 0 && fit_h > 0 {
+                        self.draw_bg
+                            .set_uniform(cx, id!(source_size), &[fit_w as f32, fit_h as f32]);
+                    }
                     // Keep every samplerExternalOES slot bound to a real OES texture.
                     // An empty video_texture + live tex_*_oes can 花屏 on NVIDIA.
                     if event.yuv.external {

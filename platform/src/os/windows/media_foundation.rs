@@ -433,6 +433,7 @@ impl MediaFoundationAccess {
                             input_id: LiveId::from_str(&symlink).into(),
                             name,
                             formats,
+                            sensor_orientation: 0,
                         },
                         symlink,
                         media_types,

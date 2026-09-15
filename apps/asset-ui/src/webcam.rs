@@ -280,6 +280,7 @@ mod tests {
                 fmt(3, 1280, 720, VideoPixelFormat::NV12),
                 fmt(4, 640, 480, VideoPixelFormat::NV12),
             ],
+            sensor_orientation: 0,
         };
         assert_eq!(pick_format(&desc).unwrap().format_id.0, makepad_widgets::LiveId(3));
         let only_big = VideoInputDesc {

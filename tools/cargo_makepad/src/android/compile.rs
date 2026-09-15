@@ -1233,10 +1233,22 @@ fn build_dex(
     let d8_jar = d8_jar_path(sdk_dir, urls);
     let android_jar = android_jar_path(sdk_dir, urls);
 
+    // The API level the dex is for. Without it D8 assumes the oldest Android
+    // there is and desugars every default interface method into a synthetic
+    // `Iface$-CC` class — including the platform's own interfaces, whose
+    // synthetic class then does not exist at runtime: a `LocationListener`
+    // gets its `onLocationChanged(List)` called on Android 12+ and the app
+    // dies with `NoClassDefFoundError: LocationListener$-CC`. From API 24
+    // the runtime carries default methods itself, so the build's own
+    // minimum (already the effective one, override applied) is what D8 is
+    // told.
+    let min_api = urls.sdk_version.to_string();
     let mut args: Vec<&str> = vec![
         "-cp",
         d8_jar.to_str().unwrap(),
         "com.android.tools.r8.D8",
+        "--min-api",
+        &min_api,
         "--classpath",
         android_jar.to_str().unwrap(),
         "--output",

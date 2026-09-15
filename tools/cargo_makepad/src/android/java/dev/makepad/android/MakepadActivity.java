@@ -2608,6 +2608,14 @@ public class MakepadActivity
                     public void onLocationChanged(Location loc) {
                         sendLocationUpdate(loc);
                     }
+                    // Android 12+ delivers batched fixes through this overload,
+                    // whose interface default the dex must not have to supply.
+                    @Override
+                    public void onLocationChanged(java.util.List<Location> locations) {
+                        for (Location loc : locations) {
+                            sendLocationUpdate(loc);
+                        }
+                    }
                     @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
                     @Override public void onProviderEnabled(String provider) {}
                     @Override public void onProviderDisabled(String provider) {}
